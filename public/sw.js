@@ -1,4 +1,4 @@
-const CACHE_NAME = 'gpt-image-playground-v0.5.3-registration-approval-toggle-1'
+const CACHE_NAME = 'gpt-image-playground-v0.5.4-agent-task-failure-1'
 const APP_SHELL = ['./', './index.html', './manifest.webmanifest', './pwa-icon.svg']
 
 async function refreshWindowClients() {

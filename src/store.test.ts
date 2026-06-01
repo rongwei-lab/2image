@@ -149,6 +149,14 @@ function importFile(data: ExportData): File {
   return { arrayBuffer: async () => buffer } as File
 }
 
+async function waitForStoreCondition(predicate: () => boolean) {
+  for (let i = 0; i < 20; i++) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  expect(predicate()).toBe(true)
+}
+
 describe('favorite collection deletion', () => {
   const collectionA = { id: 'collection-a', name: '收藏夹 A', createdAt: 1, updatedAt: 1 }
   const collectionB = { id: 'collection-b', name: '收藏夹 B', createdAt: 1, updatedAt: 1 }
@@ -1449,6 +1457,88 @@ describe('agent context for removed outputs', () => {
     const serializedConversations = JSON.stringify(state.agentConversations)
     expect(serializedConversations).toContain('function_call_output')
     expect(serializedConversations).not.toContain('batch-deleted-base64')
+  })
+})
+
+describe('agent task lifecycle', () => {
+  const responsesProfile = createDefaultOpenAIProfile({
+    id: 'responses-profile',
+    apiKey: 'test-key',
+    apiMode: 'responses',
+    model: DEFAULT_RESPONSES_MODEL,
+    streamImages: true,
+  })
+
+  beforeEach(async () => {
+    await clearTasks()
+    await clearImages()
+    await clearAgentConversations()
+    vi.mocked(callAgentResponsesApi).mockReset()
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        apiKey: 'test-key',
+        apiMode: 'responses',
+        model: DEFAULT_RESPONSES_MODEL,
+        profiles: [responsesProfile],
+        activeProfileId: responsesProfile.id,
+      }),
+      prompt: '生成一张图',
+      inputImages: [],
+      maskDraft: null,
+      params: { ...DEFAULT_PARAMS },
+      appMode: 'agent',
+      tasks: [],
+      streamPreviews: {},
+      streamPreviewSlots: {},
+      agentConversations: [agentConversation({ id: 'conversation-a' })],
+      activeAgentConversationId: 'conversation-a',
+      agentEditingRoundId: null,
+      showToast: vi.fn(),
+    })
+  })
+
+  it('marks streaming agent image tasks failed when the agent request fails', async () => {
+    vi.mocked(callAgentResponsesApi).mockImplementation(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'tool-timeout' })
+      throw new Error('上游超时')
+    })
+
+    await submitAgentMessage()
+    await waitForStoreCondition(() => useStore.getState().tasks.some((item) => item.status === 'error'))
+
+    const failedTask = useStore.getState().tasks.find((item) => item.agentToolCallId === 'tool-timeout')
+    expect(failedTask).toMatchObject({
+      status: 'error',
+      error: expect.stringContaining('上游超时'),
+      sourceMode: 'agent',
+    })
+    expect((await getAllTasks()).find((item) => item.id === failedTask?.id)).toMatchObject({
+      status: 'error',
+      error: expect.stringContaining('上游超时'),
+    })
+  })
+
+  it('marks unfinished streaming agent image tasks failed when the agent response completes without an image', async () => {
+    vi.mocked(callAgentResponsesApi).mockImplementation(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'tool-empty' })
+      return {
+        text: '已处理',
+        images: [],
+        outputItems: [{ type: 'message', content: [{ type: 'output_text', text: '已处理' }] }],
+        responseId: 'response-empty',
+      }
+    })
+
+    await submitAgentMessage()
+    await waitForStoreCondition(() => useStore.getState().tasks.some((item) => item.status === 'error'))
+
+    const failedTask = useStore.getState().tasks.find((item) => item.agentToolCallId === 'tool-empty')
+    expect(failedTask).toMatchObject({
+      status: 'error',
+      error: 'Agent 回复已结束，但图像工具未返回最终图片',
+      sourceMode: 'agent',
+    })
   })
 })
 

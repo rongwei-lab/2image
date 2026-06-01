@@ -3045,6 +3045,33 @@ function markAgentRoundTasksStopped(conversationId: string, roundId: string, now
   return runningTasks.length > 0
 }
 
+function markAgentRoundRunningTasksFailed(
+  conversationId: string,
+  roundId: string,
+  error: string,
+  now = Date.now(),
+) {
+  const runningTasks = useStore.getState().tasks.filter((task) =>
+    task.status === 'running' &&
+    task.agentConversationId === conversationId &&
+    task.agentRoundId === roundId,
+  )
+
+  for (const task of runningTasks) {
+    updateTaskInStore(task.id, {
+      status: 'error',
+      error,
+      falRecoverable: false,
+      customRecoverable: false,
+      finishedAt: now,
+      elapsed: Math.max(0, now - task.createdAt),
+    })
+    useStore.getState().setTaskStreamPreview(task.id)
+  }
+
+  return runningTasks.length
+}
+
 function markAgentRoundStopped(conversationId: string, roundId: string) {
   const now = Date.now()
   const stoppedTasks = markAgentRoundTasksStopped(conversationId, roundId, now)
@@ -4503,6 +4530,7 @@ async function executeAgentRound(
 
     const taskIds: string[] = [...streamingTaskIds]
     const outputIds = taskIds.flatMap((taskId) => useStore.getState().tasks.find((task) => task.id === taskId)?.outputImages ?? [])
+    markAgentRoundRunningTasksFailed(conversationId, roundId, 'Agent 回复已结束，但图像工具未返回最终图片')
     const limitNotice = reachedToolLimit ? `已达到最大工具调用次数（${maxToolCalls}），已停止自动续跑。` : ''
     const joinedText = textSegments.join('\n\n').trim()
     const finalContent = [joinedText, limitNotice]
@@ -4561,6 +4589,7 @@ async function executeAgentRound(
       message += `\n${networkErrorHint}`
     }
 
+    markAgentRoundRunningTasksFailed(conversationId, roundId, message)
     updateAgentConversation(conversationId, (current) => {
       const failedRound = current.rounds.find((round) => round.id === roundId)
       const existingAssistantMessage = failedRound?.assistantMessageId
