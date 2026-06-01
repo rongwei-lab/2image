@@ -32,6 +32,10 @@ export default defineConfig(({ command }) => {
       proxy:
         devProxyConfig?.enabled
           ? {
+              '/api': {
+                target: 'http://127.0.0.1:8788',
+                changeOrigin: true,
+              },
               [devProxyConfig.prefix]: {
                 target: devProxyConfig.target,
                 changeOrigin: devProxyConfig.changeOrigin,
@@ -43,7 +47,12 @@ export default defineConfig(({ command }) => {
                   ),
               },
             }
-          : undefined,
+          : {
+              '/api': {
+                target: 'http://127.0.0.1:8788',
+                changeOrigin: true,
+              },
+            },
     },
   }
 })

@@ -27,7 +27,7 @@ const releasesUrl = trimTrailingSlash(
 const releaseApiUrl = readRuntimeEnv(import.meta.env.VITE_APP_RELEASE_API_URL)
 
 export const appMeta = {
-  name: readMetaEnv(import.meta.env.VITE_APP_NAME, 'GPT Image Playground'),
+  name: readMetaEnv(import.meta.env.VITE_APP_NAME, 'Gpt To Image'),
   authorName: readMetaEnv(import.meta.env.VITE_APP_AUTHOR_NAME, `@${defaultRepositoryOwner}`),
   repositoryUrl,
   issuesUrl,

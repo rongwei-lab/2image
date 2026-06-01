@@ -1,4 +1,11 @@
 node_modules/
 dist/
+server-dist/
+.env
 dev-proxy.config.json
 .wrangler/
+.playwright-mcp/
+.docker-npm-cache/*
+!.docker-npm-cache/server/
+.docker-npm-cache/server/*
+!.docker-npm-cache/server/.gitkeep

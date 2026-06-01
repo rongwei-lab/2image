@@ -1,5 +1,19 @@
-const CACHE_NAME = 'gpt-image-playground-v0.1.5'
+const CACHE_NAME = 'gpt-image-playground-v0.5.3-registration-approval-toggle-1'
 const APP_SHELL = ['./', './index.html', './manifest.webmanifest', './pwa-icon.svg']
+
+async function refreshWindowClients() {
+  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
+  await Promise.all(clients.map((client) => {
+    let url
+    try {
+      url = new URL(client.url)
+    } catch {
+      return undefined
+    }
+    if (url.origin !== self.location.origin) return undefined
+    return client.navigate(client.url).catch(() => undefined)
+  }))
+}
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -10,11 +24,12 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))),
-    ),
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
+      .then(() => self.clients.claim())
+      // 新版本接管后刷新旧页面，避免继续运行旧前端包。
+      .then(() => refreshWindowClients()),
   )
-  self.clients.claim()
 })
 
 self.addEventListener('fetch', (event) => {
@@ -24,6 +39,7 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
+  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/api-proxy/')) return
 
   if (request.mode === 'navigate') {
     event.respondWith(

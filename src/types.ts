@@ -67,6 +67,7 @@ export interface ApiProfile {
   apiMode: ApiMode
   codexCli: boolean
   apiProxy: boolean
+  hasStoredApiKey?: boolean
   responseFormatB64Json?: boolean
   streamImages?: boolean
   streamPartialImages?: number
@@ -100,6 +101,27 @@ export interface AppSettings {
   activeProfileId: string
 }
 
+export interface PlatformSettings {
+  registration: {
+    /** 开启后，新注册用户需要管理员审批后才能登录 */
+    requireApproval: boolean
+  }
+  api: {
+    /** 开启后，API 服务商/模型等连接配置由后台统一下发 */
+    managed: boolean
+    /** 预留给后续 BYOK/个人配置扩展，当前默认允许保留个人配置 */
+    allowUserProfiles: boolean
+    settings: AppSettings
+  }
+  agent: {
+    /** 开启后，Agent 相关能力完全按后台策略执行 */
+    lockSettings: boolean
+    maxToolRounds: number
+    webSearchEnabled: boolean
+  }
+  updatedAt?: string | null
+}
+
 // ===== 任务参数 =====
 
 export interface TaskParams {
@@ -127,12 +149,22 @@ export interface InputImage {
   id: string
   /** data URL，用于预览 */
   dataUrl: string
+  /** 云端同步状态，用于登录后的跨设备恢复 */
+  uploadStatus?: 'pending' | 'uploading' | 'done' | 'error'
+  /** 云端图片是否已同步完成 */
+  remoteSynced?: boolean
+  /** 云端签名或代理访问 URL，仅作短期展示缓存 */
+  remoteUrl?: string
 }
 
 export interface MaskDraft {
   targetImageId: string
   maskDataUrl: string
   updatedAt: number
+  /** 遮罩云端同步状态，提交前必须为 done */
+  uploadStatus?: 'pending' | 'uploading' | 'done' | 'error'
+  /** 云端遮罩图片 id */
+  maskImageId?: string
 }
 
 // ===== 任务记录 =====

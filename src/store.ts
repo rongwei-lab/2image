@@ -8,6 +8,7 @@ import type {
   ApiProfile,
   AppSettings,
   AppMode,
+  PlatformSettings,
   TaskParams,
   InputImage,
   MaskDraft,
@@ -39,8 +40,35 @@ import {
   putImageThumbnail,
   deleteImage,
   clearImages,
-  storeImage,
+  storeImage as dbStoreImage,
 } from './lib/db'
+import {
+  callCloudAgentConversationTitleApi,
+  callCloudAgentResponsesApi,
+  callCloudBatchImageSingle,
+  clearCloudData,
+  createCloudTask,
+  deleteCloudImage,
+  deleteCloudTask,
+  getCloudAgentConversations,
+  getCloudImageDataUrl,
+  getCloudSettings,
+  getCloudTasks,
+  getCurrentUser,
+  loginCloud,
+  logoutCloud,
+  patchCloudTask,
+  saveCloudAgentConversations,
+  saveCloudSettings,
+  subscribeCloudTask,
+  uploadCloudImage,
+  uploadCloudImageThumbnail,
+  getCloudImageThumbnail,
+  getPlatformSettings,
+  type CloudSettingsSnapshot,
+  type CloudUser,
+} from './lib/cloudApi'
+import { applyPlatformSettingsToAppSettings } from './lib/platformSettings'
 import { callImageApi } from './lib/api'
 import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type BatchImageCallResult } from './lib/agentApi'
 import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
@@ -71,15 +99,21 @@ const MAX_THUMBNAIL_CACHE_ENTRIES = 80
 const MAX_THUMBNAIL_BACKFILL_CONCURRENT = 4
 const FAL_RECOVERY_POLL_MS = 10_000
 const CUSTOM_RECOVERY_POLL_MS = 10_000
+const CLOUD_UPLOAD_RETRY_MS = 15_000
+const CLOUD_TASK_RECONNECT_MS = 3_000
 const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
 const AGENT_INPUT_DRAFT_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 const AGENT_ROUND_IMAGE_MENTION_RE = /@(?:第)?(\d+)轮图(\d+)/g
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const cloudImageUploadRunningIds = new Set<string>()
+const cloudTaskSubscriptionCleanups = new Map<string, () => void>()
+const cloudTaskReconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const agentRoundControllers = new Map<string, AbortController>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
+let cloudImageUploadRetryTimer: ReturnType<typeof setTimeout> | null = null
 const OPENAI_INTERRUPTED_ERROR = '请求中断'
 const AGENT_STOPPED_MESSAGE = '已停止生成。'
 const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
@@ -116,7 +150,7 @@ function isErrorToastTitle(title: string): boolean {
   return /(?:失败|错误|异常|报错|无法|不能|超时|中断|断开|请先|请输入|已达上限|不存在|已丢失)$/.test(title)
 }
 
-export type SettingsTab = 'general' | 'agent' | 'api' | 'data' | 'about'
+export type SettingsTab = 'general' | 'agent' | 'api' | 'data'
 
 const TIMEOUT_STREAMING_HINT = '也可尝试打开「流式传输」，并提高「请求中间步骤图像数」来维持连接。'
 const TIMEOUT_PARTIAL_IMAGES_ZERO_HINT = '官方流式接口不发送心跳，当前「请求中间步骤图像数」为 0，连接可能因无数据传输而断开。建议提高到 2 或 3。'
@@ -187,6 +221,14 @@ export async function ensureImageCached(id: string): Promise<string | undefined>
     cacheImage(id, rec.dataUrl)
     return rec.dataUrl
   }
+  if (isCloudMode()) {
+    const dataUrl = await getCloudImageDataUrl(id)
+    if (dataUrl) {
+      await dbStoreImage(dataUrl, 'upload')
+      cacheImage(id, dataUrl)
+      return dataUrl
+    }
+  }
   return undefined
 }
 
@@ -196,6 +238,31 @@ export async function ensureImageThumbnailCached(id: string): Promise<{ dataUrl:
 
   const rec = await getStoredFreshImageThumbnail(id)
   if (!rec?.thumbnailDataUrl) {
+    if (isCloudMode()) {
+      const cloudThumbnail = await getCloudImageThumbnail(id)
+      if (cloudThumbnail?.dataUrl) {
+        await putImageThumbnail({
+          id,
+          thumbnailDataUrl: cloudThumbnail.dataUrl,
+          width: cloudThumbnail.width,
+          height: cloudThumbnail.height,
+          thumbnailVersion: cloudThumbnail.thumbnailVersion ?? CURRENT_THUMBNAIL_VERSION,
+        })
+        cacheThumbnail(id, {
+          dataUrl: cloudThumbnail.dataUrl,
+          width: cloudThumbnail.width,
+          height: cloudThumbnail.height,
+          thumbnailVersion: cloudThumbnail.thumbnailVersion ?? CURRENT_THUMBNAIL_VERSION,
+        })
+        return {
+          dataUrl: cloudThumbnail.dataUrl,
+          width: cloudThumbnail.width,
+          height: cloudThumbnail.height,
+        }
+      }
+      const dataUrl = await ensureImageCached(id)
+      if (dataUrl) return { dataUrl }
+    }
     scheduleThumbnailBackfill([id], 'visible')
     return undefined
   }
@@ -695,6 +762,10 @@ export function getPersistedState(state: AppState) {
 }
 
 async function replaceStoredAgentConversations(conversations: AgentConversation[]) {
+  if (isCloudMode()) {
+    await saveCloudAgentConversations(conversations.map(getPersistableAgentConversation))
+    return
+  }
   await replaceAgentConversations(conversations.map(getPersistableAgentConversation))
 }
 
@@ -778,6 +849,14 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
 // ===== Store 类型 =====
 
 interface AppState {
+  // 云端账号
+  cloudUser: CloudUser | null
+  cloudAuthChecked: boolean
+  cloudSyncing: boolean
+  platformSettings: PlatformSettings | null
+  cloudLogin: (email: string, password: string) => Promise<void>
+  cloudLogout: () => Promise<void>
+
   // 模式
   appMode: AppMode
   setAppMode: (mode: AppMode) => void
@@ -855,6 +934,8 @@ interface AppState {
   streamPreviews: Record<string, string>
   streamPreviewSlots: Record<string, Record<string, string>>
   setTaskStreamPreview: (taskId: string, image?: string, requestIndex?: number) => void
+  taskScrollTargetId: string | null
+  setTaskScrollTargetId: (id: string | null) => void
 
   // 搜索和筛选
   searchQuery: string
@@ -883,6 +964,8 @@ interface AppState {
   showSettings: boolean
   settingsTabRequest: SettingsTab | null
   setShowSettings: (v: boolean, tab?: SettingsTab) => void
+  showLogin: boolean
+  setShowLogin: (v: boolean) => void
   supportPromptOpen: boolean
   supportPromptDismissed: boolean
   supportPromptSkippedForImportedData: boolean
@@ -954,7 +1037,7 @@ export async function deleteImageIfUnreferenced(imageId: string) {
   thumbnailSubscribers.delete(imageId)
   if (isImageReferencedByState(useStore.getState(), imageId)) return
   try {
-    await deleteImage(imageId)
+    await deleteImageForCurrentMode(imageId)
   } catch {
     // 清理是内存/存储优化，失败不影响替换结果。
   }
@@ -969,7 +1052,16 @@ function normalizeInputImages(value: unknown): InputImage[] {
   return value
     .map((img): InputImage | null => {
       if (!isRecord(img) || typeof img.id !== 'string') return null
-      return { id: img.id, dataUrl: typeof img.dataUrl === 'string' ? img.dataUrl : '' }
+      const uploadStatus = img.uploadStatus === 'pending' || img.uploadStatus === 'uploading' || img.uploadStatus === 'done' || img.uploadStatus === 'error'
+        ? img.uploadStatus
+        : undefined
+      return {
+        id: img.id,
+        dataUrl: typeof img.dataUrl === 'string' ? img.dataUrl : '',
+        uploadStatus,
+        remoteSynced: typeof img.remoteSynced === 'boolean' ? img.remoteSynced : undefined,
+        remoteUrl: typeof img.remoteUrl === 'string' ? img.remoteUrl : undefined,
+      }
     })
     .filter((img): img is InputImage => img != null)
 }
@@ -981,6 +1073,10 @@ function normalizeMaskDraft(value: unknown): MaskDraft | null {
     targetImageId: value.targetImageId,
     maskDataUrl: value.maskDataUrl,
     updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : Date.now(),
+    uploadStatus: value.uploadStatus === 'pending' || value.uploadStatus === 'uploading' || value.uploadStatus === 'done' || value.uploadStatus === 'error'
+      ? value.uploadStatus
+      : undefined,
+    maskImageId: typeof value.maskImageId === 'string' ? value.maskImageId : undefined,
   }
 }
 
@@ -1142,6 +1238,23 @@ function getPersistableAgentInputDrafts(state: AppState) {
 export const useStore = create<AppState>()(
   persist(
     (set, get) => ({
+      // Cloud
+      cloudUser: null,
+      cloudAuthChecked: false,
+      cloudSyncing: false,
+      platformSettings: null,
+      cloudLogin: async (email, password) => {
+        const user = await loginCloud(email, password)
+        set({ cloudUser: user, cloudAuthChecked: true })
+        await initStore()
+      },
+      cloudLogout: async () => {
+        stopAllCloudTaskSubscriptions()
+        await logoutCloud()
+        set({ cloudUser: null, cloudAuthChecked: true })
+        await initStore()
+      },
+
       // Mode
       appMode: 'gallery',
       setAppMode: (appMode) => {
@@ -1239,7 +1352,7 @@ export const useStore = create<AppState>()(
               : profile,
           )
         }
-        const settings = normalizeSettings(merged)
+        const settings = applyPlatformSettingsToAppSettings(normalizeSettings(merged), st.platformSettings)
         const shouldClearReusedProfile = st.reusedTaskApiProfileId && settings.activeProfileId === st.reusedTaskApiProfileId
         return {
           settings,
@@ -1259,11 +1372,20 @@ export const useStore = create<AppState>()(
       prompt: '',
       setPrompt: (prompt) => set((s) => syncActiveInputDraft(s, { prompt })),
       inputImages: [],
-      addInputImage: (img) =>
+      addInputImage: (img) => {
+        const nextImage = isCloudMode() && img.dataUrl
+          ? {
+              ...img,
+              uploadStatus: img.uploadStatus ?? (img.remoteSynced ? 'done' : 'pending'),
+              remoteSynced: img.remoteSynced ?? false,
+            } satisfies InputImage
+          : img
         set((s) => {
-          if (s.inputImages.find((i) => i.id === img.id)) return s
-          return syncActiveInputDraft(s, { inputImages: [...s.inputImages, img] })
-        }),
+          if (s.inputImages.find((i) => i.id === nextImage.id)) return s
+          return syncActiveInputDraft(s, { inputImages: [...s.inputImages, nextImage] })
+        })
+        scheduleCloudInputImageRetry(0)
+      },
       replaceInputImage: (idx, img) => {
         let removedImageId: string | null = null
         set((s) => {
@@ -1332,15 +1454,18 @@ export const useStore = create<AppState>()(
           })
         }),
       maskDraft: null,
-      setMaskDraft: (maskDraft) =>
+      setMaskDraft: (maskDraft) => {
+        const nextMaskDraft = maskDraft && isCloudMode() ? { ...maskDraft, uploadStatus: maskDraft.uploadStatus ?? 'pending' } : maskDraft
         set((s) => {
           const inputImages = orderImagesWithMaskFirst(s.inputImages, maskDraft?.targetImageId)
           return syncActiveInputDraft(s, {
-            maskDraft,
+            maskDraft: nextMaskDraft,
             inputImages,
             prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, inputImages),
           })
-        }),
+        })
+        scheduleCloudMaskDraftSync(nextMaskDraft)
+      },
       clearMaskDraft: () => set((s) => syncActiveInputDraft(s, { maskDraft: null })),
       maskEditorImageId: null,
       setMaskEditorImageId: (maskEditorImageId) => {
@@ -1512,6 +1637,8 @@ export const useStore = create<AppState>()(
         delete nextSlots[taskId]
         return { streamPreviews: next, streamPreviewSlots: nextSlots }
       }),
+      taskScrollTargetId: null,
+      setTaskScrollTargetId: (taskScrollTargetId) => set({ taskScrollTargetId }),
 
       // Search & Filter
       searchQuery: '',
@@ -1574,6 +1701,11 @@ export const useStore = create<AppState>()(
           ...(settingsTabRequest ? { settingsTabRequest } : {}),
           ...(!showSettings ? { settingsTabRequest: null } : {}),
         })
+      },
+      showLogin: false,
+      setShowLogin: (showLogin) => {
+        if (showLogin) dismissAllTooltips()
+        set({ showLogin })
       },
       supportPromptOpen: false,
       supportPromptDismissed: false,
@@ -1641,11 +1773,339 @@ useStore.subscribe((state) => {
   void flushAgentConversationsToIndexedDB()
 })
 
+let cloudSettingsSyncTimer: ReturnType<typeof setTimeout> | null = null
+let cloudMaskSyncTimer: ReturnType<typeof setTimeout> | null = null
+let cloudSettingsHydrating = false
+let cloudSettingsSyncInFlight = false
+let lastCloudSettingsSnapshot = ''
+
+function getCloudPersistableInputImage(image: InputImage): InputImage {
+  const shouldStripDataUrl = image.remoteSynced === true || image.uploadStatus === 'done'
+  return shouldStripDataUrl ? { ...image, dataUrl: '' } : { ...image }
+}
+
+function getCloudPersistableMaskDraft(maskDraft: MaskDraft | null | undefined): MaskDraft | null {
+  if (!maskDraft) return null
+  return maskDraft.maskImageId ? { ...maskDraft, maskDataUrl: '' } : { ...maskDraft }
+}
+
+function getCloudPersistableInputDraft(draft: AgentInputDraft | null | undefined): AgentInputDraft | null {
+  if (!draft) return null
+  return {
+    prompt: draft.prompt,
+    inputImages: draft.inputImages.map(getCloudPersistableInputImage),
+    maskDraft: getCloudPersistableMaskDraft(draft.maskDraft),
+    maskEditorImageId: draft.maskEditorImageId,
+    ...(typeof draft.updatedAt === 'number' ? { updatedAt: draft.updatedAt } : {}),
+  }
+}
+
+function getCloudCurrentInputDraft(state: Pick<AppState, 'prompt' | 'inputImages' | 'maskDraft' | 'maskEditorImageId'>, updatedAt?: number): AgentInputDraft {
+  return {
+    prompt: state.prompt,
+    inputImages: state.inputImages,
+    maskDraft: state.maskDraft,
+    maskEditorImageId: state.maskEditorImageId,
+    ...(typeof updatedAt === 'number' ? { updatedAt } : {}),
+  }
+}
+
+function getCloudGalleryInputDraft(state: AppState): AgentInputDraft | null {
+  if (state.appMode !== 'gallery') return state.galleryInputDraft
+  const draft = getCloudCurrentInputDraft(state, state.galleryInputDraft?.updatedAt)
+  return isEmptyAgentInputDraft(draft) ? null : draft
+}
+
+function getCloudPersistableAgentInputDrafts(state: AppState) {
+  const drafts = { ...state.agentInputDrafts }
+  if (state.appMode === 'agent' && state.activeAgentConversationId) {
+    drafts[state.activeAgentConversationId] = getCloudCurrentInputDraft(
+      state,
+      state.agentInputDrafts[state.activeAgentConversationId]?.updatedAt,
+    )
+  }
+  const conversationIds = new Set(state.agentConversations.map((conversation) => conversation.id))
+  const persistable: Record<string, AgentInputDraft> = {}
+  for (const [conversationId, draft] of Object.entries(drafts)) {
+    if (!conversationIds.has(conversationId) || isEmptyAgentInputDraft(draft)) continue
+    const nextDraft = getCloudPersistableInputDraft(draft)
+    if (nextDraft) persistable[conversationId] = nextDraft
+  }
+  return persistable
+}
+
+function buildCloudSettingsSnapshot(state: AppState): CloudSettingsSnapshot {
+  const galleryInputDraft = getCloudGalleryInputDraft(state)
+  const cloudGalleryInputDraft = getCloudPersistableInputDraft(galleryInputDraft)
+  return {
+    settings: normalizeSettings(state.settings),
+    params: state.params,
+    activeAgentConversationId: state.activeAgentConversationId,
+    appMode: state.appMode,
+    agentSidebarCollapsed: state.agentSidebarCollapsed,
+    agentAssetTab: state.agentAssetTab,
+    agentAssetPanelCollapsed: state.agentAssetPanelCollapsed,
+    favoriteCollections: state.favoriteCollections,
+    defaultFavoriteCollectionId: state.defaultFavoriteCollectionId,
+    prompt: state.prompt,
+    inputImages: state.inputImages.map(getCloudPersistableInputImage),
+    maskDraft: getCloudPersistableMaskDraft(state.maskDraft),
+    galleryInputDraft: cloudGalleryInputDraft,
+    agentInputDrafts: getCloudPersistableAgentInputDrafts(state),
+  }
+}
+
+function serializeCloudSettingsSnapshot(snapshot: CloudSettingsSnapshot): string {
+  return JSON.stringify({
+    ...snapshot,
+    settings: {
+      ...snapshot.settings,
+      apiKey: '',
+      profiles: snapshot.settings.profiles.map((profile) => ({ ...profile, apiKey: '' })),
+    },
+  })
+}
+
+function scheduleCloudSettingsSync() {
+  const state = useStore.getState()
+  if (!state.cloudUser || cloudSettingsHydrating || cloudSettingsSyncInFlight) return
+  const snapshot = buildCloudSettingsSnapshot(state)
+  const serialized = serializeCloudSettingsSnapshot(snapshot)
+  if (serialized === lastCloudSettingsSnapshot) return
+  if (cloudSettingsSyncTimer) clearTimeout(cloudSettingsSyncTimer)
+  cloudSettingsSyncTimer = setTimeout(() => {
+    cloudSettingsSyncTimer = null
+    const latestState = useStore.getState()
+    if (!latestState.cloudUser) return
+    const latestSnapshot = buildCloudSettingsSnapshot(latestState)
+    const latestSerialized = serializeCloudSettingsSnapshot(latestSnapshot)
+    if (latestSerialized === lastCloudSettingsSnapshot) return
+    cloudSettingsSyncInFlight = true
+    useStore.setState({ cloudSyncing: true })
+    let syncSucceeded = false
+    void saveCloudSettings(latestSnapshot)
+      .then((saved) => {
+        // 后端会做字段规范化；这里用本轮实际提交的快照去重，避免规范化差异触发循环同步。
+        void saved
+        lastCloudSettingsSnapshot = latestSerialized
+        syncSucceeded = true
+      })
+      .catch((error) => {
+        useStore.getState().showToast(`云端配置同步失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+      })
+      .finally(() => {
+        // 避免 cloudSyncing 本身的状态变化反向触发下一轮重复同步。
+        useStore.setState({ cloudSyncing: false })
+        cloudSettingsSyncInFlight = false
+        const currentState = useStore.getState()
+        if (!currentState.cloudUser) return
+        const currentSerialized = serializeCloudSettingsSnapshot(buildCloudSettingsSnapshot(currentState))
+        const comparisonSnapshot = syncSucceeded ? lastCloudSettingsSnapshot : latestSerialized
+        if (currentSerialized !== comparisonSnapshot) {
+          scheduleCloudSettingsSync()
+        }
+      })
+  }, 800)
+}
+
+useStore.subscribe((state) => {
+  if (!state.cloudUser) return
+  scheduleCloudSettingsSync()
+})
+
+function scheduleCloudMaskDraftSync(maskDraft: MaskDraft | null) {
+  if (!maskDraft || !isCloudMode() || maskDraft.uploadStatus === 'done') return
+  if (cloudMaskSyncTimer) clearTimeout(cloudMaskSyncTimer)
+  cloudMaskSyncTimer = setTimeout(() => {
+    cloudMaskSyncTimer = null
+    const latest = useStore.getState().maskDraft
+    if (!latest || latest.updatedAt !== maskDraft.updatedAt || latest.uploadStatus === 'done') return
+    useStore.setState((state) => syncActiveInputDraft(state, {
+      maskDraft: { ...latest, uploadStatus: 'uploading' },
+    }))
+    void storeImageForCurrentMode(latest.maskDataUrl, 'mask')
+      .then((maskImageId) => {
+        const current = useStore.getState().maskDraft
+        if (!current || current.updatedAt !== latest.updatedAt) return
+        useStore.setState((state) => syncActiveInputDraft(state, {
+          maskDraft: { ...current, maskImageId, uploadStatus: 'done' },
+        }))
+      })
+      .catch(() => {
+        const current = useStore.getState().maskDraft
+        if (!current || current.updatedAt !== latest.updatedAt) return
+        useStore.setState((state) => syncActiveInputDraft(state, {
+          maskDraft: { ...current, uploadStatus: 'error' },
+        }))
+        setTimeout(() => {
+          const retryDraft = useStore.getState().maskDraft
+          if (retryDraft?.updatedAt === latest.updatedAt && retryDraft.uploadStatus === 'error') {
+            scheduleCloudMaskDraftSync(retryDraft)
+          }
+        }, CLOUD_UPLOAD_RETRY_MS)
+      })
+  }, 800)
+}
+
+function patchCloudInputImageList(images: InputImage[], imageId: string, patch: Partial<InputImage>) {
+  return images.map((image) => image.id === imageId ? { ...image, ...patch } : image)
+}
+
+function patchCloudInputDraftImages(draft: AgentInputDraft | null, imageId: string, patch: Partial<InputImage>) {
+  return draft
+    ? { ...draft, inputImages: patchCloudInputImageList(draft.inputImages, imageId, patch) }
+    : draft
+}
+
+function patchCloudInputImageState(imageId: string, patch: Partial<InputImage>) {
+  useStore.setState((state) => ({
+    inputImages: patchCloudInputImageList(state.inputImages, imageId, patch),
+    galleryInputDraft: patchCloudInputDraftImages(state.galleryInputDraft, imageId, patch),
+    agentInputDrafts: Object.fromEntries(
+      Object.entries(state.agentInputDrafts).map(([conversationId, draft]) => [
+        conversationId,
+        patchCloudInputDraftImages(draft, imageId, patch) ?? draft,
+      ]),
+    ),
+  }))
+}
+
+async function uploadImageToCloudStorage(
+  image: InputImage,
+  source: 'upload' | 'generated' | 'mask',
+  taskId?: string | null,
+) {
+  const upload = await uploadCloudImage(image, source, taskId)
+  if (upload.url) cacheImage(image.id, image.dataUrl)
+  const thumbnail = await getStoredFreshImageThumbnail(image.id)
+  if (thumbnail?.thumbnailDataUrl) {
+    await uploadCloudImageThumbnail(image.id, {
+      dataUrl: thumbnail.thumbnailDataUrl,
+      width: thumbnail.width,
+      height: thumbnail.height,
+      thumbnailVersion: thumbnail.thumbnailVersion,
+    })
+  }
+  return upload
+}
+
+async function uploadCloudInputImageWithRetryState(image: InputImage) {
+  if (!isCloudMode() || !image.dataUrl || image.remoteSynced || cloudImageUploadRunningIds.has(image.id)) return
+  cloudImageUploadRunningIds.add(image.id)
+  patchCloudInputImageState(image.id, { uploadStatus: 'uploading', remoteSynced: false })
+  try {
+    const upload = await uploadImageToCloudStorage(image, 'upload')
+    patchCloudInputImageState(image.id, {
+      uploadStatus: 'done',
+      remoteSynced: true,
+      remoteUrl: upload.url,
+    })
+  } catch {
+    patchCloudInputImageState(image.id, { uploadStatus: 'error', remoteSynced: false })
+    scheduleCloudInputImageRetry(CLOUD_UPLOAD_RETRY_MS)
+  } finally {
+    cloudImageUploadRunningIds.delete(image.id)
+  }
+}
+
+function collectRetryableCloudInputImages(state: AppState) {
+  const images = new Map<string, InputImage>()
+  const collect = (items: InputImage[]) => {
+    for (const image of items) {
+      if (!image.dataUrl || image.remoteSynced || image.uploadStatus === 'uploading') continue
+      images.set(image.id, image)
+    }
+  }
+  collect(state.inputImages)
+  if (state.galleryInputDraft) collect(state.galleryInputDraft.inputImages)
+  for (const draft of Object.values(state.agentInputDrafts)) collect(draft.inputImages)
+  return [...images.values()]
+}
+
+function scheduleCloudInputImageRetry(delay = 1200) {
+  if (cloudImageUploadRetryTimer) clearTimeout(cloudImageUploadRetryTimer)
+  cloudImageUploadRetryTimer = setTimeout(() => {
+    cloudImageUploadRetryTimer = null
+    const state = useStore.getState()
+    if (!state.cloudUser) return
+    for (const image of collectRetryableCloudInputImages(state)) {
+      void uploadCloudInputImageWithRetryState(image)
+    }
+    scheduleCloudMaskDraftSync(state.maskDraft)
+  }, delay)
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', () => {
+    scheduleCloudInputImageRetry(0)
+    scheduleCloudMaskDraftSync(useStore.getState().maskDraft)
+  })
+}
+
 // ===== Actions =====
 
 let uid = 0
 function genId(): string {
   return Date.now().toString(36) + (++uid).toString(36) + Math.random().toString(36).slice(2, 6)
+}
+
+function isCloudMode() {
+  return Boolean(useStore.getState().cloudUser)
+}
+
+export async function storeImageForCurrentMode(
+  dataUrl: string,
+  source: 'upload' | 'generated' | 'mask' = 'upload',
+  taskId?: string | null,
+  options: { backgroundCloudSync?: boolean } = {},
+): Promise<string> {
+  const id = await dbStoreImage(dataUrl, source)
+  if (isCloudMode()) {
+    const image = { id, dataUrl, uploadStatus: 'pending' as const, remoteSynced: false }
+    if (options.backgroundCloudSync && source === 'upload') {
+      void uploadCloudInputImageWithRetryState(image)
+      return id
+    }
+    try {
+      patchCloudInputImageState(id, { uploadStatus: 'uploading', remoteSynced: false })
+      const upload = await uploadImageToCloudStorage(image, source, taskId)
+      patchCloudInputImageState(id, { uploadStatus: 'done', remoteSynced: true, remoteUrl: upload.url })
+    } catch (error) {
+      patchCloudInputImageState(id, { uploadStatus: 'error', remoteSynced: false })
+      if (source === 'upload') scheduleCloudInputImageRetry(CLOUD_UPLOAD_RETRY_MS)
+      throw error
+    }
+  }
+  return id
+}
+
+async function storeImage(dataUrl: string, source: 'upload' | 'generated' | 'mask' = 'upload', taskId?: string | null): Promise<string> {
+  return storeImageForCurrentMode(dataUrl, source, taskId)
+}
+
+async function deleteImageForCurrentMode(imageId: string): Promise<void> {
+  if (isCloudMode()) await deleteCloudImage(imageId)
+  await deleteImage(imageId)
+}
+
+async function cleanupImageForCurrentMode(imageId: string): Promise<void> {
+  imageCache.delete(imageId)
+  thumbnailCache.delete(imageId)
+  thumbnailBackfillIds.delete(imageId)
+  thumbnailBackfillRunningIds.delete(imageId)
+  thumbnailSubscribers.delete(imageId)
+  try {
+    await deleteImageForCurrentMode(imageId)
+  } catch {
+    // 图片清理是存储回收操作，失败不应阻断删除任务或继续生成。
+  }
+}
+
+async function persistTaskRecord(task: TaskRecord): Promise<unknown> {
+  if (isCloudMode()) {
+    return patchCloudTask(getPersistableTask(task))
+  }
+  return dbPutTask(getPersistableTask(task))
 }
 
 function getPersistableRawResponsePayload(rawResponsePayload?: string) {
@@ -1667,8 +2127,8 @@ function getPersistableTask(task: TaskRecord): TaskRecord {
   return rawResponsePayload === task.rawResponsePayload ? task : { ...task, rawResponsePayload }
 }
 
-function putTask(task: TaskRecord): Promise<IDBValidKey> {
-  return dbPutTask(getPersistableTask(task))
+function putTask(task: TaskRecord): Promise<unknown> {
+  return persistTaskRecord(task)
 }
 
 export function getCodexCliPromptKey(settings: AppSettings): string {
@@ -1963,6 +2423,49 @@ async function resolveImageSizeParamsList(
   return images.map((_, index) => hasActualParams(preferred?.[index]) ? preferred?.[index] : fallback[index])
 }
 
+async function restoreCloudInputImages(images: InputImage[] | undefined): Promise<InputImage[]> {
+  const restored: InputImage[] = []
+  for (const image of images ?? []) {
+    if (image.dataUrl) {
+      const uploadStatus = image.uploadStatus === 'uploading'
+        ? 'pending'
+        : image.uploadStatus ?? (image.remoteSynced ? 'done' : 'pending')
+      restored.push({
+        ...image,
+        remoteSynced: image.remoteSynced ?? image.uploadStatus === 'done',
+        uploadStatus,
+      })
+      continue
+    }
+
+    const dataUrl = await ensureImageCached(image.id)
+    if (dataUrl) restored.push({ ...image, dataUrl, remoteSynced: true, uploadStatus: 'done' })
+  }
+  return restored
+}
+
+async function restoreCloudMaskDraft(maskDraft: MaskDraft | null | undefined): Promise<MaskDraft | null> {
+  if (!maskDraft) return null
+  if (maskDraft.maskDataUrl) {
+    const uploadStatus = maskDraft.uploadStatus === 'uploading'
+      ? 'pending'
+      : maskDraft.uploadStatus ?? (maskDraft.maskImageId ? 'done' : 'pending')
+    return {
+      ...maskDraft,
+      uploadStatus,
+    }
+  }
+  if (!maskDraft.maskImageId) return null
+
+  const maskDataUrl = await ensureImageCached(maskDraft.maskImageId)
+  if (!maskDataUrl) return null
+  return {
+    ...maskDraft,
+    maskDataUrl,
+    uploadStatus: 'done',
+  }
+}
+
 async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<ReturnType<typeof getFalQueuedImageResult>>) {
   const latest = useStore.getState().tasks.find((item) => item.id === task.id)
   if (!latest || latest.status === 'done') return
@@ -1970,7 +2473,7 @@ async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<Return
   const actualParamsList = await resolveImageSizeParamsList(result.images, result.actualParamsList)
   const outputIds: string[] = []
   for (const dataUrl of result.images) {
-    const imgId = await storeImage(dataUrl, 'generated')
+    const imgId = await storeImage(dataUrl, 'generated', task.id)
     cacheImage(imgId, dataUrl)
     outputIds.push(imgId)
   }
@@ -2026,6 +2529,142 @@ async function recoverFalTask(taskId: string) {
 
 /** 初始化：从 IndexedDB 加载任务，按需恢复输入图片，并清理孤立图片 */
 export async function initStore() {
+  let platformSettings: PlatformSettings | null = null
+  try {
+    platformSettings = await getPlatformSettings()
+  } catch {
+    platformSettings = null
+  }
+  useStore.setState((state) => ({
+    platformSettings,
+    settings: applyPlatformSettingsToAppSettings(state.settings, platformSettings),
+  }))
+
+  let cloudUser = useStore.getState().cloudUser
+  try {
+    cloudUser = cloudUser ?? await getCurrentUser()
+  } catch {
+    cloudUser = null
+  }
+
+	  if (cloudUser) {
+	    cloudSettingsHydrating = true
+	    let shouldSyncCloudSettingsAfterHydration = false
+	    try {
+      useStore.setState({ cloudUser, cloudAuthChecked: true, platformSettings })
+      const [cloudSettings, cloudTasks, cloudConversations] = await Promise.all([
+        getCloudSettings(),
+        getCloudTasks(),
+        getCloudAgentConversations(),
+      ])
+      const normalizedConversations = normalizeAgentConversations(cloudConversations)
+      const activeAgentConversationId = cloudSettings?.activeAgentConversationId &&
+        normalizedConversations.some((conversation) => conversation.id === cloudSettings.activeAgentConversationId)
+        ? cloudSettings.activeAgentConversationId
+        : normalizedConversations[0]?.id ?? null
+      const restoredInputImages = await restoreCloudInputImages(cloudSettings?.inputImages)
+      const restoredMaskDraft = await restoreCloudMaskDraft(cloudSettings?.maskDraft)
+      const restoredGalleryInputDraft = cloudSettings?.galleryInputDraft
+        ? {
+            ...cloudSettings.galleryInputDraft,
+            inputImages: await restoreCloudInputImages(cloudSettings.galleryInputDraft.inputImages),
+            maskDraft: await restoreCloudMaskDraft(cloudSettings.galleryInputDraft.maskDraft),
+          }
+        : null
+      const restoredAgentInputDrafts: Record<string, AgentInputDraft> = {}
+      for (const [conversationId, draft] of Object.entries(cloudSettings?.agentInputDrafts ?? {})) {
+        restoredAgentInputDrafts[conversationId] = {
+          ...draft,
+          inputImages: await restoreCloudInputImages(draft.inputImages),
+          maskDraft: await restoreCloudMaskDraft(draft.maskDraft),
+        }
+      }
+	      const nextSnapshot = cloudSettings ?? buildCloudSettingsSnapshot({
+	        ...useStore.getState(),
+	        cloudUser,
+	        activeAgentConversationId,
+	      })
+	      shouldSyncCloudSettingsAfterHydration = !cloudSettings ||
+	        !Array.isArray(cloudSettings.favoriteCollections) ||
+	        !('defaultFavoriteCollectionId' in cloudSettings)
+	      useStore.setState((state) => {
+	        const nextAgentInputDrafts = cleanStaleAgentInputDrafts(
+	          normalizeAgentInputDrafts({ ...state.agentInputDrafts, ...restoredAgentInputDrafts }, normalizedConversations),
+	          activeAgentConversationId,
+	        )
+	        const snapshotGalleryDraft: AgentInputDraft | null = (nextSnapshot.prompt || restoredInputImages.length || restoredMaskDraft)
+	          ? {
+	              prompt: nextSnapshot.prompt ?? '',
+	              inputImages: restoredInputImages,
+	              maskDraft: restoredMaskDraft,
+	              maskEditorImageId: null,
+	            }
+	          : null
+	        const nextGalleryInputDraft = restoredGalleryInputDraft ?? snapshotGalleryDraft ?? state.galleryInputDraft
+	        const favoriteCollections = Array.isArray(nextSnapshot.favoriteCollections)
+	          ? ensureDefaultFavoriteCollection(normalizeFavoriteCollections(nextSnapshot.favoriteCollections))
+	          : state.favoriteCollections
+	        const defaultFavoriteCollectionId = resolveDefaultFavoriteCollectionId(favoriteCollections, nextSnapshot.defaultFavoriteCollectionId)
+	        return {
+	          cloudUser,
+	          cloudAuthChecked: true,
+	          settings: applyPlatformSettingsToAppSettings(normalizeSettings(nextSnapshot.settings), platformSettings),
+	          params: nextSnapshot.params ?? state.params,
+	          appMode: nextSnapshot.appMode ?? state.appMode,
+	          galleryInputDraft: nextGalleryInputDraft,
+	          agentConversations: normalizedConversations,
+	          agentConversationsLoaded: true,
+	          activeAgentConversationId,
+	          agentInputDrafts: nextAgentInputDrafts,
+	          agentSidebarCollapsed: nextSnapshot.agentSidebarCollapsed,
+	          agentAssetTab: nextSnapshot.agentAssetTab,
+	          agentAssetPanelCollapsed: nextSnapshot.agentAssetPanelCollapsed,
+	          favoriteCollections,
+	          defaultFavoriteCollectionId,
+	          activeFavoriteCollectionId: null,
+	          favoritePickerTaskIds: null,
+	          ...(nextSnapshot.appMode === 'agent'
+	            ? restoreAgentInputDraftState(nextAgentInputDrafts, activeAgentConversationId)
+	            : restoreGalleryInputDraftState(nextGalleryInputDraft)
+	          ),
+	        }
+	      })
+	      lastStoredAgentConversations = normalizedConversations
+	      agentConversationPersistenceReady = true
+	      agentConversationMigrationPending = false
+	      const favoriteState = useStore.getState()
+	      const persistableCloudTasks = cloudTasks.map(getPersistableTask)
+	      const normalizedFavorites = normalizeLoadedFavoriteState(
+	        persistableCloudTasks,
+	        favoriteState.favoriteCollections,
+	        favoriteState.defaultFavoriteCollectionId,
+	      )
+	      if (normalizedFavorites.collections !== favoriteState.favoriteCollections) {
+	        favoriteState.setFavoriteCollections(normalizedFavorites.collections)
+	      }
+	      if (normalizedFavorites.defaultFavoriteCollectionId !== favoriteState.defaultFavoriteCollectionId) {
+	        useStore.getState().setDefaultFavoriteCollectionId(normalizedFavorites.defaultFavoriteCollectionId)
+	      }
+	      lastCloudSettingsSnapshot = serializeCloudSettingsSnapshot(buildCloudSettingsSnapshot(useStore.getState()))
+	      useStore.getState().setTasks(normalizedFavorites.tasks)
+	      if (normalizedFavorites.changed) {
+	        await Promise.all(normalizedFavorites.tasks
+	          .filter((task, index) => task !== persistableCloudTasks[index])
+	          .map((task) => patchCloudTask(task)))
+	      }
+	      showSupportPromptForExistingLocalData(normalizedFavorites.tasks)
+	      resumeCloudRunningTasks(normalizedFavorites.tasks)
+	      scheduleCloudInputImageRetry(0)
+	      scheduleCloudMaskDraftSync(useStore.getState().maskDraft)
+	    } finally {
+	      cloudSettingsHydrating = false
+	    }
+	    if (shouldSyncCloudSettingsAfterHydration) scheduleCloudSettingsSync()
+	    return
+	  }
+
+  stopAllCloudTaskSubscriptions()
+  useStore.setState({ cloudUser: null, cloudAuthChecked: true })
   const legacyAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
   const storedTasks = await getAllTasks()
   const storedAgentConversations = normalizeAgentConversations(await getAllAgentConversations())
@@ -2125,7 +2764,7 @@ export async function initStore() {
     if (referencedIds.has(imgId)) {
       referencedImageIds.push(imgId)
     } else {
-      await deleteImage(imgId)
+      await deleteImageForCurrentMode(imgId)
     }
   }
   scheduleThumbnailBackfill(referencedImageIds)
@@ -2259,8 +2898,9 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     }
   }
 
-  if (validateApiProfile(activeProfile)) {
-    showToast(`请先完善请求 API 配置：${validateApiProfile(activeProfile)}`, 'error')
+  const profileValidation = validateApiProfile(activeProfile)
+  if (profileValidation && !(isCloudMode() && profileValidation === '缺少 API Key')) {
+    showToast(`请先完善请求 API 配置：${profileValidation}`, 'error')
     useStore.getState().setShowSettings(true)
     return
   }
@@ -2336,7 +2976,13 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
 
   const latestTasks = useStore.getState().tasks
   useStore.getState().setTasks([task, ...latestTasks])
-  await putTask(task)
+  useStore.getState().setTaskScrollTargetId(task.id)
+  if (isCloudMode()) {
+    executeCloudTask(task)
+  } else {
+    await putTask(task)
+    executeTask(taskId)
+  }
   useStore.getState().showToast('任务已提交', 'success')
 
   if (settings.clearInputAfterSubmit) {
@@ -2345,8 +2991,6 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
   }
   useStore.getState().setReusedTaskApiProfile(null)
 
-  // 异步调用 API
-  executeTask(taskId)
 }
 
 function getActiveAgentConversation(): AgentConversation {
@@ -2473,13 +3117,14 @@ async function generateAgentConversationTitle(
     return { agentGeneratingTitleIds: next }
   })
   try {
-    const imageDataUrls = await readAgentImageDataUrls(inputImageIds)
-    const title = await callAgentConversationTitleApi({
-      settings: requestSettings,
-      profile: activeProfile,
-      prompt,
-      imageDataUrls,
-    })
+    const title = isCloudMode()
+      ? await callCloudAgentConversationTitleApi({ prompt, inputImageIds })
+      : await callAgentConversationTitleApi({
+          settings: requestSettings,
+          profile: activeProfile,
+          prompt,
+          imageDataUrls: await readAgentImageDataUrls(inputImageIds),
+        })
     if (!title || title === fallbackTitle) return
 
     updateAgentConversation(conversationId, (current) => {
@@ -2681,15 +3326,13 @@ async function deleteUnreferencedImageIds(imageIds: Iterable<string>) {
 
   for (const imgId of candidates) {
     if (stillUsed.has(imgId)) continue
-    await deleteImage(imgId)
-    imageCache.delete(imgId)
-    thumbnailCache.delete(imgId)
+    await cleanupImageForCurrentMode(imgId)
   }
 }
 
 async function persistTaskStreamPartialImage(taskId: string, dataUrl: string) {
   try {
-    const imgId = await storeImage(dataUrl, 'generated')
+    const imgId = await storeImage(dataUrl, 'generated', taskId)
     cacheImage(imgId, dataUrl)
 
     const latestTask = useStore.getState().tasks.find((task) => task.id === taskId)
@@ -3061,8 +3704,9 @@ export async function submitAgentMessage() {
     return
   }
 
-  if (validateApiProfile(activeProfile)) {
-    showToast(`请先完善请求 API 配置：${validateApiProfile(activeProfile)}`, 'error')
+  const profileValidation = validateApiProfile(activeProfile)
+  if (profileValidation && !(isCloudMode() && profileValidation === '缺少 API Key')) {
+    showToast(`请先完善请求 API 配置：${profileValidation}`, 'error')
     state.setShowSettings(true)
     return
   }
@@ -3211,8 +3855,9 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
     return
   }
 
-  if (validateApiProfile(activeProfile)) {
-    showToast(`请先完善请求 API 配置：${validateApiProfile(activeProfile)}`, 'error')
+  const profileValidation = validateApiProfile(activeProfile)
+  if (profileValidation && !(isCloudMode() && profileValidation === '缺少 API Key')) {
+    showToast(`请先完善请求 API 配置：${profileValidation}`, 'error')
     state.setShowSettings(true)
     return
   }
@@ -3403,6 +4048,7 @@ async function executeAgentRound(
 
       taskIdByToolCallId.set(toolCallId, task.id)
       useStore.getState().setTasks([task, ...useStore.getState().tasks])
+      useStore.getState().setTaskScrollTargetId(task.id)
       attachTaskToAgentRound(task.id)
       await putTask(task)
       return task.id
@@ -3414,7 +4060,7 @@ async function executeAgentRound(
       const latestTask = useStore.getState().tasks.find((task) => task.id === taskId)
       if (latestTask?.status === 'done' && latestTask.outputImages.length > 0) return taskId
 
-      const imgId = await storeImage(image.dataUrl, 'generated')
+      const imgId = await storeImage(image.dataUrl, 'generated', taskId)
       cacheImage(imgId, image.dataUrl)
       const actualParams: Partial<TaskParams> = {
         ...(Object.keys(image.actualParams ?? {}).length ? image.actualParams : {}),
@@ -3532,13 +4178,7 @@ async function executeAgentRound(
       // Fire all batch items concurrently after all cards are visible.
       const batchPromises = batchExecutionItems.map(async ({ item, batchToolCallId, references, referenceIds }) => {
 
-        const batchResult = await callBatchImageSingle({
-          profile: activeProfile,
-          params,
-          batchItemId: item.id,
-          prompt: item.prompt,
-          referenceImageDataUrls: references.dataUrls,
-          referenceIds,
+        const batchCallbacks = {
           signal: controller.signal,
           onImageToolStarted: shouldStreamAssistantMessage
             ? async () => {
@@ -3546,7 +4186,7 @@ async function executeAgentRound(
               }
             : undefined,
           onPartialImage: shouldStreamAssistantMessage
-            ? async ({ image, partialImageIndex }) => {
+            ? async ({ image, partialImageIndex }: { image: string; partialImageIndex?: number }) => {
                 if (controller.signal.aborted) return
                 const taskId = taskIdByToolCallId.get(batchToolCallId)
                 if (taskId) {
@@ -3558,12 +4198,30 @@ async function executeAgentRound(
               }
             : undefined,
           onImageToolCompleted: shouldStreamAssistantMessage
-            ? async (image) => {
+            ? async (image: AgentApiResultImage) => {
                 if (controller.signal.aborted) return
                 await completeAgentImageTask({ ...image, toolCallId: batchToolCallId })
               }
             : undefined,
-        })
+        }
+        const batchResult = isCloudMode()
+          ? await callCloudBatchImageSingle({
+              params,
+              batchItemId: item.id,
+              prompt: item.prompt,
+              referenceImageDataUrls: references.dataUrls,
+              referenceIds,
+              ...batchCallbacks,
+            })
+          : await callBatchImageSingle({
+              profile: activeProfile,
+              params,
+              batchItemId: item.id,
+              prompt: item.prompt,
+              referenceImageDataUrls: references.dataUrls,
+              referenceIds,
+              ...batchCallbacks,
+            })
 
         // If not streaming and we have an image, complete the pre-created task.
         if (batchResult.image && !shouldStreamAssistantMessage) {
@@ -3606,15 +4264,17 @@ async function executeAgentRound(
       if (controller.signal.aborted) throw createAgentAbortError()
       const textBeforeResponse = accumulatedText
       let currentResponseOutputItems: ResponsesOutputItem[] = []
-      const result = await callAgentResponsesApi({
-        settings: requestSettings,
-        profile: activeProfile,
-        params,
-        input: apiInputForTurn,
-        maskDataUrl,
+      const agentCallbacks: {
+        signal: AbortSignal
+        onTextDelta?: (delta: string) => void
+        onOutputItems?: (outputItems: ResponsesOutputItem[] | undefined) => void
+        onImageToolStarted?: (event: { toolCallId: string; outputIndex?: number }) => Promise<void>
+        onImagePartialImage?: (event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number }) => Promise<void>
+        onImageToolCompleted?: (image: AgentApiResultImage) => Promise<void>
+      } = {
         signal: controller.signal,
         onTextDelta: shouldStreamAssistantMessage
-          ? (delta) => {
+          ? (delta: string) => {
               if (controller.signal.aborted) return
               if (pendingToolTextSeparator && delta && accumulatedText.trim()) {
                 accumulatedText += '\n\n'
@@ -3626,23 +4286,24 @@ async function executeAgentRound(
             }
           : undefined,
         onOutputItems: shouldStreamAssistantMessage
-          ? (outputItems) => {
+          ? (outputItems: ResponsesOutputItem[] | undefined) => {
               if (controller.signal.aborted) return
-              currentResponseOutputItems = outputItems
+              const nextOutputItems = outputItems ?? []
+              currentResponseOutputItems = nextOutputItems
               updateAgentConversation(conversationId, (current) => ({
                 ...current,
-                rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, outputItems) } : item),
+                rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, nextOutputItems) } : item),
               }))
             }
           : undefined,
         onImageToolStarted: shouldStreamAssistantMessage
-          ? async ({ toolCallId }) => {
+          ? async ({ toolCallId }: { toolCallId: string; outputIndex?: number }) => {
               if (controller.signal.aborted) return
               await ensureStreamingAgentTask(toolCallId)
             }
           : undefined,
         onImagePartialImage: shouldStreamAssistantMessage
-          ? async ({ toolCallId, image, partialImageIndex }) => {
+          ? async ({ toolCallId, image, partialImageIndex }: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number }) => {
               if (controller.signal.aborted) return
               const taskId = await ensureStreamingAgentTask(toolCallId)
               if (controller.signal.aborted) return
@@ -3653,12 +4314,28 @@ async function executeAgentRound(
             }
           : undefined,
         onImageToolCompleted: shouldStreamAssistantMessage
-          ? async (image) => {
+          ? async (image: AgentApiResultImage) => {
               if (controller.signal.aborted) return
               await completeAgentImageTask(image)
             }
           : undefined,
-      })
+      }
+      const result = isCloudMode()
+        ? await callCloudAgentResponsesApi({
+            params,
+            input: apiInputForTurn,
+            maskImageId: round.maskImageId,
+            maskDataUrl,
+            ...agentCallbacks,
+          })
+        : await callAgentResponsesApi({
+            settings: requestSettings,
+            profile: activeProfile,
+            params,
+            input: apiInputForTurn,
+            maskDataUrl,
+            ...agentCallbacks,
+          })
       if (controller.signal.aborted) throw createAgentAbortError()
 
       lastResponseId = result.responseId ?? lastResponseId
@@ -3695,14 +4372,15 @@ async function executeAgentRound(
         }
         const promptRefIds = uniqueIds(extractAgentReferenceIds(image.revisedPrompt ?? ''))
         const promptRefs = await resolveReferenceImages(promptRefIds)
-        const imgId = await storeImage(image.dataUrl, 'generated')
+        const taskId = genId()
+        const imgId = await storeImage(image.dataUrl, 'generated', taskId)
         cacheImage(imgId, image.dataUrl)
         const actualParams: Partial<TaskParams> = {
           ...(Object.keys(image.actualParams ?? {}).length ? image.actualParams : {}),
           n: 1,
         }
         const task: TaskRecord = {
-          id: genId(),
+          id: taskId,
           prompt: image.revisedPrompt ?? round?.prompt ?? userMessage.content,
           params,
           apiProvider: activeProfile.provider,
@@ -3731,6 +4409,7 @@ async function executeAgentRound(
           agentToolAction: image.action,
         }
         useStore.getState().setTasks([task, ...useStore.getState().tasks])
+        useStore.getState().setTaskScrollTargetId(task.id)
         attachTaskToAgentRound(task.id)
         await putTask(task)
       }
@@ -3926,6 +4605,110 @@ async function executeAgentRound(
   }
 }
 
+function clearCloudTaskReconnectTimer(taskId: string) {
+  const timer = cloudTaskReconnectTimers.get(taskId)
+  if (timer) clearTimeout(timer)
+  cloudTaskReconnectTimers.delete(taskId)
+}
+
+function stopCloudTaskSubscription(taskId: string) {
+  clearCloudTaskReconnectTimer(taskId)
+  const cleanup = cloudTaskSubscriptionCleanups.get(taskId)
+  cleanup?.()
+  cloudTaskSubscriptionCleanups.delete(taskId)
+}
+
+function stopAllCloudTaskSubscriptions() {
+  const taskIds = new Set([
+    ...cloudTaskSubscriptionCleanups.keys(),
+    ...cloudTaskReconnectTimers.keys(),
+  ])
+  for (const taskId of taskIds) stopCloudTaskSubscription(taskId)
+}
+
+function applyRemoteTaskUpdate(task: TaskRecord): TaskRecord | undefined {
+  const previousTasks = useStore.getState().tasks
+  const previousTask = previousTasks.find((item) => item.id === task.id)
+  const nextTasks = previousTasks.some((item) => item.id === task.id)
+    ? previousTasks.map((item) => item.id === task.id ? task : item)
+    : [task, ...previousTasks]
+  useStore.getState().setTasks(nextTasks)
+  maybeOpenSupportPrompt(previousTasks, nextTasks, task.id)
+  if (task.status !== 'running') stopCloudTaskSubscription(task.id)
+  return previousTask
+}
+
+function scheduleCloudTaskSubscriptionRetry(taskId: string) {
+  clearCloudTaskReconnectTimer(taskId)
+  const timer = setTimeout(() => {
+    cloudTaskReconnectTimers.delete(taskId)
+    const latest = useStore.getState().tasks.find((item) => item.id === taskId)
+    if (!latest || latest.status !== 'running' || !isCloudMode()) return
+    subscribeToCloudTask(latest)
+  }, CLOUD_TASK_RECONNECT_MS)
+  cloudTaskReconnectTimers.set(taskId, timer)
+}
+
+function subscribeToCloudTask(task: TaskRecord, options: { notifyDone?: boolean; revealError?: boolean } = {}) {
+  if (!isCloudMode() || task.status !== 'running' || cloudTaskSubscriptionCleanups.has(task.id)) return
+  clearCloudTaskReconnectTimer(task.id)
+
+  const unsubscribe = subscribeCloudTask(
+    task.id,
+    (event) => {
+      if (event.type === 'partial') {
+        useStore.getState().setTaskStreamPreview(task.id, event.image, event.requestIndex)
+        return
+      }
+
+      const previousTask = applyRemoteTaskUpdate(event.task)
+      if (event.task.status !== 'running') useStore.getState().setTaskStreamPreview(task.id)
+      const completedNow = previousTask?.status === 'running' && event.task.status === 'done'
+      const failedNow = previousTask?.status === 'running' && event.task.status === 'error'
+      if ((event.type === 'done' || completedNow) && options.notifyDone) {
+        useStore.getState().showToast(`生成完成，共 ${event.task.outputImages.length} 张图片`, 'success')
+      }
+      if ((event.type === 'error' || failedNow) && options.revealError) {
+        useStore.getState().setDetailTaskId(task.id)
+      }
+    },
+    () => {
+      stopCloudTaskSubscription(task.id)
+      const latest = useStore.getState().tasks.find((item) => item.id === task.id)
+      if (latest?.status === 'running' && isCloudMode()) scheduleCloudTaskSubscriptionRetry(task.id)
+    },
+  )
+  cloudTaskSubscriptionCleanups.set(task.id, unsubscribe)
+}
+
+function resumeCloudRunningTasks(tasks: TaskRecord[]) {
+  for (const task of tasks) {
+    if (task.status === 'running') subscribeToCloudTask(task, { notifyDone: true, revealError: true })
+  }
+}
+
+function executeCloudTask(task: TaskRecord) {
+  const handleTaskCreateError = (error: Error) => {
+    const latest = useStore.getState().tasks.find((item) => item.id === task.id) ?? task
+    if (latest.status !== 'running') return
+    applyRemoteTaskUpdate({
+      ...latest,
+      status: 'error',
+      error: error.message,
+      finishedAt: Date.now(),
+      elapsed: Date.now() - latest.createdAt,
+    })
+    useStore.getState().setDetailTaskId(task.id)
+  }
+
+  void createCloudTask(task)
+    .then((createdTask) => {
+      applyRemoteTaskUpdate(createdTask)
+      subscribeToCloudTask(createdTask, { notifyDone: true, revealError: true })
+    })
+    .catch(handleTaskCreateError)
+}
+
 async function executeTask(taskId: string) {
   const { settings } = useStore.getState()
   const task = useStore.getState().tasks.find((t) => t.id === taskId)
@@ -4006,7 +4789,7 @@ async function executeTask(taskId: string) {
     // 存储输出图片
     const outputIds: string[] = []
     for (const dataUrl of result.images) {
-      const imgId = await storeImage(dataUrl, 'generated')
+      const imgId = await storeImage(dataUrl, 'generated', taskId)
       cacheImage(imgId, dataUrl)
       outputIds.push(imgId)
     }
@@ -4352,9 +5135,12 @@ export async function retryTask(task: TaskRecord) {
 
   const latestTasks = useStore.getState().tasks
   useStore.getState().setTasks([newTask, ...latestTasks])
-  await putTask(newTask)
-
-  executeTask(taskId)
+  if (isCloudMode()) {
+    executeCloudTask(newTask)
+  } else {
+    await putTask(newTask)
+    executeTask(taskId)
+  }
 }
 
 /** 复用配置 */
@@ -4459,7 +5245,9 @@ export async function removeMultipleTasks(taskIds: string[]) {
 
   setTasks(remaining)
   for (const id of taskIds) {
-    await dbDeleteTask(id)
+    stopCloudTaskSubscription(id)
+    if (isCloudMode()) await deleteCloudTask(id)
+    else await dbDeleteTask(id)
   }
 
   // 找出其他任务仍引用的图片
@@ -4474,9 +5262,7 @@ export async function removeMultipleTasks(taskIds: string[]) {
   // 删除孤立图片
   for (const imgId of deletedImageIds) {
     if (!stillUsed.has(imgId)) {
-      await deleteImage(imgId)
-      imageCache.delete(imgId)
-      thumbnailCache.delete(imgId)
+      await cleanupImageForCurrentMode(imgId)
     }
   }
 
@@ -4504,7 +5290,9 @@ export async function removeTask(task: TaskRecord) {
   // 从列表移除
   const remaining = await scrubAgentOutputPayloadsForDeletedTasks([task], tasks.filter((t) => t.id !== task.id))
   setTasks(remaining)
-  await dbDeleteTask(task.id)
+  stopCloudTaskSubscription(task.id)
+  if (isCloudMode()) await deleteCloudTask(task.id)
+  else await dbDeleteTask(task.id)
 
   // 找出其他任务仍引用的图片
   const stillUsed = new Set<string>()
@@ -4518,9 +5306,7 @@ export async function removeTask(task: TaskRecord) {
   // 删除孤立图片
   for (const imgId of taskImageIds) {
     if (!stillUsed.has(imgId)) {
-      await deleteImage(imgId)
-      imageCache.delete(imgId)
-      thumbnailCache.delete(imgId)
+      await cleanupImageForCurrentMode(imgId)
     }
   }
 
@@ -4537,7 +5323,18 @@ export interface ClearOptions {
 export async function clearData(options: ClearOptions = { clearConfig: true, clearTasks: true }) {
   const { setTasks, clearInputImages, clearMaskDraft, setSettings, setParams, showToast } = useStore.getState()
 
+  if (isCloudMode() && (options.clearConfig || options.clearTasks)) {
+    try {
+      await clearCloudData(options)
+      lastCloudSettingsSnapshot = ''
+    } catch (error) {
+      showToast(`云端数据清空失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+      return
+    }
+  }
+
   if (options.clearTasks) {
+    stopAllCloudTaskSubscriptions()
     await dbClearTasks()
     await dbClearAgentConversations()
     await clearImages()
@@ -4592,7 +5389,7 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
   const actualParamsList = await readImageSizeParamsList(result.images)
   const outputIds: string[] = []
   for (const dataUrl of result.images) {
-    const imgId = await storeImage(dataUrl, 'generated')
+    const imgId = await storeImage(dataUrl, 'generated', task.id)
     cacheImage(imgId, dataUrl)
     outputIds.push(imgId)
   }
@@ -4881,9 +5678,11 @@ export async function addImageFromFile(file: File): Promise<void> {
 export async function createInputImageFromFile(file: File): Promise<InputImage | null> {
   if (!file.type.startsWith('image/')) return null
   const dataUrl = await fileToDataUrl(file)
-  const id = await storeImage(dataUrl, 'upload')
+  const id = await storeImageForCurrentMode(dataUrl, 'upload', null, { backgroundCloudSync: true })
   cacheImage(id, dataUrl)
-  return { id, dataUrl }
+  return isCloudMode()
+    ? { id, dataUrl, uploadStatus: 'pending', remoteSynced: false }
+    : { id, dataUrl }
 }
 
 /** 添加图片到输入（右键菜单）—— 支持 data/blob/http URL */
@@ -4892,9 +5691,11 @@ export async function addImageFromUrl(src: string): Promise<void> {
   const blob = await res.blob()
   if (!blob.type.startsWith('image/')) throw new Error('不是有效的图片')
   const dataUrl = await blobToDataUrl(blob)
-  const id = await storeImage(dataUrl, 'upload')
+  const id = await storeImageForCurrentMode(dataUrl, 'upload', null, { backgroundCloudSync: true })
   cacheImage(id, dataUrl)
-  useStore.getState().addInputImage({ id, dataUrl })
+  useStore.getState().addInputImage(isCloudMode()
+    ? { id, dataUrl, uploadStatus: 'pending', remoteSynced: false }
+    : { id, dataUrl })
 }
 
 function fileToDataUrl(file: File): Promise<string> {

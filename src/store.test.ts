@@ -211,6 +211,7 @@ describe('mask draft lifecycle in store actions', () => {
       maskEditorImageId: null,
       params: { ...DEFAULT_PARAMS },
       tasks: [],
+      taskScrollTargetId: null,
       detailTaskId: null,
       lightboxImageId: null,
       lightboxImageList: [],
@@ -258,7 +259,24 @@ describe('mask draft lifecycle in store actions', () => {
 
     const state = useStore.getState()
     expect(state.tasks).toHaveLength(1)
+    expect(state.prompt).toBe('prompt')
+    expect(state.taskScrollTargetId).toBe(state.tasks[0]?.id)
     expect(state.showToast).toHaveBeenCalledWith('任务已提交', 'success')
+  })
+
+  it('clears prompt and references after submit when the setting is enabled', async () => {
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, apiKey: 'test-key', clearInputAfterSubmit: true },
+      prompt: `参考 ${getSelectedImageMentionLabel(0)} 生成`,
+      inputImages: [imageA],
+    })
+
+    await submitTask()
+
+    const state = useStore.getState()
+    expect(state.tasks).toHaveLength(1)
+    expect(state.prompt).toBe('')
+    expect(state.inputImages).toEqual([])
   })
 
   it('preserves selected image mentions when replacing a mask target with an equivalent image id', () => {

@@ -9,6 +9,8 @@ export default function TaskGrid() {
   const filterFavorite = useStore((s) => s.filterFavorite)
   const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
   const setDetailTaskId = useStore((s) => s.setDetailTaskId)
+  const taskScrollTargetId = useStore((s) => s.taskScrollTargetId)
+  const setTaskScrollTargetId = useStore((s) => s.setTaskScrollTargetId)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const selectedTaskIds = useStore((s) => s.selectedTaskIds)
   const setSelectedTaskIds = useStore((s) => s.setSelectedTaskIds)
@@ -47,6 +49,24 @@ export default function TaskGrid() {
       return prompt.includes(q) || paramStr.includes(q)
     })
   }, [tasks, searchQuery, filterStatus, filterFavorite, activeFavoriteCollectionId])
+
+  useEffect(() => {
+    if (!taskScrollTargetId) return
+    if (!tasks.some((task) => task.id === taskScrollTargetId)) {
+      setTaskScrollTargetId(null)
+      return
+    }
+    if (!filteredTasks.some((task) => task.id === taskScrollTargetId)) return
+
+    const frame = window.requestAnimationFrame(() => {
+      const target = gridRef.current?.querySelector<HTMLElement>(`[data-task-id="${taskScrollTargetId}"]`)
+      if (!target) return
+      const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
+      target.scrollIntoView({ behavior, block: 'center', inline: 'nearest' })
+      setTaskScrollTargetId(null)
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [filteredTasks, setTaskScrollTargetId, taskScrollTargetId, tasks])
 
   const handleDelete = (task: typeof tasks[0]) => {
     setConfirmDialog({

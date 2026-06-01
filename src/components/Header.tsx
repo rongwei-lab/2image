@@ -8,7 +8,7 @@ import ViewportTooltip from './ViewportTooltip'
 import HelpModal from './HelpModal'
 import HistoryModal from './HistoryModal'
 import { useFavoriteCollectionTitle } from './FavoriteCollections'
-import { EditIcon, HelpCircleIcon, HistoryIcon, InstallIcon, SettingsIcon } from './icons'
+import { EditIcon, HelpCircleIcon, HistoryIcon, InstallIcon, SettingsIcon, WrenchIcon } from './icons'
 
 type BeforeInstallPromptEvent = Event & {
   prompt: () => Promise<void>
@@ -25,6 +25,10 @@ export default function Header() {
   const setAppMode = useStore((s) => s.setAppMode)
   const setShowSettings = useStore((s) => s.setShowSettings)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
+  const cloudUser = useStore((s) => s.cloudUser)
+  const cloudLogout = useStore((s) => s.cloudLogout)
+  const setShowLogin = useStore((s) => s.setShowLogin)
+  const showToast = useStore((s) => s.showToast)
   const agentMobileHeaderVisible = useStore((s) => s.agentMobileHeaderVisible)
   const setAgentMobileHeaderVisible = useStore((s) => s.setAgentMobileHeaderVisible)
   const agentConversations = useStore((s) => s.agentConversations)
@@ -88,8 +92,14 @@ export default function Header() {
   }, [appMode, agentMobileHeaderVisible])
 
   const installTooltip = useTooltip()
+  const adminTooltip = useTooltip()
   const helpTooltip = useTooltip()
   const settingsTooltip = useTooltip()
+
+  const openAdminPage = () => {
+    window.history.pushState(null, '', '/admin')
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  }
 
   useEffect(() => {
     const handleBeforeInstallPrompt = (event: Event) => {
@@ -256,6 +266,51 @@ export default function Header() {
             </button>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {cloudUser?.isAdmin && (
+              <div
+                className="relative"
+                {...adminTooltip.handlers}
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    dismissAllTooltips()
+                    openAdminPage()
+                  }}
+                  className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-900 transition-colors"
+                  aria-label="管理后台"
+                >
+                  <WrenchIcon className="w-5 h-5 text-gray-600 dark:text-gray-400" />
+                </button>
+                <ViewportTooltip visible={adminTooltip.visible} className="whitespace-nowrap">
+                  管理后台
+                </ViewportTooltip>
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                if (!cloudUser) {
+                  setShowLogin(true)
+                  return
+                }
+                setConfirmDialog({
+                  title: '退出云端工作台',
+                  message: `当前账号：${cloudUser.email}\n\n退出后将回到本地工作台，已同步到云端的数据仍会保留。`,
+                  confirmText: '退出登录',
+                  cancelText: '取消',
+                  action: () => {
+                    void cloudLogout()
+                      .then(() => showToast('已退出云端工作台', 'success'))
+                      .catch((error) => showToast(error instanceof Error ? error.message : String(error), 'error'))
+                  },
+                })
+              }}
+              className={`px-3 py-2 rounded-lg text-xs sm:text-sm transition-colors ${cloudUser ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-500/10 dark:text-emerald-300' : 'hover:bg-gray-100 dark:hover:bg-gray-900 text-gray-600 dark:text-gray-400'}`}
+              title={cloudUser ? `云端：${cloudUser.email}` : '登录云端工作台'}
+            >
+              {cloudUser ? '云端' : '登录'}
+            </button>
             {!isPwaInstalled && (
               <div
                 className="relative"

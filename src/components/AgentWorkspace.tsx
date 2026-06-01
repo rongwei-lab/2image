@@ -329,6 +329,8 @@ export default function AgentWorkspace() {
   const tasks = useStore((s) => s.tasks)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const setDetailTaskId = useStore((s) => s.setDetailTaskId)
+  const taskScrollTargetId = useStore((s) => s.taskScrollTargetId)
+  const setTaskScrollTargetId = useStore((s) => s.setTaskScrollTargetId)
   const setPrompt = useStore((s) => s.setPrompt)
   const setInputImages = useStore((s) => s.setInputImages)
   const setMaskDraft = useStore((s) => s.setMaskDraft)
@@ -572,6 +574,24 @@ export default function AgentWorkspace() {
     const frame = window.requestAnimationFrame(updateIsScrolledToBottom)
     return () => window.cancelAnimationFrame(frame)
   }, [activeMessages, activeRounds, updateIsScrolledToBottom])
+
+  useEffect(() => {
+    if (appMode !== 'agent' || !taskScrollTargetId) return
+    if (!tasks.some((task) => task.id === taskScrollTargetId)) {
+      setTaskScrollTargetId(null)
+      return
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.querySelector<HTMLElement>(`[data-agent-task-id="${taskScrollTargetId}"]`)
+      if (!target) return
+      const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
+      target.scrollIntoView({ behavior, block: 'center', inline: 'nearest' })
+      setTaskScrollTargetId(null)
+      updateIsScrolledToBottom()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [activeMessages, appMode, setTaskScrollTargetId, taskScrollTargetId, tasks, updateIsScrolledToBottom])
 
   useEffect(() => {
     if (!scrollTargetRoundId) return
@@ -1107,7 +1127,7 @@ export default function AgentWorkspace() {
                                 )
                               }
                               return (
-                                <div key={block.key} className="mt-4 max-w-sm" onClick={e => e.stopPropagation()}>
+                                <div key={block.key} data-agent-task-id={block.task.id} className="mt-4 max-w-sm" onClick={e => e.stopPropagation()}>
                                   <TaskCard
                                     task={block.task}
                                     disableSwipe={true}

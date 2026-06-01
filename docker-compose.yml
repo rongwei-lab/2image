@@ -1,0 +1,91 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      - api
+    environment:
+      HOST: 0.0.0.0
+      PORT: 80
+      ENABLE_API_PROXY: "false"
+    ports:
+      - "${WEB_PORT:-18080}:80"
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/api.Dockerfile
+    # 不走代理时避开宿主机代理软件的 fake-ip DNS，确保容器解析到真实上游地址。
+    dns:
+      - ${DOCKER_DNS_PRIMARY:-223.5.5.5}
+      - ${DOCKER_DNS_SECONDARY:-114.114.114.114}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8788
+      DATABASE_URL: postgres://gip:gip_password@postgres:5432/gip
+      SESSION_SECRET: ${SESSION_SECRET:-change-this-session-secret-at-least-32-chars}
+      KEY_ENCRYPTION_SECRET: ${KEY_ENCRYPTION_SECRET:-change-this-key-encryption-secret-32}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
+      ALLOW_INSECURE_DEFAULTS: ${ALLOW_INSECURE_DEFAULTS:-true}
+      COOKIE_SECURE: "false"
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: gpt-image-playground
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      S3_FORCE_PATH_STYLE: "true"
+      # 后端容器访问上游模型 API 的代理。使用本机代理时，请先开启代理的局域网访问。
+      NODE_USE_ENV_PROXY: ${NODE_USE_ENV_PROXY:-1}
+      HTTP_PROXY: ${APP_HTTP_PROXY:-}
+      HTTPS_PROXY: ${APP_HTTPS_PROXY:-}
+      ALL_PROXY: ${APP_ALL_PROXY:-}
+      NO_PROXY: ${APP_NO_PROXY:-localhost,127.0.0.1,::1,postgres,minio,api,web,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
+    ports:
+      - "${API_HOST_BIND:-0.0.0.0}:${API_PORT:-8788}:8788"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gip
+      POSTGRES_PASSWORD: gip_password
+      POSTGRES_DB: gip
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gip -d gip"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "${MINIO_HOST_BIND:-0.0.0.0}:${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_HOST_BIND:-0.0.0.0}:${MINIO_CONSOLE_PORT:-9001}:9001"
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${S3_ACCESS_KEY_ID:-minioadmin} ${S3_SECRET_ACCESS_KEY:-minioadmin}; do sleep 1; done;
+      mc mb -p local/gpt-image-playground || true;
+      "
+
+volumes:
+  postgres-data:
+  minio-data:

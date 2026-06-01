@@ -26,6 +26,9 @@ export async function dataUrlToBlob(dataUrl: string, fallbackType = 'image/png')
 }
 
 export async function imageDataUrlToPngBlob(dataUrl: string): Promise<Blob> {
+  if (typeof document === 'undefined' || typeof Image === 'undefined') {
+    return dataUrlToBlob(dataUrl, 'image/png')
+  }
   const image = await loadImage(dataUrl)
   const canvas = document.createElement('canvas')
   canvas.width = image.naturalWidth

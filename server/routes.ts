@@ -1,0 +1,2214 @@
+import type { FastifyInstance, FastifyReply } from 'fastify'
+import type { S3Client } from '@aws-sdk/client-s3'
+import net from 'node:net'
+import type { AgentConversation, ApiProfile, AppSettings, PlatformSettings, TaskRecord, TaskParams } from '../src/types'
+import { DEFAULT_PARAMS } from '../src/types'
+import { getActiveApiProfile, normalizeSettings } from '../src/lib/apiProfiles'
+import { applyPlatformSettingsToAppSettings, normalizePlatformSettings, sanitizePlatformSettingsForClient } from '../src/lib/platformSettings'
+import { callImageApi } from '../src/lib/api'
+import {
+  callAgentConversationTitleApi,
+  callAgentResponsesApi,
+  callBatchImageSingle,
+  type AgentApiResult,
+  type AgentApiResultImage,
+  type BatchImageCallResult,
+} from '../src/lib/agentApi'
+import type { Db } from './db'
+import type { ServerConfig } from './config'
+import { hashPassword, requireAuth, type AuthUser } from './auth'
+import { decryptText, encryptText } from './crypto'
+import { bufferToDataUrl, parseImageDataUrl, resolveImageStorageId } from './imageData'
+import { createSignedImageUrl, deleteObjects, getObjectBuffer, listObjectKeys, putObject } from './storage'
+
+type TaskEvent =
+  | { type: 'task'; task: TaskRecord }
+  | { type: 'partial'; taskId: string; image: string; requestIndex?: number }
+  | { type: 'done'; task: TaskRecord }
+  | { type: 'error'; task: TaskRecord }
+
+const taskSubscribers = new Map<string, Set<FastifyReply>>()
+const PLATFORM_SETTINGS_KEY = 'platform'
+const UPSTREAM_CONNECT_TIMEOUT_MS = 8_000
+const PLATFORM_TEST_TIMEOUT_MS = 10_000
+
+type SseEvent =
+  | { type: 'text_delta'; delta: string }
+  | { type: 'output_items'; outputItems: unknown[] }
+  | { type: 'image_tool_started'; event: { toolCallId: string; outputIndex?: number } }
+  | { type: 'image_partial_image'; event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number } }
+  | { type: 'image_tool_completed'; image: AgentApiResultImage }
+  | { type: 'batch_image_started' }
+  | { type: 'batch_partial_image'; event: { image: string; partialImageIndex?: number } }
+  | { type: 'batch_image_completed'; image: AgentApiResultImage }
+  | { type: 'done'; result: AgentApiResult | BatchImageCallResult }
+  | { type: 'error'; error: string }
+
+type AdminUserRow = {
+  id: string
+  email: string
+  is_admin: boolean
+  disabled_at: string | null
+  registration_status: string
+  registration_requested_at: string | null
+  registration_reviewed_at: string | null
+  registration_reviewed_by: string | null
+  created_at: string
+  updated_at: string
+  storage_quota_bytes: string | number | null
+  task_quota_count: string | number | null
+  latest_session_at: string | null
+  task_count: string | number
+  running_task_count: string | number
+  image_count: string | number
+  storage_bytes: string | number
+  conversation_count: string | number
+  session_count: string | number
+}
+
+type AuditLogRow = {
+  id: string
+  action: string
+  details: Record<string, unknown>
+  ip: string | null
+  user_agent: string | null
+  created_at: string
+  actor_email: string | null
+  target_email: string | null
+}
+
+type AdminGenerationTaskRow = {
+  user_id: string
+  user_email: string
+  record: TaskRecord
+  updated_at: string
+}
+
+type AdminGenerationConversationRow = {
+  user_id: string
+  id: string
+  conversation: AgentConversation
+}
+
+type AdminGenerationImageRow = {
+  id: string
+  source: string
+  byte_size: string | number
+  width: string | number | null
+  height: string | number | null
+  created_at: string
+  updated_at: string
+  has_thumbnail: boolean
+}
+
+type PlatformTestStatus = 'success' | 'warning' | 'error' | 'skipped'
+
+type PlatformTestCheck = {
+  id: string
+  label: string
+  status: PlatformTestStatus
+  detail: string
+  elapsedMs?: number
+}
+
+type PlatformTestResult = {
+  ok: boolean
+  testedAt: string
+  profile: {
+    id: string
+    name: string
+    provider: string
+    baseUrl: string
+    model: string
+    apiMode: string
+    hasApiKey: boolean
+  }
+  checks: PlatformTestCheck[]
+}
+
+type RegistrationStatus = 'approved' | 'pending' | 'rejected'
+
+function taskEventKey(userId: string, taskId: string) {
+  return `${userId}:${taskId}`
+}
+
+function publishTaskEvent(userId: string, taskId: string, event: TaskEvent) {
+  const subscribers = taskSubscribers.get(taskEventKey(userId, taskId))
+  if (!subscribers?.size) return
+  const payload = `data: ${JSON.stringify(event)}\n\n`
+  for (const reply of subscribers) {
+    reply.raw.write(payload)
+  }
+}
+
+function getErrorCauseMessage(error: unknown): string | null {
+  if (!error || typeof error !== 'object' || !('cause' in error)) return null
+  const cause = (error as { cause?: unknown }).cause
+  if (!cause) return null
+  if (cause instanceof Error) return cause.message
+  if (typeof cause === 'object' && 'code' in cause) return String((cause as { code?: unknown }).code)
+  return String(cause)
+}
+
+function formatGenerationError(error: unknown, profile?: ApiProfile | null) {
+  const message = error instanceof Error ? error.message : String(error)
+  const causeMessage = getErrorCauseMessage(error)
+  const diagnostic = [message, causeMessage].filter(Boolean).join(' / ')
+  const isNetworkError = /fetch failed|operation was aborted|aborted|timeout|timed out|超时|无法连接|连接.*失败|ECONN|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN/i.test(diagnostic)
+  if (!isNetworkError) return message
+
+  const target = profile?.baseUrl ? `（${profile.baseUrl}）` : ''
+  return [
+    `连接上游 API 失败${target}：${message}`,
+    causeMessage ? `底层原因：${causeMessage}` : '',
+    '请检查后端 Docker 容器是否能访问外网；如果本机使用代理/TUN，请开启代理的局域网访问，并在 .env 中配置 APP_HTTP_PROXY/APP_HTTPS_PROXY 后重启 Docker。',
+  ].filter(Boolean).join('。')
+}
+
+function normalizeProxyUrl(raw: string | undefined) {
+  const value = raw?.trim()
+  if (!value) return null
+  const withProtocol = /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(value)
+    ? value
+    : `http://${value}`
+  try {
+    const url = new URL(withProtocol)
+    if (!url.hostname) return null
+    return url
+  } catch {
+    return null
+  }
+}
+
+function getProxyForProtocol(protocol: string) {
+  const env = process.env
+  if (protocol === 'http:') {
+    return normalizeProxyUrl(env.HTTP_PROXY ?? env.http_proxy) ??
+      normalizeProxyUrl(env.ALL_PROXY ?? env.all_proxy)
+  }
+  if (protocol === 'https:') {
+    return normalizeProxyUrl(env.HTTPS_PROXY ?? env.https_proxy) ??
+      normalizeProxyUrl(env.HTTP_PROXY ?? env.http_proxy) ??
+      normalizeProxyUrl(env.ALL_PROXY ?? env.all_proxy)
+  }
+  return normalizeProxyUrl(env.ALL_PROXY ?? env.all_proxy)
+}
+
+async function assertTcpReachable(host: string, port: number, timeoutMessage: string, errorMessage: string) {
+  await new Promise<void>((resolve, reject) => {
+    const socket = net.connect({ host, port, timeout: UPSTREAM_CONNECT_TIMEOUT_MS }, () => {
+      socket.destroy()
+      resolve()
+    })
+    socket.on('timeout', () => {
+      socket.destroy()
+      reject(new Error(timeoutMessage))
+    })
+    socket.on('error', (error) => {
+      socket.destroy()
+      reject(new Error(`${errorMessage}（${error.message}）`))
+    })
+  })
+}
+
+async function assertUpstreamTcpReachable(profile: ApiProfile) {
+  let url: URL
+  try {
+    url = new URL(profile.baseUrl)
+  } catch {
+    return
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return
+
+  const proxy = getProxyForProtocol(url.protocol)
+  if (proxy) {
+    const proxyPort = proxy.port ? Number(proxy.port) : proxy.protocol === 'https:' ? 443 : 80
+    await assertTcpReachable(
+      proxy.hostname,
+      proxyPort,
+      `后端容器连接代理服务器超时：${proxy.hostname}:${proxyPort}`,
+      `后端容器连接代理服务器失败：${proxy.hostname}:${proxyPort}`,
+    )
+    return
+  }
+
+  const port = url.port ? Number(url.port) : url.protocol === 'https:' ? 443 : 80
+  await assertTcpReachable(
+    url.hostname,
+    port,
+    `后端容器连接上游 API 超时：${url.hostname}:${port}`,
+    `后端容器连接上游 API 失败：${url.hostname}:${port}`,
+  )
+}
+
+function createPlatformTestCheck(
+  id: string,
+  label: string,
+  status: PlatformTestStatus,
+  detail: string,
+  elapsedMs?: number,
+): PlatformTestCheck {
+  return {
+    id,
+    label,
+    status,
+    detail,
+    ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+  }
+}
+
+async function measureCheck(run: () => Promise<string>) {
+  const startedAt = Date.now()
+  const detail = await run()
+  return { detail, elapsedMs: Date.now() - startedAt }
+}
+
+function buildOpenAiCompatibleEndpoint(baseUrl: string, endpoint: string) {
+  const trimmed = baseUrl.trim().replace(/\/+$/, '')
+  const path = endpoint.replace(/^\/+/, '')
+  if (!trimmed) throw new Error('缺少 API URL')
+  const withProtocol = /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(trimmed) ? trimmed : `https://${trimmed}`
+  const url = new URL(withProtocol)
+  const normalizedPath = url.pathname.replace(/\/+$/, '')
+  if (normalizedPath.endsWith('/v1')) {
+    url.pathname = `${normalizedPath}/${path}`
+  } else {
+    url.pathname = `${normalizedPath}/v1/${path}`.replace(/\/+/g, '/')
+  }
+  return url.toString()
+}
+
+function getProfileForPlatformTest(saved: PlatformSettings, draftInput: unknown) {
+  const draft = normalizePlatformSettings(draftInput ?? saved)
+  const savedSettings = normalizeSettings(saved.api.settings)
+  const savedProfiles = new Map(savedSettings.profiles.map((profile) => [profile.id, profile]))
+  const draftSettings = normalizeSettings(draft.api.settings)
+  const profiles = draftSettings.profiles.map((profile) => {
+    const savedProfile = savedProfiles.get(profile.id)
+    const apiKey = profile.apiKey.trim() || savedProfile?.apiKey.trim() || ''
+    return {
+      ...profile,
+      apiKey,
+      hasStoredApiKey: Boolean(apiKey || profile.hasStoredApiKey || savedProfile?.hasStoredApiKey),
+    }
+  })
+  const settings = normalizeSettings({ ...draftSettings, profiles })
+  return {
+    settings,
+    profile: getActiveApiProfile(settings),
+  }
+}
+
+async function testPlatformSettings(db: Db, config: ServerConfig, draftInput: unknown): Promise<PlatformTestResult> {
+  const saved = await loadPlatformSettings(db, config, { includeApiKeys: true })
+  const { settings, profile } = getProfileForPlatformTest(saved, draftInput)
+  const checks: PlatformTestCheck[] = []
+
+  const profileSummary = {
+    id: profile.id,
+    name: profile.name,
+    provider: profile.provider,
+    baseUrl: profile.baseUrl,
+    model: profile.model,
+    apiMode: profile.apiMode,
+    hasApiKey: Boolean(profile.apiKey.trim()),
+  }
+
+  let upstreamUrl: URL | null = null
+  try {
+    upstreamUrl = new URL(profile.baseUrl)
+    checks.push(createPlatformTestCheck(
+      'config',
+      '配置检查',
+      profile.apiKey.trim() ? 'success' : 'error',
+      profile.apiKey.trim()
+        ? `当前测试 ${profile.provider} / ${profile.model}`
+        : '缺少 API Key：请输入新 Key，或先保存一次让后端沿用已保存 Key。',
+    ))
+  } catch {
+    checks.push(createPlatformTestCheck('config', '配置检查', 'error', 'API URL 格式无效'))
+  }
+
+  if (!upstreamUrl || !profile.apiKey.trim()) {
+    return { ok: false, testedAt: new Date().toISOString(), profile: profileSummary, checks }
+  }
+
+  const proxy = getProxyForProtocol(upstreamUrl.protocol)
+  if (proxy) {
+    const proxyPort = proxy.port ? Number(proxy.port) : proxy.protocol === 'https:' ? 443 : 80
+    try {
+      const measured = await measureCheck(async () => {
+        await assertTcpReachable(
+          proxy.hostname,
+          proxyPort,
+          `后端容器连接代理服务器超时：${proxy.hostname}:${proxyPort}`,
+          `后端容器连接代理服务器失败：${proxy.hostname}:${proxyPort}`,
+        )
+        return `代理服务器可访问：${proxy.hostname}:${proxyPort}`
+      })
+      checks.push(createPlatformTestCheck('proxy', '代理连通性', 'success', measured.detail, measured.elapsedMs))
+    } catch (error) {
+      checks.push(createPlatformTestCheck(
+        'proxy',
+        '代理连通性',
+        'error',
+        error instanceof Error ? error.message : String(error),
+      ))
+      return { ok: false, testedAt: new Date().toISOString(), profile: profileSummary, checks }
+    }
+    checks.push(createPlatformTestCheck('upstream-tcp', '上游 TCP', 'skipped', '已配置代理，上游 TCP 由代理服务器访问。'))
+  } else {
+    const port = upstreamUrl.port ? Number(upstreamUrl.port) : upstreamUrl.protocol === 'https:' ? 443 : 80
+    try {
+      const measured = await measureCheck(async () => {
+        await assertTcpReachable(
+          upstreamUrl.hostname,
+          port,
+          `后端容器连接上游 API 超时：${upstreamUrl.hostname}:${port}`,
+          `后端容器连接上游 API 失败：${upstreamUrl.hostname}:${port}`,
+        )
+        return `上游地址可访问：${upstreamUrl.hostname}:${port}`
+      })
+      checks.push(createPlatformTestCheck('upstream-tcp', '上游 TCP', 'success', measured.detail, measured.elapsedMs))
+    } catch (error) {
+      checks.push(createPlatformTestCheck(
+        'upstream-tcp',
+        '上游 TCP',
+        'error',
+        error instanceof Error ? error.message : String(error),
+      ))
+      return { ok: false, testedAt: new Date().toISOString(), profile: profileSummary, checks }
+    }
+  }
+
+  if (settings.codexCli || profile.codexCli || profile.provider !== 'openai') {
+    checks.push(createPlatformTestCheck('auth', '接口认证', 'skipped', '当前服务商暂只做网络连通性测试。'))
+    return { ok: !checks.some((check) => check.status === 'error'), testedAt: new Date().toISOString(), profile: profileSummary, checks }
+  }
+
+  try {
+    const endpoint = buildOpenAiCompatibleEndpoint(profile.baseUrl, 'models')
+    const measured = await measureCheck(async () => {
+      const response = await fetch(endpoint, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${profile.apiKey}`,
+          Accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(PLATFORM_TEST_TIMEOUT_MS),
+      })
+      const text = await response.text().catch(() => '')
+      if (response.ok) return `/models 请求成功，API Key 可用（HTTP ${response.status}）`
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(`API Key 认证失败（HTTP ${response.status}）：${text.slice(0, 300) || response.statusText}`)
+      }
+      if (response.status === 404 || response.status === 405) {
+        return `上游可达，但不支持 /models 测试端点（HTTP ${response.status}）。生成接口仍可能可用。`
+      }
+      throw new Error(`测试端点返回 HTTP ${response.status}：${text.slice(0, 300) || response.statusText}`)
+    })
+    const isWarning = /不支持 \/models/.test(measured.detail)
+    checks.push(createPlatformTestCheck('auth', '接口认证', isWarning ? 'warning' : 'success', measured.detail, measured.elapsedMs))
+  } catch (error) {
+    checks.push(createPlatformTestCheck('auth', '接口认证', 'error', formatGenerationError(error, profile)))
+  }
+
+  return {
+    ok: !checks.some((check) => check.status === 'error'),
+    testedAt: new Date().toISOString(),
+    profile: profileSummary,
+    checks,
+  }
+}
+
+function writeSse(reply: FastifyReply, event: SseEvent) {
+  reply.raw.write(`data: ${JSON.stringify(event)}\n\n`)
+}
+
+function openSse(reply: FastifyReply) {
+  reply.hijack()
+  reply.raw.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+  })
+}
+
+async function requireAdmin(db: Db, request: Parameters<typeof requireAuth>[1], reply: FastifyReply): Promise<AuthUser | null> {
+  const user = await requireAuth(db, request, reply)
+  if (!user) return null
+  if (!user.isAdmin) {
+    void reply.code(403).send({ error: '需要管理员权限' })
+    return null
+  }
+  return user
+}
+
+function toNumber(value: string | number | null | undefined): number {
+  const numberValue = Number(value ?? 0)
+  return Number.isFinite(numberValue) ? numberValue : 0
+}
+
+function toOptionalNumber(value: string | number | null | undefined): number | null {
+  if (value == null) return null
+  const numberValue = Number(value)
+  return Number.isFinite(numberValue) ? numberValue : null
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function getRequestIp(request: Parameters<typeof requireAuth>[1]) {
+  const forwardedFor = request.headers['x-forwarded-for']
+  if (typeof forwardedFor === 'string' && forwardedFor.trim()) return forwardedFor.split(',')[0]?.trim() ?? null
+  return request.ip || request.socket.remoteAddress || null
+}
+
+async function writeAuditLog(
+  db: Db,
+  request: Parameters<typeof requireAuth>[1],
+  input: {
+    actor?: AuthUser | null
+    targetUserId?: string | null
+    action: string
+    details?: Record<string, unknown>
+  },
+) {
+  await db.query(
+    `
+      INSERT INTO audit_logs (actor_user_id, target_user_id, action, details, ip, user_agent)
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `,
+    [
+      input.actor?.id ?? null,
+      input.targetUserId ?? null,
+      input.action,
+      input.details ?? {},
+      getRequestIp(request),
+      typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null,
+    ],
+  )
+}
+
+async function loadActiveGenerationProfile(db: Db, config: ServerConfig, userId: string) {
+  const settings = await loadGenerationSettings(db, config, userId)
+  if (!settings) throw new Error('缺少云端 API 配置')
+  const profile = getActiveApiProfile(settings)
+  if (!profile.apiKey.trim()) throw new Error('缺少云端 API Key，请在设置中保存 API Key')
+  return { settings, profile }
+}
+
+function closeTaskSubscribers(userId: string, taskId: string) {
+  const key = taskEventKey(userId, taskId)
+  const subscribers = taskSubscribers.get(key)
+  if (!subscribers?.size) return
+  for (const reply of subscribers) reply.raw.end()
+  taskSubscribers.delete(key)
+}
+
+function sanitizeSettingsForClient(settings: AppSettings): AppSettings {
+  const normalized = normalizeSettings(settings)
+  return {
+    ...normalized,
+    apiKey: '',
+    profiles: normalized.profiles.map((profile) => ({ ...profile, apiKey: '' })),
+  }
+}
+
+function getEncryptedPlatformApiKeys(value: unknown): Record<string, string> {
+  const record = isRecord(value) ? value : {}
+  const apiRecord = isRecord(record.api) ? record.api : {}
+  const encryptedApiKeys = isRecord(apiRecord.encryptedApiKeys) ? apiRecord.encryptedApiKeys : {}
+  return Object.fromEntries(
+    Object.entries(encryptedApiKeys).filter((entry): entry is [string, string] =>
+      typeof entry[0] === 'string' && typeof entry[1] === 'string' && Boolean(entry[1]),
+    ),
+  )
+}
+
+function tryDecryptText(payload: string | null | undefined, secret: string): string {
+  try {
+    return decryptText(payload, secret)
+  } catch {
+    return ''
+  }
+}
+
+async function loadPlatformSettings(
+  db: Db,
+  config: ServerConfig,
+  options: { includeApiKeys?: boolean } = {},
+): Promise<PlatformSettings> {
+  const result = await db.query<{ value: unknown; updated_at: string }>(
+    'SELECT value, updated_at FROM platform_settings WHERE key = $1',
+    [PLATFORM_SETTINGS_KEY],
+  )
+  const row = result.rows[0]
+  const encryptedApiKeys = getEncryptedPlatformApiKeys(row?.value)
+  const platform = normalizePlatformSettings(row?.value)
+  const settings = normalizeSettings(platform.api.settings)
+  const profiles = settings.profiles.map((profile) => ({
+    ...profile,
+    apiKey: options.includeApiKeys ? tryDecryptText(encryptedApiKeys[profile.id], config.keyEncryptionSecret) : '',
+    hasStoredApiKey: encryptedApiKeys[profile.id] ? true : profile.hasStoredApiKey,
+  }))
+  return {
+    ...platform,
+    updatedAt: row?.updated_at ?? platform.updatedAt ?? null,
+    api: {
+      ...platform.api,
+      settings: normalizeSettings({ ...settings, profiles }),
+    },
+  }
+}
+
+async function upsertPlatformSettings(db: Db, config: ServerConfig, body: unknown) {
+  const existing = await db.query<{ value: unknown }>(
+    'SELECT value FROM platform_settings WHERE key = $1',
+    [PLATFORM_SETTINGS_KEY],
+  )
+  const previousEncryptedApiKeys = getEncryptedPlatformApiKeys(existing.rows[0]?.value)
+  const platform = normalizePlatformSettings(body)
+  const settings = normalizeSettings(platform.api.settings)
+  const encryptedApiKeys: Record<string, string> = {}
+  const sanitizedProfiles = settings.profiles.map((profile) => {
+    const apiKey = profile.apiKey.trim()
+    if (apiKey) encryptedApiKeys[profile.id] = encryptText(apiKey, config.keyEncryptionSecret)
+    else if (profile.hasStoredApiKey && previousEncryptedApiKeys[profile.id]) encryptedApiKeys[profile.id] = previousEncryptedApiKeys[profile.id]
+    return {
+      ...profile,
+      apiKey: '',
+      hasStoredApiKey: encryptedApiKeys[profile.id] ? true : undefined,
+    }
+  })
+  const value = {
+    ...platform,
+    updatedAt: undefined,
+    api: {
+      ...platform.api,
+      settings: normalizeSettings({ ...settings, profiles: sanitizedProfiles }),
+      encryptedApiKeys,
+    },
+  }
+  const result = await db.query<{ value: unknown; updated_at: string }>(
+    `
+      INSERT INTO platform_settings (key, value, updated_at)
+      VALUES ($1, $2, now())
+      ON CONFLICT (key)
+      DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+      RETURNING value, updated_at
+    `,
+    [PLATFORM_SETTINGS_KEY, value],
+  )
+  const saved = normalizePlatformSettings(result.rows[0]?.value)
+  return sanitizePlatformSettingsForClient({
+    ...saved,
+    updatedAt: result.rows[0]?.updated_at ?? null,
+  })
+}
+
+async function saveApiProfiles(db: Db, config: ServerConfig, userId: string, settings: AppSettings) {
+  const normalized = normalizeSettings(settings)
+  for (const profile of normalized.profiles) {
+    const apiKey = profile.apiKey.trim()
+    const encryptedApiKey = apiKey ? encryptText(apiKey, config.keyEncryptionSecret) : null
+    const sanitizedProfile = { ...profile, apiKey: '' }
+    await db.query(
+      `
+        INSERT INTO api_profiles (id, user_id, profile, encrypted_api_key, updated_at)
+        VALUES ($1, $2, $3, COALESCE($4, (
+          SELECT encrypted_api_key FROM api_profiles WHERE user_id = $2 AND id = $1
+        )), now())
+        ON CONFLICT (user_id, id)
+        DO UPDATE SET
+          profile = EXCLUDED.profile,
+          encrypted_api_key = COALESCE(EXCLUDED.encrypted_api_key, api_profiles.encrypted_api_key),
+          updated_at = now()
+      `,
+      [profile.id, userId, sanitizedProfile, encryptedApiKey],
+    )
+  }
+
+  const profileIds = normalized.profiles.map((profile) => profile.id)
+  await db.query(
+    'DELETE FROM api_profiles WHERE user_id = $1 AND NOT (id = ANY($2::text[]))',
+    [userId, profileIds],
+  )
+}
+
+async function loadSettings(db: Db, userId: string) {
+  const result = await db.query<{
+    settings: AppSettings
+    params: TaskParams
+    workspace: Record<string, unknown>
+  }>(
+    'SELECT settings, params, workspace FROM user_settings WHERE user_id = $1',
+    [userId],
+  )
+  const saved = result.rows[0] ?? null
+  if (!saved) return null
+  const keyRows = await db.query<{ id: string }>(
+    'SELECT id FROM api_profiles WHERE user_id = $1 AND encrypted_api_key IS NOT NULL',
+    [userId],
+  )
+  const keyedProfileIds = new Set(keyRows.rows.map((row) => row.id))
+  const settings = normalizeSettings(saved.settings)
+  return {
+    ...saved,
+    settings: {
+      ...settings,
+      profiles: settings.profiles.map((profile) => ({
+        ...profile,
+        hasStoredApiKey: keyedProfileIds.has(profile.id) || undefined,
+      })),
+    },
+  }
+}
+
+async function loadGenerationSettings(db: Db, config: ServerConfig, userId: string): Promise<AppSettings | null> {
+  const platform = await loadPlatformSettings(db, config, { includeApiKeys: true })
+  if (platform.api.managed) {
+    return applyPlatformSettingsToAppSettings(normalizeSettings({}), platform)
+  }
+
+  const saved = await loadSettings(db, userId)
+  if (!saved) return null
+  const profiles = await db.query<{ id: string; encrypted_api_key: string | null }>(
+    'SELECT id, encrypted_api_key FROM api_profiles WHERE user_id = $1',
+    [userId],
+  )
+  const apiKeys = new Map(profiles.rows.map((profile) => [
+    profile.id,
+    tryDecryptText(profile.encrypted_api_key, config.keyEncryptionSecret),
+  ]))
+  const settings = normalizeSettings(saved.settings)
+  return applyPlatformSettingsToAppSettings(normalizeSettings({
+    ...settings,
+    profiles: settings.profiles.map((profile) => ({
+      ...profile,
+      apiKey: apiKeys.get(profile.id) ?? profile.apiKey ?? '',
+    })),
+  }), platform)
+}
+
+async function upsertSettings(
+  db: Db,
+  config: ServerConfig,
+  userId: string,
+  body: {
+    settings: AppSettings
+    params: TaskParams
+    activeAgentConversationId?: string | null
+    appMode?: string
+    agentSidebarCollapsed?: boolean
+    agentAssetTab?: string
+    agentAssetPanelCollapsed?: boolean
+    prompt?: string
+	    inputImages?: unknown[]
+	    maskDraft?: unknown
+	    galleryInputDraft?: unknown
+	    agentInputDrafts?: unknown
+	    favoriteCollections?: unknown
+	    defaultFavoriteCollectionId?: unknown
+	  },
+	) {
+  const settings = sanitizeSettingsForClient(body.settings)
+  const workspace = {
+    activeAgentConversationId: body.activeAgentConversationId ?? null,
+    appMode: body.appMode === 'agent' ? 'agent' : 'gallery',
+    agentSidebarCollapsed: Boolean(body.agentSidebarCollapsed),
+    agentAssetTab: body.agentAssetTab === 'references' ? 'references' : 'outputs',
+    agentAssetPanelCollapsed: Boolean(body.agentAssetPanelCollapsed),
+    prompt: typeof body.prompt === 'string' ? body.prompt : '',
+    inputImages: Array.isArray(body.inputImages) ? body.inputImages : [],
+	    maskDraft: body.maskDraft ?? null,
+	    galleryInputDraft: body.galleryInputDraft ?? null,
+	    agentInputDrafts: body.agentInputDrafts && typeof body.agentInputDrafts === 'object' ? body.agentInputDrafts : {},
+	    favoriteCollections: Array.isArray(body.favoriteCollections) ? body.favoriteCollections : [],
+	    defaultFavoriteCollectionId: typeof body.defaultFavoriteCollectionId === 'string' ? body.defaultFavoriteCollectionId : null,
+	  }
+  await saveApiProfiles(db, config, userId, body.settings)
+  await db.query(
+    `
+      INSERT INTO user_settings (user_id, settings, params, workspace, updated_at)
+      VALUES ($1, $2, $3, $4, now())
+      ON CONFLICT (user_id)
+      DO UPDATE SET settings = EXCLUDED.settings, params = EXCLUDED.params, workspace = EXCLUDED.workspace, updated_at = now()
+    `,
+    [userId, settings, body.params ?? DEFAULT_PARAMS, workspace],
+  )
+  return { settings, params: body.params ?? DEFAULT_PARAMS, ...workspace }
+}
+
+async function readImageDataUrl(db: Db, s3: S3Client, config: ServerConfig, userId: string, imageId: string) {
+  const result = await db.query<{ storage_key: string; mime_type: string }>(
+    'SELECT storage_key, mime_type FROM images WHERE user_id = $1 AND id = $2',
+    [userId, imageId],
+  )
+  const image = result.rows[0]
+  if (!image) throw new Error('图片不存在')
+  const buffer = await getObjectBuffer(s3, config, image.storage_key)
+  return bufferToDataUrl(buffer, image.mime_type)
+}
+
+async function upsertImage(
+  db: Db,
+  s3: S3Client,
+  config: ServerConfig,
+  user: AuthUser,
+  input: {
+    id?: string
+    dataUrl: string
+    source?: string
+    taskId?: string | null
+    width?: number
+    height?: number
+  },
+) {
+  const parsed = parseImageDataUrl(input.dataUrl)
+  const imageId = resolveImageStorageId(parsed.id, input.id)
+  const source = input.source === 'mask' || input.source === 'generated' ? input.source : 'upload'
+  const taskSegment = input.taskId ? `tasks/${input.taskId}` : 'library'
+  const storageKey = `users/${user.id}/${taskSegment}/images/${imageId}.${parsed.extension}`
+  await assertUserLimits(db, user.id, { extraBytes: parsed.buffer.length })
+  await putObject(s3, config, {
+    key: storageKey,
+    mimeType: parsed.mimeType,
+    buffer: parsed.buffer,
+  })
+  await db.query(
+    `
+      INSERT INTO images (id, user_id, task_id, source, storage_key, mime_type, byte_size, width, height, upload_status, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'done', now())
+      ON CONFLICT (user_id, id)
+      DO UPDATE SET
+        task_id = COALESCE(EXCLUDED.task_id, images.task_id),
+        source = EXCLUDED.source,
+        storage_key = EXCLUDED.storage_key,
+        mime_type = EXCLUDED.mime_type,
+        byte_size = EXCLUDED.byte_size,
+        width = COALESCE(EXCLUDED.width, images.width),
+        height = COALESCE(EXCLUDED.height, images.height),
+        upload_status = 'done',
+        updated_at = now()
+    `,
+    [
+      imageId,
+      user.id,
+      input.taskId ?? null,
+      source,
+      storageKey,
+      parsed.mimeType,
+      parsed.buffer.length,
+      input.width ?? null,
+      input.height ?? null,
+    ],
+  )
+  return {
+    id: imageId,
+    source,
+    width: input.width,
+    height: input.height,
+    url: await createSignedImageUrl(s3, config, storageKey),
+  }
+}
+
+async function upsertImageThumbnail(
+  db: Db,
+  s3: S3Client,
+  config: ServerConfig,
+  user: AuthUser,
+  imageId: string,
+  input: {
+    dataUrl: string
+    width?: number
+    height?: number
+    thumbnailVersion?: number
+  },
+) {
+  const existing = await db.query<{ task_id: string | null }>(
+    'SELECT task_id FROM images WHERE user_id = $1 AND id = $2',
+    [user.id, imageId],
+  )
+  if (!existing.rows[0]) throw new Error('图片不存在')
+  const parsed = parseImageDataUrl(input.dataUrl)
+  const taskSegment = existing.rows[0].task_id ? `tasks/${existing.rows[0].task_id}` : 'library'
+  const storageKey = `users/${user.id}/${taskSegment}/thumbnails/${imageId}.${parsed.extension}`
+  await putObject(s3, config, {
+    key: storageKey,
+    mimeType: parsed.mimeType,
+    buffer: parsed.buffer,
+  })
+  await db.query(
+    `
+      INSERT INTO image_thumbnails (image_id, user_id, storage_key, mime_type, width, height, thumbnail_version, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+      ON CONFLICT (user_id, image_id)
+      DO UPDATE SET
+        storage_key = EXCLUDED.storage_key,
+        mime_type = EXCLUDED.mime_type,
+        width = EXCLUDED.width,
+        height = EXCLUDED.height,
+        thumbnail_version = EXCLUDED.thumbnail_version,
+        updated_at = now()
+    `,
+    [imageId, user.id, storageKey, parsed.mimeType, input.width ?? null, input.height ?? null, input.thumbnailVersion ?? null],
+  )
+  return { id: imageId }
+}
+
+async function deleteImageForUser(db: Db, s3: S3Client, config: ServerConfig, userId: string, imageId: string) {
+  const objects = await db.query<{ storage_key: string }>(
+    `
+      SELECT storage_key FROM images WHERE user_id = $1 AND id = $2
+      UNION ALL
+      SELECT storage_key FROM image_thumbnails WHERE user_id = $1 AND image_id = $2
+    `,
+    [userId, imageId],
+  )
+  await db.query('DELETE FROM image_thumbnails WHERE user_id = $1 AND image_id = $2', [userId, imageId])
+  await db.query('DELETE FROM images WHERE user_id = $1 AND id = $2', [userId, imageId])
+  await deleteObjects(s3, config, objects.rows.map((row) => row.storage_key))
+}
+
+function createEmptyWorkspace() {
+  return {
+    activeAgentConversationId: null,
+    appMode: 'gallery',
+    agentSidebarCollapsed: false,
+    agentAssetTab: 'outputs',
+    agentAssetPanelCollapsed: false,
+    prompt: '',
+    inputImages: [],
+    maskDraft: null,
+    galleryInputDraft: null,
+    agentInputDrafts: {},
+  }
+}
+
+async function clearUserDataForUser(
+  db: Db,
+  s3: S3Client,
+  config: ServerConfig,
+  userId: string,
+  options: { clearConfig?: boolean; clearTasks?: boolean },
+) {
+  const clearConfig = Boolean(options.clearConfig)
+  const clearTasks = Boolean(options.clearTasks)
+
+  if (clearTasks) {
+    const taskRows = await db.query<{ id: string }>('SELECT id FROM tasks WHERE user_id = $1', [userId])
+    for (const task of taskRows.rows) closeTaskSubscribers(userId, task.id)
+
+    const objects = await db.query<{ storage_key: string }>(
+      `
+        SELECT storage_key FROM images WHERE user_id = $1
+        UNION ALL
+        SELECT storage_key FROM image_thumbnails WHERE user_id = $1
+      `,
+      [userId],
+    )
+
+    await db.query('DELETE FROM image_thumbnails WHERE user_id = $1', [userId])
+    await db.query('DELETE FROM images WHERE user_id = $1', [userId])
+    await db.query('DELETE FROM tasks WHERE user_id = $1', [userId])
+    await db.query('DELETE FROM agent_conversations WHERE user_id = $1', [userId])
+    if (!clearConfig) {
+      await db.query(
+        'UPDATE user_settings SET workspace = $2, updated_at = now() WHERE user_id = $1',
+        [userId, createEmptyWorkspace()],
+      )
+    }
+    await deleteObjects(s3, config, objects.rows.map((row) => row.storage_key))
+  }
+
+  if (clearConfig) {
+    await db.query('DELETE FROM api_profiles WHERE user_id = $1', [userId])
+    await db.query('DELETE FROM user_settings WHERE user_id = $1', [userId])
+  }
+}
+
+async function getAdminUserRows(db: Db): Promise<AdminUserRow[]> {
+  const result = await db.query<AdminUserRow>(
+    `
+      SELECT
+        users.id,
+        users.email,
+        users.is_admin,
+        users.disabled_at,
+        users.registration_status,
+        users.registration_requested_at,
+        users.registration_reviewed_at,
+        users.registration_reviewed_by,
+        users.created_at,
+        users.updated_at,
+        users.storage_quota_bytes,
+        users.task_quota_count,
+        session_stats.latest_session_at,
+        COALESCE(task_stats.task_count, 0) AS task_count,
+        COALESCE(task_stats.running_task_count, 0) AS running_task_count,
+        COALESCE(image_stats.image_count, 0) AS image_count,
+        COALESCE(image_stats.storage_bytes, 0) AS storage_bytes,
+        COALESCE(conversation_stats.conversation_count, 0) AS conversation_count,
+        COALESCE(session_stats.session_count, 0) AS session_count
+      FROM users
+      LEFT JOIN (
+        SELECT
+          user_id,
+          COUNT(*) AS task_count,
+          COUNT(*) FILTER (WHERE status = 'running') AS running_task_count
+        FROM tasks
+        GROUP BY user_id
+      ) task_stats ON task_stats.user_id = users.id
+      LEFT JOIN (
+        SELECT
+          user_id,
+          COUNT(*) AS image_count,
+          COALESCE(SUM(byte_size), 0) AS storage_bytes
+        FROM images
+        GROUP BY user_id
+      ) image_stats ON image_stats.user_id = users.id
+      LEFT JOIN (
+        SELECT user_id, COUNT(*) AS conversation_count
+        FROM agent_conversations
+        GROUP BY user_id
+      ) conversation_stats ON conversation_stats.user_id = users.id
+      LEFT JOIN (
+        SELECT user_id, COUNT(*) AS session_count, MAX(created_at) AS latest_session_at
+        FROM sessions
+        WHERE expires_at > now()
+        GROUP BY user_id
+      ) session_stats ON session_stats.user_id = users.id
+      ORDER BY users.created_at DESC
+    `,
+  )
+  return result.rows
+}
+
+function serializeAdminUser(row: AdminUserRow) {
+  const registrationStatus = normalizeRegistrationStatus(row.registration_status)
+  return {
+    id: row.id,
+    email: row.email,
+    isAdmin: Boolean(row.is_admin),
+    disabledAt: row.disabled_at,
+    registrationStatus,
+    registrationRequestedAt: row.registration_requested_at,
+    registrationReviewedAt: row.registration_reviewed_at,
+    registrationReviewedBy: row.registration_reviewed_by,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    storageQuotaBytes: toOptionalNumber(row.storage_quota_bytes),
+    taskQuotaCount: toOptionalNumber(row.task_quota_count),
+    latestSessionAt: row.latest_session_at,
+    taskCount: toNumber(row.task_count),
+    runningTaskCount: toNumber(row.running_task_count),
+    imageCount: toNumber(row.image_count),
+    storageBytes: toNumber(row.storage_bytes),
+    conversationCount: toNumber(row.conversation_count),
+    sessionCount: toNumber(row.session_count),
+  }
+}
+
+function normalizeRegistrationStatus(value: unknown): RegistrationStatus {
+  return value === 'pending' || value === 'rejected' ? value : 'approved'
+}
+
+async function countEnabledAdmins(db: Db): Promise<number> {
+  const result = await db.query<{ count: string }>(
+    'SELECT COUNT(*)::text AS count FROM users WHERE is_admin = true AND disabled_at IS NULL',
+  )
+  return toNumber(result.rows[0]?.count)
+}
+
+function normalizeAdminEmail(value: unknown) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : ''
+}
+
+function normalizeAdminPassword(value: unknown) {
+  return typeof value === 'string' ? value : ''
+}
+
+function normalizeNullableQuota(value: unknown) {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw createBadRequestError('配额必须是有效数字')
+  }
+  const normalized = Math.floor(value)
+  return normalized > 0 ? normalized : null
+}
+
+function isUniqueViolation(error: unknown) {
+  return typeof error === 'object' && error != null && (error as { code?: string }).code === '23505'
+}
+
+function createBadRequestError(message: string) {
+  return Object.assign(new Error(message), { statusCode: 400 })
+}
+
+async function adminUserExists(db: Db, userId: string) {
+  const result = await db.query<{ id: string }>('SELECT id FROM users WHERE id = $1', [userId])
+  return Boolean(result.rows[0])
+}
+
+function serializeAuditLog(row: AuditLogRow) {
+  return {
+    id: row.id,
+    action: row.action,
+    details: row.details ?? {},
+    ip: row.ip,
+    userAgent: row.user_agent,
+    createdAt: row.created_at,
+    actorEmail: row.actor_email,
+    targetEmail: row.target_email,
+  }
+}
+
+async function getAuditLogs(db: Db, limit: number) {
+  const result = await db.query<AuditLogRow>(
+    `
+      SELECT
+        audit_logs.id,
+        audit_logs.action,
+        audit_logs.details,
+        audit_logs.ip,
+        audit_logs.user_agent,
+        audit_logs.created_at,
+        actor.email AS actor_email,
+        target.email AS target_email
+      FROM audit_logs
+      LEFT JOIN users actor ON actor.id = audit_logs.actor_user_id
+      LEFT JOIN users target ON target.id = audit_logs.target_user_id
+      ORDER BY audit_logs.created_at DESC
+      LIMIT $1
+    `,
+    [limit],
+  )
+  return result.rows.map(serializeAuditLog)
+}
+
+function getTaskImageRefs(task: TaskRecord) {
+  const refs: Array<{ id: string; role: 'input' | 'mask' | 'output' | 'partial' }> = []
+  for (const id of task.inputImageIds) refs.push({ id, role: 'input' })
+  if (task.maskImageId) refs.push({ id: task.maskImageId, role: 'mask' })
+  for (const id of task.outputImages) refs.push({ id, role: 'output' })
+  for (const id of task.streamPartialImageIds ?? []) refs.push({ id, role: 'partial' })
+
+  const seen = new Set<string>()
+  return refs.filter((ref) => {
+    const key = `${ref.role}:${ref.id}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function getAdminImageDataPath(userId: string, imageId: string, thumbnail = false) {
+  const base = `/api/admin/users/${encodeURIComponent(userId)}/images/${encodeURIComponent(imageId)}`
+  return thumbnail ? `${base}/thumbnail/data` : `${base}/data`
+}
+
+async function getAdminGenerationAuditImages(db: Db, userId: string, task: TaskRecord) {
+  const refs = getTaskImageRefs(task)
+  const ids = Array.from(new Set(refs.map((ref) => ref.id)))
+  if (!ids.length) return []
+
+  const result = await db.query<AdminGenerationImageRow>(
+    `
+      SELECT
+        images.id,
+        images.source,
+        images.byte_size,
+        images.width,
+        images.height,
+        images.created_at,
+        images.updated_at,
+        image_thumbnails.image_id IS NOT NULL AS has_thumbnail
+      FROM images
+      LEFT JOIN image_thumbnails
+        ON image_thumbnails.user_id = images.user_id
+       AND image_thumbnails.image_id = images.id
+      WHERE images.user_id = $1 AND images.id = ANY($2::text[])
+    `,
+    [userId, ids],
+  )
+  const imagesById = new Map(result.rows.map((row) => [row.id, row]))
+  return refs.map((ref) => {
+    const row = imagesById.get(ref.id)
+    return {
+      id: ref.id,
+      role: ref.role,
+      source: row?.source ?? 'missing',
+      byteSize: toNumber(row?.byte_size),
+      width: toOptionalNumber(row?.width),
+      height: toOptionalNumber(row?.height),
+      createdAt: row?.created_at ?? null,
+      updatedAt: row?.updated_at ?? null,
+      missing: !row,
+      hasThumbnail: Boolean(row?.has_thumbnail),
+      imageUrl: getAdminImageDataPath(userId, ref.id),
+      thumbnailUrl: row?.has_thumbnail ? getAdminImageDataPath(userId, ref.id, true) : getAdminImageDataPath(userId, ref.id),
+    }
+  })
+}
+
+async function getAdminGenerationConversationMap(db: Db, rows: AdminGenerationTaskRow[]) {
+  const conversationIds = Array.from(new Set(rows.map((row) => row.record.agentConversationId).filter((id): id is string => Boolean(id))))
+  const userIds = Array.from(new Set(rows.filter((row) => row.record.agentConversationId).map((row) => row.user_id)))
+  if (!conversationIds.length || !userIds.length) return new Map<string, AgentConversation>()
+
+  const result = await db.query<AdminGenerationConversationRow>(
+    `
+      SELECT user_id, id, conversation
+      FROM agent_conversations
+      WHERE user_id = ANY($1::uuid[]) AND id = ANY($2::text[])
+    `,
+    [userIds, conversationIds],
+  )
+  return new Map(result.rows.map((row) => [`${row.user_id}:${row.id}`, row.conversation]))
+}
+
+function getAdminGenerationAgentContext(task: TaskRecord, conversation?: AgentConversation) {
+  if (task.sourceMode !== 'agent' && !task.agentConversationId) return null
+
+  const round = Array.isArray(conversation?.rounds)
+    ? conversation.rounds.find((item) => item.id === task.agentRoundId)
+    : null
+  return {
+    conversationId: task.agentConversationId ?? conversation?.id ?? null,
+    title: conversation?.title ?? null,
+    roundId: task.agentRoundId ?? null,
+    roundIndex: typeof round?.index === 'number' ? round.index : null,
+    roundStatus: round?.status ?? null,
+    toolCallId: task.agentToolCallId ?? null,
+    batchCallId: task.agentBatchCallId ?? null,
+    toolAction: task.agentToolAction ?? null,
+  }
+}
+
+async function getAdminGenerationAudits(db: Db, input: { userId?: string; agentConversationId?: string; limit?: number } = {}) {
+  const maxLimit = input.agentConversationId ? 1000 : 200
+  const limit = Math.min(maxLimit, Math.max(1, input.limit ?? 80))
+  const params: unknown[] = []
+  const whereParts: string[] = []
+  if (input.userId) {
+    params.push(input.userId)
+    whereParts.push(`tasks.user_id = $${params.length}`)
+  }
+  if (input.agentConversationId) {
+    params.push(input.agentConversationId)
+    whereParts.push(`tasks.record->>'agentConversationId' = $${params.length}`)
+  }
+  params.push(limit)
+  const limitParam = `$${params.length}`
+  const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : ''
+
+  const result = await db.query<AdminGenerationTaskRow>(
+    `
+      SELECT
+        tasks.user_id,
+        users.email AS user_email,
+        tasks.record,
+        tasks.updated_at
+      FROM tasks
+      INNER JOIN users ON users.id = tasks.user_id
+      ${where}
+      ORDER BY
+        CASE
+          WHEN tasks.record->>'createdAt' ~ '^[0-9]+$' THEN (tasks.record->>'createdAt')::bigint
+          ELSE (EXTRACT(EPOCH FROM tasks.created_at) * 1000)::bigint
+        END DESC,
+        tasks.updated_at DESC
+      LIMIT ${limitParam}
+    `,
+    params,
+  )
+
+  const conversationsByKey = await getAdminGenerationConversationMap(db, result.rows)
+  return Promise.all(result.rows.map(async (row) => ({
+    user: {
+      id: row.user_id,
+      email: row.user_email,
+    },
+    task: row.record,
+    updatedAt: row.updated_at,
+    agentContext: getAdminGenerationAgentContext(row.record, conversationsByKey.get(`${row.user_id}:${row.record.agentConversationId}`)),
+    images: await getAdminGenerationAuditImages(db, row.user_id, row.record),
+  })))
+}
+
+async function getReferencedObjectKeys(db: Db) {
+  const result = await db.query<{ storage_key: string }>(
+    `
+      SELECT storage_key FROM images
+      UNION
+      SELECT storage_key FROM image_thumbnails
+    `,
+  )
+  return new Set(result.rows.map((row) => row.storage_key))
+}
+
+async function findOrphanObjects(db: Db, s3: S3Client, config: ServerConfig) {
+  const [objectKeys, referencedKeys] = await Promise.all([
+    listObjectKeys(s3, config, 'users/'),
+    getReferencedObjectKeys(db),
+  ])
+  return objectKeys.filter((key) => !referencedKeys.has(key))
+}
+
+async function getSystemSnapshot(db: Db, s3: S3Client, config: ServerConfig) {
+  const [users, objectKeys, auditCount] = await Promise.all([
+    getAdminUserRows(db),
+    listObjectKeys(s3, config, ''),
+    db.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM audit_logs'),
+  ])
+  return {
+    database: {
+      userCount: users.length,
+      taskCount: users.reduce((sum, item) => sum + toNumber(item.task_count), 0),
+      imageCount: users.reduce((sum, item) => sum + toNumber(item.image_count), 0),
+      auditLogCount: toNumber(auditCount.rows[0]?.count),
+    },
+    storage: {
+      bucket: config.s3.bucket,
+      objectCount: objectKeys.length,
+    },
+  }
+}
+
+async function getTask(db: Db, userId: string, taskId: string): Promise<TaskRecord | null> {
+  const result = await db.query<{ record: TaskRecord }>(
+    'SELECT record FROM tasks WHERE user_id = $1 AND id = $2',
+    [userId, taskId],
+  )
+  return result.rows[0]?.record ?? null
+}
+
+async function putTaskRecord(db: Db, userId: string, task: TaskRecord) {
+  await db.query(
+    `
+      INSERT INTO tasks (id, user_id, record, status, updated_at)
+      VALUES ($1, $2, $3, $4, now())
+      ON CONFLICT (user_id, id)
+      DO UPDATE SET record = EXCLUDED.record, status = EXCLUDED.status, updated_at = now()
+    `,
+    [task.id, userId, task, task.status],
+  )
+}
+
+async function assertUserLimits(db: Db, userId: string, input: { extraBytes?: number; creatingTask?: boolean }) {
+  const result = await db.query<{
+    storage_quota_bytes: string | number | null
+    task_quota_count: string | number | null
+    storage_bytes: string | number
+    task_count: string | number
+  }>(
+    `
+      SELECT
+        users.storage_quota_bytes,
+        users.task_quota_count,
+        COALESCE(image_stats.storage_bytes, 0) AS storage_bytes,
+        COALESCE(task_stats.task_count, 0) AS task_count
+      FROM users
+      LEFT JOIN (
+        SELECT user_id, COALESCE(SUM(byte_size), 0) AS storage_bytes
+        FROM images
+        GROUP BY user_id
+      ) image_stats ON image_stats.user_id = users.id
+      LEFT JOIN (
+        SELECT user_id, COUNT(*) AS task_count
+        FROM tasks
+        GROUP BY user_id
+      ) task_stats ON task_stats.user_id = users.id
+      WHERE users.id = $1
+    `,
+    [userId],
+  )
+  const row = result.rows[0]
+  if (!row) throw new Error('用户不存在')
+  const storageQuotaBytes = toOptionalNumber(row.storage_quota_bytes)
+  const taskQuotaCount = toOptionalNumber(row.task_quota_count)
+  if (storageQuotaBytes != null && toNumber(row.storage_bytes) + (input.extraBytes ?? 0) > storageQuotaBytes) {
+    throw createBadRequestError('已超过用户存储配额')
+  }
+  if (input.creatingTask && taskQuotaCount != null && toNumber(row.task_count) + 1 > taskQuotaCount) {
+    throw createBadRequestError('已超过用户任务数量配额')
+  }
+}
+
+async function assertTaskImagesBelongToUser(db: Db, userId: string, task: TaskRecord) {
+  const ids = [
+    ...task.inputImageIds,
+    ...(task.maskImageId ? [task.maskImageId] : []),
+    ...task.outputImages,
+    ...(task.streamPartialImageIds ?? []),
+  ]
+  if (!ids.length) return
+  const result = await db.query<{ id: string }>(
+    'SELECT id FROM images WHERE user_id = $1 AND id = ANY($2::text[])',
+    [userId, ids],
+  )
+  if (result.rows.length !== new Set(ids).size) throw new Error('任务引用了不存在的图片')
+}
+
+function isTaskRecordBody(value: Partial<TaskRecord>): value is TaskRecord {
+  return typeof value.prompt === 'string' &&
+    value.params != null &&
+    Array.isArray(value.inputImageIds) &&
+    Array.isArray(value.outputImages) &&
+    (value.status === 'running' || value.status === 'done' || value.status === 'error') &&
+    Object.prototype.hasOwnProperty.call(value, 'error') &&
+    typeof value.createdAt === 'number'
+}
+
+function applyTaskPatch(task: TaskRecord, patch: Partial<TaskRecord>): TaskRecord {
+  return { ...task, ...patch }
+}
+
+async function runTask(
+  db: Db,
+  s3: S3Client,
+  config: ServerConfig,
+  user: AuthUser,
+  taskId: string,
+) {
+  const task = await getTask(db, user.id, taskId)
+  if (!task || task.status !== 'running') return
+
+  try {
+    const settings = await loadGenerationSettings(db, config, user.id)
+    if (!settings) throw new Error('缺少云端 API 配置')
+
+    const inputImageDataUrls = await Promise.all(task.inputImageIds.map((id) =>
+      readImageDataUrl(db, s3, config, user.id, id),
+    ))
+    const maskDataUrl = task.maskImageId
+      ? await readImageDataUrl(db, s3, config, user.id, task.maskImageId)
+      : undefined
+
+    const result = await callImageApi({
+      settings,
+      prompt: task.prompt,
+      params: task.params,
+      inputImageDataUrls,
+      maskDataUrl,
+      onPartialImage: (partial) => {
+        publishTaskEvent(user.id, taskId, {
+          type: 'partial',
+          taskId,
+          image: partial.image,
+          requestIndex: partial.requestIndex,
+        })
+      },
+    })
+
+    const outputIds: string[] = []
+    for (const dataUrl of result.images) {
+      const image = await upsertImage(db, s3, config, user, {
+        dataUrl,
+        source: 'generated',
+        taskId,
+      })
+      outputIds.push(image.id)
+    }
+
+    const latestBeforeSave = await getTask(db, user.id, taskId)
+    if (!latestBeforeSave || latestBeforeSave.status !== 'running') return
+
+    const now = Date.now()
+    const doneTask = applyTaskPatch(latestBeforeSave, {
+      outputImages: outputIds,
+      rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
+      actualParams: { ...result.actualParams, n: outputIds.length },
+      actualParamsByImage: result.actualParamsList?.reduce<Record<string, Partial<TaskParams>>>((acc, params, index) => {
+        const imageId = outputIds[index]
+        if (imageId && params && Object.keys(params).length) acc[imageId] = params
+        return acc
+      }, {}),
+      revisedPromptByImage: result.revisedPrompts?.reduce<Record<string, string>>((acc, prompt, index) => {
+        const imageId = outputIds[index]
+        if (imageId && prompt?.trim()) acc[imageId] = prompt
+        return acc
+      }, {}),
+      status: 'done',
+      error: null,
+      finishedAt: now,
+      elapsed: now - latestBeforeSave.createdAt,
+    })
+    await putTaskRecord(db, user.id, doneTask)
+    publishTaskEvent(user.id, taskId, { type: 'done', task: doneTask })
+  } catch (error) {
+    const latestTask = await getTask(db, user.id, taskId)
+    if (!latestTask) return
+    const now = Date.now()
+    const failedTask = applyTaskPatch(latestTask, {
+      status: 'error',
+      error: error instanceof Error ? error.message : String(error),
+      finishedAt: now,
+      elapsed: now - latestTask.createdAt,
+    })
+    await putTaskRecord(db, user.id, failedTask)
+    publishTaskEvent(user.id, taskId, { type: 'error', task: failedTask })
+  } finally {
+    closeTaskSubscribers(user.id, taskId)
+  }
+}
+
+export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, config: ServerConfig) {
+  app.get('/api/platform/settings', async () => (
+    sanitizePlatformSettingsForClient(await loadPlatformSettings(db, config))
+  ))
+
+  app.get('/api/settings', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const saved = await loadSettings(db, user.id)
+    return saved
+      ? { settings: saved.settings, params: saved.params, ...saved.workspace }
+      : null
+  })
+
+  app.put('/api/settings', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    return upsertSettings(db, config, user.id, request.body as Parameters<typeof upsertSettings>[3])
+  })
+
+  app.get('/api/admin/overview', async (request, reply) => {
+    const user = await requireAdmin(db, request, reply)
+    if (!user) return
+    const users = await getAdminUserRows(db)
+    return {
+      userCount: users.length,
+      disabledUserCount: users.filter((item) => item.disabled_at).length,
+      pendingRegistrationCount: users.filter((item) => normalizeRegistrationStatus(item.registration_status) === 'pending').length,
+      taskCount: users.reduce((sum, item) => sum + toNumber(item.task_count), 0),
+      runningTaskCount: users.reduce((sum, item) => sum + toNumber(item.running_task_count), 0),
+      imageCount: users.reduce((sum, item) => sum + toNumber(item.image_count), 0),
+      storageBytes: users.reduce((sum, item) => sum + toNumber(item.storage_bytes), 0),
+    }
+  })
+
+  app.get('/api/admin/system', async (request, reply) => {
+    const user = await requireAdmin(db, request, reply)
+    if (!user) return
+    return getSystemSnapshot(db, s3, config)
+  })
+
+  app.get('/api/admin/audit-logs', async (request, reply) => {
+    const user = await requireAdmin(db, request, reply)
+    if (!user) return
+    const query = request.query as { limit?: string }
+    const limit = Math.min(200, Math.max(1, Number(query.limit) || 80))
+    return { logs: await getAuditLogs(db, limit) }
+  })
+
+  app.get('/api/admin/generation-audits', async (request, reply) => {
+    const user = await requireAdmin(db, request, reply)
+    if (!user) return
+    const query = request.query as { limit?: string; userId?: string; agentConversationId?: string }
+    const agentConversationId = typeof query.agentConversationId === 'string' && query.agentConversationId.trim() ? query.agentConversationId.trim() : undefined
+    const maxLimit = agentConversationId ? 1000 : 200
+    const limit = Math.min(maxLimit, Math.max(1, Number(query.limit) || 80))
+    const userId = typeof query.userId === 'string' && query.userId.trim() ? query.userId.trim() : undefined
+    if (userId && !(await adminUserExists(db, userId))) return reply.code(404).send({ error: '用户不存在' })
+    return { audits: await getAdminGenerationAudits(db, { userId, agentConversationId, limit }) }
+  })
+
+  app.get('/api/admin/users/:userId/images/:imageId/data', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const { userId, imageId } = request.params as { userId: string; imageId: string }
+    const result = await db.query<{ storage_key: string; mime_type: string }>(
+      'SELECT storage_key, mime_type FROM images WHERE user_id = $1 AND id = $2',
+      [userId, imageId],
+    )
+    const image = result.rows[0]
+    if (!image) return reply.code(404).send({ error: '图片不存在' })
+    const buffer = await getObjectBuffer(s3, config, image.storage_key)
+    return reply.type(image.mime_type).send(buffer)
+  })
+
+  app.get('/api/admin/users/:userId/images/:imageId/thumbnail/data', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const { userId, imageId } = request.params as { userId: string; imageId: string }
+    const result = await db.query<{ storage_key: string; mime_type: string; width: number | null; height: number | null; thumbnail_version: number | null }>(
+      'SELECT storage_key, mime_type, width, height, thumbnail_version FROM image_thumbnails WHERE user_id = $1 AND image_id = $2',
+      [userId, imageId],
+    )
+    const thumbnail = result.rows[0]
+    if (!thumbnail) return reply.code(404).send({ error: '缩略图不存在' })
+    const buffer = await getObjectBuffer(s3, config, thumbnail.storage_key)
+    reply.header('X-Image-Width', String(thumbnail.width ?? ''))
+    reply.header('X-Image-Height', String(thumbnail.height ?? ''))
+    reply.header('X-Thumbnail-Version', String(thumbnail.thumbnail_version ?? ''))
+    return reply.type(thumbnail.mime_type).send(buffer)
+  })
+
+  app.get('/api/admin/platform-settings', async (request, reply) => {
+    const user = await requireAdmin(db, request, reply)
+    if (!user) return
+    return sanitizePlatformSettingsForClient(await loadPlatformSettings(db, config))
+  })
+
+  app.post('/api/admin/platform-settings/test', async (request, reply) => {
+    const user = await requireAdmin(db, request, reply)
+    if (!user) return
+    return testPlatformSettings(db, config, request.body)
+  })
+
+  app.put('/api/admin/platform-settings', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const saved = await upsertPlatformSettings(db, config, request.body)
+    await writeAuditLog(db, request, {
+      actor: admin,
+      action: 'platform.update',
+      details: {
+        apiManaged: saved.api.managed,
+        activeProfileId: saved.api.settings.activeProfileId,
+        agentLocked: saved.agent.lockSettings,
+      },
+    })
+    return saved
+  })
+
+  app.get('/api/admin/users', async (request, reply) => {
+    const user = await requireAdmin(db, request, reply)
+    if (!user) return
+    const users = await getAdminUserRows(db)
+    return { users: users.map(serializeAdminUser) }
+  })
+
+  app.get('/api/admin/users/:id', async (request, reply) => {
+    const user = await requireAdmin(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    const users = await getAdminUserRows(db)
+    const target = users.map(serializeAdminUser).find((item) => item.id === id)
+    if (!target) return reply.code(404).send({ error: '用户不存在' })
+    const [tasks, images, logs, generationAudits] = await Promise.all([
+      db.query<{ record: TaskRecord; updated_at: string }>(
+        'SELECT record, updated_at FROM tasks WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 10',
+        [id],
+      ),
+      db.query<{ id: string; source: string; byte_size: number; created_at: string; updated_at: string }>(
+        'SELECT id, source, byte_size, created_at, updated_at FROM images WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 10',
+        [id],
+      ),
+      db.query<AuditLogRow>(
+        `
+          SELECT
+            audit_logs.id,
+            audit_logs.action,
+            audit_logs.details,
+            audit_logs.ip,
+            audit_logs.user_agent,
+            audit_logs.created_at,
+            actor.email AS actor_email,
+            target.email AS target_email
+          FROM audit_logs
+          LEFT JOIN users actor ON actor.id = audit_logs.actor_user_id
+          LEFT JOIN users target ON target.id = audit_logs.target_user_id
+          WHERE audit_logs.target_user_id = $1
+          ORDER BY audit_logs.created_at DESC
+          LIMIT 10
+        `,
+        [id],
+      ),
+      getAdminGenerationAudits(db, { userId: id, limit: 10 }),
+    ])
+    return {
+      user: target,
+      recentTasks: tasks.rows.map((row) => ({ task: row.record, updatedAt: row.updated_at })),
+      recentImages: images.rows.map((row) => ({
+        id: row.id,
+        source: row.source,
+        byteSize: row.byte_size,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      })),
+      recentLogs: logs.rows.map(serializeAuditLog),
+      generationAudits,
+    }
+  })
+
+  app.post('/api/admin/users/batch', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const body = request.body as { ids?: unknown; action?: unknown }
+    const ids = Array.isArray(body.ids) ? [...new Set(body.ids.filter((id): id is string => typeof id === 'string' && id !== admin.id))] : []
+    if (!ids.length) return reply.code(400).send({ error: '请选择至少一个非当前账号用户' })
+    const action = typeof body.action === 'string' ? body.action : ''
+    if (action === 'disable' || action === 'enable') {
+      await db.query(
+        `UPDATE users SET disabled_at = ${action === 'disable' ? 'now()' : 'null'}, updated_at = now() WHERE id = ANY($1::uuid[])`,
+        [ids],
+      )
+      await writeAuditLog(db, request, {
+        actor: admin,
+        action: `user.batch_${action}`,
+        details: { ids },
+      })
+      return { ok: true }
+    }
+    if (action === 'clearData') {
+      for (const id of ids) {
+        if (await adminUserExists(db, id)) {
+          await clearUserDataForUser(db, s3, config, id, { clearConfig: true, clearTasks: true })
+        }
+      }
+      await writeAuditLog(db, request, {
+        actor: admin,
+        action: 'user.batch_clear_data',
+        details: { ids },
+      })
+      return { ok: true }
+    }
+    return reply.code(400).send({ error: '不支持的批量操作' })
+  })
+
+  app.post('/api/admin/users', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const body = request.body as { email?: unknown; password?: unknown; isAdmin?: unknown; storageQuotaBytes?: unknown; taskQuotaCount?: unknown }
+    const email = normalizeAdminEmail(body.email)
+    const password = normalizeAdminPassword(body.password)
+    if (!email || !password) return reply.code(400).send({ error: '请输入邮箱和密码' })
+    if (password.length < 8) return reply.code(400).send({ error: '密码至少需要 8 位' })
+
+    const passwordHash = await hashPassword(password)
+    const storageQuotaBytes = normalizeNullableQuota(body.storageQuotaBytes) ?? null
+    const taskQuotaCount = normalizeNullableQuota(body.taskQuotaCount) ?? null
+    let row: {
+      id: string
+      email: string
+      is_admin: boolean
+      disabled_at: string | null
+      registration_status: string
+      registration_requested_at: string | null
+      registration_reviewed_at: string | null
+      registration_reviewed_by: string | null
+      storage_quota_bytes: string | number | null
+      task_quota_count: string | number | null
+      created_at: string
+      updated_at: string
+    }
+    try {
+      const result = await db.query<typeof row>(
+        `
+          INSERT INTO users (
+            email,
+            password_hash,
+            is_admin,
+            disabled_at,
+            registration_status,
+            registration_requested_at,
+            registration_reviewed_at,
+            registration_reviewed_by,
+            storage_quota_bytes,
+            task_quota_count
+          )
+          VALUES ($1, $2, $3, null, 'approved', now(), now(), $6, $4, $5)
+          RETURNING
+            id,
+            email,
+            is_admin,
+            disabled_at,
+            registration_status,
+            registration_requested_at,
+            registration_reviewed_at,
+            registration_reviewed_by,
+            storage_quota_bytes,
+            task_quota_count,
+            created_at,
+            updated_at
+        `,
+        [email, passwordHash, Boolean(body.isAdmin), storageQuotaBytes, taskQuotaCount, admin.id],
+      )
+      row = result.rows[0]
+    } catch (error) {
+      if (isUniqueViolation(error)) return reply.code(409).send({ error: '邮箱已存在' })
+      throw error
+    }
+    await writeAuditLog(db, request, {
+      actor: admin,
+      targetUserId: row.id,
+      action: 'user.create',
+      details: { email, isAdmin: Boolean(body.isAdmin), storageQuotaBytes, taskQuotaCount },
+    })
+    return {
+      user: serializeAdminUser({
+        ...row,
+        latest_session_at: null,
+        task_count: 0,
+        running_task_count: 0,
+        image_count: 0,
+        storage_bytes: 0,
+        conversation_count: 0,
+        session_count: 0,
+      }),
+    }
+  })
+
+  app.post('/api/admin/users/:id/registration', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const { id } = request.params as { id: string }
+    const body = request.body as { action?: unknown }
+    const action = typeof body.action === 'string' ? body.action : ''
+    if (action !== 'approve' && action !== 'reject') return reply.code(400).send({ error: '不支持的审批操作' })
+
+    const current = await db.query<{ email: string; registration_status: string }>(
+      'SELECT email, registration_status FROM users WHERE id = $1',
+      [id],
+    )
+    const targetUser = current.rows[0]
+    if (!targetUser) return reply.code(404).send({ error: '用户不存在' })
+    if (normalizeRegistrationStatus(targetUser.registration_status) !== 'pending') {
+      return reply.code(400).send({ error: '只能审批待处理的注册申请' })
+    }
+
+    await db.query(
+      `
+        UPDATE users
+        SET
+          registration_status = $1,
+          disabled_at = ${action === 'approve' ? 'null' : 'now()'},
+          registration_reviewed_at = now(),
+          registration_reviewed_by = $2,
+          updated_at = now()
+        WHERE id = $3
+      `,
+      [action === 'approve' ? 'approved' : 'rejected', admin.id, id],
+    )
+    if (action === 'reject') await db.query('DELETE FROM sessions WHERE user_id = $1', [id])
+    await writeAuditLog(db, request, {
+      actor: admin,
+      targetUserId: id,
+      action: action === 'approve' ? 'user.registration_approve' : 'user.registration_reject',
+      details: { email: targetUser.email },
+    })
+    const users = await getAdminUserRows(db)
+    return { user: users.map(serializeAdminUser).find((item) => item.id === id) }
+  })
+
+  app.patch('/api/admin/users/:id', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const { id } = request.params as { id: string }
+    const body = request.body as { password?: unknown; isAdmin?: unknown; disabled?: unknown; storageQuotaBytes?: unknown; taskQuotaCount?: unknown }
+    const current = await db.query<{ is_admin: boolean; disabled_at: string | null }>(
+      'SELECT is_admin, disabled_at FROM users WHERE id = $1',
+      [id],
+    )
+    const targetUser = current.rows[0]
+    if (!targetUser) return reply.code(404).send({ error: '用户不存在' })
+    if (id === admin.id && (body.disabled === true || body.isAdmin === false)) {
+      return reply.code(400).send({ error: '不能禁用自己或移除自己的管理员权限' })
+    }
+    if (targetUser.is_admin && !targetUser.disabled_at && body.isAdmin === false && await countEnabledAdmins(db) <= 1) {
+      return reply.code(400).send({ error: '至少需要保留一个启用的管理员' })
+    }
+
+    const patches: string[] = []
+    const values: unknown[] = []
+    const addPatch = (sql: string, value: unknown) => {
+      values.push(value)
+      patches.push(`${sql} = $${values.length}`)
+    }
+    if (typeof body.isAdmin === 'boolean') addPatch('is_admin', body.isAdmin)
+    const storageQuotaBytes = normalizeNullableQuota(body.storageQuotaBytes)
+    const taskQuotaCount = normalizeNullableQuota(body.taskQuotaCount)
+    if (storageQuotaBytes !== undefined) addPatch('storage_quota_bytes', storageQuotaBytes)
+    if (taskQuotaCount !== undefined) addPatch('task_quota_count', taskQuotaCount)
+    if (typeof body.disabled === 'boolean') {
+      if (targetUser.is_admin && !targetUser.disabled_at && body.disabled && await countEnabledAdmins(db) <= 1) {
+        return reply.code(400).send({ error: '至少需要保留一个启用的管理员' })
+      }
+      patches.push(`disabled_at = ${body.disabled ? 'now()' : 'null'}`)
+    }
+    const password = normalizeAdminPassword(body.password)
+    if (password) {
+      if (password.length < 8) return reply.code(400).send({ error: '密码至少需要 8 位' })
+      addPatch('password_hash', await hashPassword(password))
+      await db.query('DELETE FROM sessions WHERE user_id = $1', [id])
+    }
+    if (!patches.length) return reply.code(400).send({ error: '没有需要更新的字段' })
+
+    values.push(id)
+    const result = await db.query<{ id: string }>(
+      `UPDATE users SET ${patches.join(', ')}, updated_at = now() WHERE id = $${values.length} RETURNING id`,
+      values,
+    )
+    await writeAuditLog(db, request, {
+      actor: admin,
+      targetUserId: id,
+      action: 'user.update',
+      details: {
+        isAdmin: typeof body.isAdmin === 'boolean' ? body.isAdmin : undefined,
+        disabled: typeof body.disabled === 'boolean' ? body.disabled : undefined,
+        passwordChanged: Boolean(password),
+        storageQuotaBytes: body.storageQuotaBytes,
+        taskQuotaCount: body.taskQuotaCount,
+      },
+    })
+    const users = await getAdminUserRows(db)
+    return { user: users.map(serializeAdminUser).find((item) => item.id === id) }
+  })
+
+  app.delete('/api/admin/users/:id/data', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const { id } = request.params as { id: string }
+    if (!(await adminUserExists(db, id))) return reply.code(404).send({ error: '用户不存在' })
+    await clearUserDataForUser(db, s3, config, id, { clearConfig: true, clearTasks: true })
+    await writeAuditLog(db, request, { actor: admin, targetUserId: id, action: 'user.clear_data' })
+    return { ok: true }
+  })
+
+  app.delete('/api/admin/users/:id/sessions', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const { id } = request.params as { id: string }
+    if (id === admin.id) return reply.code(400).send({ error: '不能清理当前登录管理员自己的会话' })
+    if (!(await adminUserExists(db, id))) return reply.code(404).send({ error: '用户不存在' })
+    await db.query('DELETE FROM sessions WHERE user_id = $1', [id])
+    await writeAuditLog(db, request, { actor: admin, targetUserId: id, action: 'user.revoke_sessions' })
+    return { ok: true }
+  })
+
+  app.delete('/api/admin/users/:id', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const { id } = request.params as { id: string }
+    if (id === admin.id) return reply.code(400).send({ error: '不能删除当前登录的管理员账号' })
+    const target = await db.query<{ is_admin: boolean; disabled_at: string | null }>(
+      'SELECT is_admin, disabled_at FROM users WHERE id = $1',
+      [id],
+    )
+    if (!target.rows[0]) return reply.code(404).send({ error: '用户不存在' })
+    if (target.rows[0].is_admin && !target.rows[0].disabled_at && await countEnabledAdmins(db) <= 1) {
+      return reply.code(400).send({ error: '至少需要保留一个启用的管理员' })
+    }
+    await clearUserDataForUser(db, s3, config, id, { clearConfig: true, clearTasks: true })
+    await writeAuditLog(db, request, { actor: admin, targetUserId: id, action: 'user.delete', details: { deletedUserId: id } })
+    await db.query('DELETE FROM users WHERE id = $1', [id])
+    return { ok: true }
+  })
+
+  app.post('/api/admin/maintenance/orphans', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const body = request.body as { delete?: unknown }
+    const orphanKeys = await findOrphanObjects(db, s3, config)
+    const shouldDelete = body.delete === true
+    if (shouldDelete) {
+      await deleteObjects(s3, config, orphanKeys)
+      await writeAuditLog(db, request, {
+        actor: admin,
+        action: 'maintenance.delete_orphans',
+        details: { count: orphanKeys.length },
+      })
+    }
+    return { orphanCount: orphanKeys.length, orphanKeys: orphanKeys.slice(0, 100), deleted: shouldDelete }
+  })
+
+  app.post('/api/data/clear', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    await clearUserDataForUser(db, s3, config, user.id, request.body as { clearConfig?: boolean; clearTasks?: boolean })
+    return { ok: true }
+  })
+
+  app.post('/api/images', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    return upsertImage(db, s3, config, user, request.body as Parameters<typeof upsertImage>[4])
+  })
+
+  app.post('/api/images/:id/thumbnail', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    return upsertImageThumbnail(db, s3, config, user, id, request.body as Parameters<typeof upsertImageThumbnail>[5])
+  })
+
+  app.get('/api/images/:id/url', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    const result = await db.query<{ storage_key: string }>(
+      'SELECT storage_key FROM images WHERE user_id = $1 AND id = $2',
+      [user.id, id],
+    )
+    const image = result.rows[0]
+    if (!image) return reply.code(404).send({ error: '图片不存在' })
+    return { url: await createSignedImageUrl(s3, config, image.storage_key) }
+  })
+
+  app.get('/api/images/:id/data', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    const result = await db.query<{ storage_key: string; mime_type: string }>(
+      'SELECT storage_key, mime_type FROM images WHERE user_id = $1 AND id = $2',
+      [user.id, id],
+    )
+    const image = result.rows[0]
+    if (!image) return reply.code(404).send({ error: '图片不存在' })
+    const buffer = await getObjectBuffer(s3, config, image.storage_key)
+    return reply.type(image.mime_type).send(buffer)
+  })
+
+  app.get('/api/images/:id/thumbnail/data', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    const result = await db.query<{ storage_key: string; mime_type: string; width: number | null; height: number | null; thumbnail_version: number | null }>(
+      'SELECT storage_key, mime_type, width, height, thumbnail_version FROM image_thumbnails WHERE user_id = $1 AND image_id = $2',
+      [user.id, id],
+    )
+    const thumbnail = result.rows[0]
+    if (!thumbnail) return reply.code(404).send({ error: '缩略图不存在' })
+    const buffer = await getObjectBuffer(s3, config, thumbnail.storage_key)
+    reply.header('X-Image-Width', String(thumbnail.width ?? ''))
+    reply.header('X-Image-Height', String(thumbnail.height ?? ''))
+    reply.header('X-Thumbnail-Version', String(thumbnail.thumbnail_version ?? ''))
+    return reply.type(thumbnail.mime_type).send(buffer)
+  })
+
+  app.delete('/api/images/:id', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    await deleteImageForUser(db, s3, config, user.id, id)
+    return { ok: true }
+  })
+
+  app.get('/api/tasks', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const result = await db.query<{ record: TaskRecord }>(
+      'SELECT record FROM tasks WHERE user_id = $1 ORDER BY (record->>\'createdAt\')::bigint DESC',
+      [user.id],
+    )
+    return { tasks: result.rows.map((row) => row.record) }
+  })
+
+  app.post('/api/tasks', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const task = request.body as TaskRecord
+    await assertTaskImagesBelongToUser(db, user.id, task)
+    await assertUserLimits(db, user.id, { creatingTask: true })
+    await putTaskRecord(db, user.id, task)
+    publishTaskEvent(user.id, task.id, { type: 'task', task })
+    void runTask(db, s3, config, user, task.id)
+    return { task }
+  })
+
+  app.patch('/api/tasks/:id', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    const patch = request.body as Partial<TaskRecord>
+    const current = await getTask(db, user.id, id)
+    if (!current) {
+      const task = { ...patch, id }
+      if (!isTaskRecordBody(task)) return reply.code(400).send({ error: '任务数据不完整' })
+      await assertTaskImagesBelongToUser(db, user.id, task)
+      await assertUserLimits(db, user.id, { creatingTask: true })
+      await putTaskRecord(db, user.id, task)
+      return { task }
+    }
+
+    const task = applyTaskPatch(current, { ...patch, id })
+    await assertTaskImagesBelongToUser(db, user.id, task)
+    await putTaskRecord(db, user.id, task)
+    return { task }
+  })
+
+  app.get('/api/tasks/:id', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    const task = await getTask(db, user.id, id)
+    if (!task) return reply.code(404).send({ error: '任务不存在' })
+    return { task }
+  })
+
+  app.delete('/api/tasks/:id', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    closeTaskSubscribers(user.id, id)
+    await db.query('DELETE FROM tasks WHERE user_id = $1 AND id = $2', [user.id, id])
+    return { ok: true }
+  })
+
+  app.get('/api/tasks/:id/events', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const { id } = request.params as { id: string }
+    const task = await getTask(db, user.id, id)
+    if (!task) return reply.code(404).send({ error: '任务不存在' })
+
+    reply.hijack()
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+    })
+    reply.raw.write(`data: ${JSON.stringify({ type: 'task', task })}\n\n`)
+
+    if (task.status !== 'running') {
+      reply.raw.end()
+      return
+    }
+
+    const key = taskEventKey(user.id, id)
+    const subscribers = taskSubscribers.get(key) ?? new Set<FastifyReply>()
+    subscribers.add(reply)
+    taskSubscribers.set(key, subscribers)
+    request.raw.on('close', () => {
+      subscribers.delete(reply)
+      if (subscribers.size === 0) taskSubscribers.delete(key)
+    })
+    return
+  })
+
+  app.get('/api/agent/conversations', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const result = await db.query<{ conversation: AgentConversation }>(
+      'SELECT conversation FROM agent_conversations WHERE user_id = $1 ORDER BY updated_at ASC',
+      [user.id],
+    )
+    return { conversations: result.rows.map((row) => row.conversation) }
+  })
+
+  app.put('/api/agent/conversations', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const body = request.body as { conversations?: AgentConversation[] }
+    const conversations = Array.isArray(body.conversations) ? body.conversations : []
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('DELETE FROM agent_conversations WHERE user_id = $1', [user.id])
+      for (const conversation of conversations) {
+        await client.query(
+          `
+            INSERT INTO agent_conversations (id, user_id, conversation, updated_at)
+            VALUES ($1, $2, $3, to_timestamp($4 / 1000.0))
+          `,
+          [conversation.id, user.id, conversation, conversation.updatedAt ?? Date.now()],
+        )
+      }
+      await client.query('COMMIT')
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
+    return { conversations }
+  })
+
+  app.post('/api/agent/title', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    const body = request.body as { prompt?: string; inputImageIds?: string[] }
+    const { settings, profile } = await loadActiveGenerationProfile(db, config, user.id)
+    await assertUpstreamTcpReachable(profile)
+    const imageDataUrls = await Promise.all((body.inputImageIds ?? []).map((id) =>
+      readImageDataUrl(db, s3, config, user.id, id),
+    ))
+    const title = await callAgentConversationTitleApi({
+      settings,
+      profile,
+      prompt: body.prompt ?? '',
+      imageDataUrls,
+    })
+    return { title }
+  })
+
+  app.post('/api/agent/responses/stream', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    let activeProfile: ApiProfile | null = null
+    const body = request.body as {
+      params?: TaskParams
+      input?: unknown
+      maskImageId?: string | null
+      maskDataUrl?: string
+    }
+    openSse(reply)
+    try {
+      const { settings, profile } = await loadActiveGenerationProfile(db, config, user.id)
+      activeProfile = profile
+      await assertUpstreamTcpReachable(profile)
+      const maskDataUrl = body.maskImageId
+        ? await readImageDataUrl(db, s3, config, user.id, body.maskImageId)
+        : body.maskDataUrl
+      const result = await callAgentResponsesApi({
+        settings,
+        profile,
+        params: body.params ?? DEFAULT_PARAMS,
+        input: body.input,
+        maskDataUrl,
+        onTextDelta: (delta) => writeSse(reply, { type: 'text_delta', delta }),
+        onOutputItems: (outputItems) => writeSse(reply, { type: 'output_items', outputItems }),
+        onImageToolStarted: (event) => writeSse(reply, { type: 'image_tool_started', event }),
+        onImagePartialImage: (event) => writeSse(reply, { type: 'image_partial_image', event }),
+        onImageToolCompleted: (image) => writeSse(reply, { type: 'image_tool_completed', image }),
+      })
+      writeSse(reply, { type: 'done', result })
+    } catch (error) {
+      request.log.error({ err: error, baseUrl: activeProfile?.baseUrl, model: activeProfile?.model }, 'cloud agent responses failed')
+      writeSse(reply, { type: 'error', error: formatGenerationError(error, activeProfile) })
+    } finally {
+      reply.raw.end()
+    }
+  })
+
+  app.post('/api/agent/batch-image/stream', async (request, reply) => {
+    const user = await requireAuth(db, request, reply)
+    if (!user) return
+    let activeProfile: ApiProfile | null = null
+    const body = request.body as {
+      params?: TaskParams
+      batchItemId?: string
+      prompt?: string
+      referenceImageDataUrls?: string[]
+      referenceIds?: string[]
+    }
+    openSse(reply)
+    try {
+      const { profile } = await loadActiveGenerationProfile(db, config, user.id)
+      activeProfile = profile
+      await assertUpstreamTcpReachable(profile)
+      const result = await callBatchImageSingle({
+        profile,
+        params: body.params ?? DEFAULT_PARAMS,
+        batchItemId: body.batchItemId ?? '',
+        prompt: body.prompt ?? '',
+        referenceImageDataUrls: body.referenceImageDataUrls ?? [],
+        referenceIds: body.referenceIds,
+        onImageToolStarted: () => writeSse(reply, { type: 'batch_image_started' }),
+        onPartialImage: (event) => writeSse(reply, { type: 'batch_partial_image', event }),
+        onImageToolCompleted: (image) => writeSse(reply, { type: 'batch_image_completed', image }),
+      })
+      writeSse(reply, { type: 'done', result })
+    } catch (error) {
+      request.log.error({ err: error, baseUrl: activeProfile?.baseUrl, model: activeProfile?.model }, 'cloud batch image failed')
+      writeSse(reply, { type: 'error', error: formatGenerationError(error, activeProfile) })
+    } finally {
+      reply.raw.end()
+    }
+  })
+}

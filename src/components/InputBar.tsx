@@ -454,9 +454,13 @@ export default function InputBar() {
   const params = useStore((s) => s.params)
   const setParams = useStore((s) => s.setParams)
   const settings = useStore((s) => s.settings)
+  const cloudUser = useStore((s) => s.cloudUser)
+  const cloudAuthChecked = useStore((s) => s.cloudAuthChecked)
+  const platformSettings = useStore((s) => s.platformSettings)
   const setSettings = useStore((s) => s.setSettings)
   const reusedTaskApiProfileId = useStore((s) => s.reusedTaskApiProfileId)
   const setShowSettings = useStore((s) => s.setShowSettings)
+  const setShowLogin = useStore((s) => s.setShowLogin)
   const setLightboxImageId = useStore((s) => s.setLightboxImageId)
   const showToast = useStore((s) => s.showToast)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
@@ -749,6 +753,10 @@ export default function InputBar() {
   const isMobile = useIsMobile()
 
   const currentActiveProfile = useMemo(() => getActiveApiProfile(settings), [settings])
+  const platformApiManaged = platformSettings?.api.managed === true
+  const platformActiveProfile = useMemo(() => (
+    platformApiManaged ? getActiveApiProfile(platformSettings.api.settings) : null
+  ), [platformApiManaged, platformSettings])
   const activeProfile = useMemo(() => (
     settings.reuseTaskApiProfileTemporarily && reusedTaskApiProfileId
       ? settings.profiles.find((profile) => profile.id === reusedTaskApiProfileId) ?? currentActiveProfile
@@ -763,34 +771,87 @@ export default function InputBar() {
       ? settings
       : normalizeSettings({ ...settings, activeProfileId: activeProfile.id })
   ), [activeProfile.id, currentActiveProfile.id, settings])
-  const hasSubmitApiConfig = Boolean(activeProfile.apiKey)
-  const canSubmit = Boolean(prompt.trim() && hasSubmitApiConfig && !activeAgentIsRunning)
+  const platformHasStoredApiKey = Boolean(platformApiManaged && platformActiveProfile?.hasStoredApiKey)
+  const hasCloudStoredApiKey = Boolean(cloudUser && (
+    activeProfile.hasStoredApiKey ||
+    currentActiveProfile.hasStoredApiKey ||
+    platformHasStoredApiKey
+  ))
+  const hasSubmitApiConfig = Boolean(activeProfile.apiKey.trim() || hasCloudStoredApiKey)
+  const submitUnavailableReason = !cloudAuthChecked
+    ? '正在检查云端登录状态'
+    : platformApiManaged && !cloudUser
+    ? '请先登录云端工作台'
+    : platformApiManaged && !platformHasStoredApiKey
+    ? '后台 API Key 未保存，请联系管理员'
+    : '尚未完成 API 配置，请在右上角设置中进行'
   const submitButtonAriaLabel = activeAgentIsRunning
     ? '停止生成'
     : hasSubmitApiConfig
     ? maskDraft ? '遮罩编辑' : '生成图像'
-    : '请先配置 API'
-  const submitTooltipText = activeAgentIsRunning ? '停止生成' : '尚未完成 API 配置，请在右上角设置中进行'
+    : submitUnavailableReason
+  const submitTooltipText = activeAgentIsRunning
+    ? '停止生成'
+    : submitUnavailableReason
   const promptPlaceholder = '描述你想生成的图片，可输入 @ 来指定参考图...'
-  const submitCurrentMode = useCallback(() => {
-    if (appMode === 'agent') {
-      void submitAgentMessage()
-    } else {
-      void submitTask()
-    }
-  }, [appMode])
   const stopActiveAgentResponse = useCallback(() => {
     stopAgentResponse(activeAgentConversationId)
   }, [activeAgentConversationId])
   const syncPromptFromContentEditable = useCallback(() => {
     const el = textareaRef.current
-    if (!el) return
+    if (!el) return useStore.getState().prompt
     isUserInputRef.current = true
     const range = getContentEditableSelection(el)
     setCursorPos(range.start)
     syncMentionTagSelection(el)
-    setPrompt(getContentEditablePlainText(el))
+    const text = getContentEditablePlainText(el)
+    setPrompt(text)
+    return text
   }, [setPrompt])
+  const submitCurrentMode = useCallback(() => {
+    // contentEditable 在部分输入法/浏览器中可能延迟同步，提交前再读一次 DOM。
+    syncPromptFromContentEditable()
+    if (appMode === 'agent') {
+      void submitAgentMessage()
+    } else {
+      void submitTask()
+    }
+  }, [appMode, syncPromptFromContentEditable])
+  const requestSubmit = useCallback(() => {
+    if (activeAgentIsRunning) {
+      stopActiveAgentResponse()
+      return
+    }
+    if (hasSubmitApiConfig) {
+      submitCurrentMode()
+      return
+    }
+    if (!cloudAuthChecked) {
+      showToast('正在检查云端登录状态，请稍后再试', 'info')
+      return
+    }
+    if (platformApiManaged && !cloudUser) {
+      setShowLogin(true)
+      return
+    }
+    if (platformApiManaged && !platformHasStoredApiKey) {
+      showToast('后台 API Key 未保存，请联系管理员', 'error')
+      return
+    }
+    setShowSettings(true, 'api')
+  }, [
+    activeAgentIsRunning,
+    cloudAuthChecked,
+    cloudUser,
+    hasSubmitApiConfig,
+    platformApiManaged,
+    platformHasStoredApiKey,
+    setShowLogin,
+    setShowSettings,
+    showToast,
+    stopActiveAgentResponse,
+    submitCurrentMode,
+  ])
   const activeProvider = activeProfile.provider
   const isFalProvider = activeProvider === 'fal'
   const agentAutoImageCount = appMode === 'agent' && activeProfile.provider === 'openai' && activeProfile.apiMode === 'responses'
@@ -1286,11 +1347,11 @@ export default function InputBar() {
         if (e.shiftKey) {
           insertPromptTextAtSelection('\n')
         } else if (!isModifier) {
-          if (canSubmit) submitCurrentMode()
+          requestSubmit()
         }
       } else {
         if (isModifier) {
-          if (canSubmit) submitCurrentMode()
+          requestSubmit()
         } else {
           insertPromptTextAtSelection('\n')
         }
@@ -1462,7 +1523,7 @@ export default function InputBar() {
     // 输入时不重复渲染以防光标跳动
     if (isUserInputRef.current) {
       isUserInputRef.current = false
-      return
+      if (getContentEditablePlainText(el) === prompt) return
     }
     const parts = getPromptMentionParts(prompt, inputImages)
     const html = prompt
@@ -1850,6 +1911,16 @@ export default function InputBar() {
           {isMaskTarget && (
             <span className="absolute left-1 top-1 rounded bg-blue-500/90 px-1.5 py-0.5 text-[8px] leading-none text-white font-bold tracking-wider backdrop-blur-sm z-10 pointer-events-none">
               MASK
+            </span>
+          )}
+          {img.uploadStatus === 'uploading' && (
+            <span className="absolute right-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[8px] leading-none text-white backdrop-blur-sm z-10 pointer-events-none">
+              上传中
+            </span>
+          )}
+          {img.uploadStatus === 'error' && (
+            <span className="absolute right-1 top-1 rounded bg-red-500/90 px-1.5 py-0.5 text-[8px] leading-none text-white backdrop-blur-sm z-10 pointer-events-none">
+              失败
             </span>
           )}
           <span className="absolute bottom-1 left-1 flex h-4 w-4 items-center justify-center rounded-full bg-black/55 text-[9px] font-semibold text-white backdrop-blur-sm z-10 pointer-events-none">
@@ -2442,8 +2513,7 @@ export default function InputBar() {
                 >
                   <ButtonTooltip visible={(activeAgentIsRunning || !hasSubmitApiConfig) && submitHover} text={submitTooltipText} />
                   <button
-                    onClick={() => activeAgentIsRunning ? stopActiveAgentResponse() : hasSubmitApiConfig ? submitCurrentMode() : setShowSettings(true)}
-                    disabled={activeAgentIsRunning ? false : hasSubmitApiConfig ? !canSubmit : false}
+                    onClick={requestSubmit}
                     className={`p-2.5 rounded-xl transition-all shadow-sm hover:shadow ${
                       activeAgentIsRunning
                         ? 'bg-red-500 text-white hover:bg-red-600'
@@ -2549,8 +2619,7 @@ export default function InputBar() {
                 >
                   <ButtonTooltip visible={(activeAgentIsRunning || !hasSubmitApiConfig) && submitHover} text={submitTooltipText} />
                   <button
-                    onClick={() => activeAgentIsRunning ? stopActiveAgentResponse() : hasSubmitApiConfig ? submitCurrentMode() : setShowSettings(true)}
-                    disabled={activeAgentIsRunning ? false : hasSubmitApiConfig ? !canSubmit : false}
+                    onClick={requestSubmit}
                     aria-label={submitButtonAriaLabel}
                     className={`w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium transition-all shadow-sm ${
                       activeAgentIsRunning

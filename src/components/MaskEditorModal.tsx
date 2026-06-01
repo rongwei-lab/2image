@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react'
 import { createPortal } from 'react-dom'
-import { ensureImageCached, useStore } from '../store'
+import { ensureImageCached, storeImageForCurrentMode, useStore } from '../store'
 import { canvasToBlob, loadImage } from '../lib/canvasImage'
-import { storeImage } from '../lib/db'
 import { prepareMaskTargetDataUrl, replaceMaskTargetImage } from '../lib/maskPreprocess'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
@@ -791,7 +790,7 @@ export default function MaskEditorModal() {
       setIsSaving(true)
       const blob = await canvasToBlob(canvas, 'image/png')
       const maskDataUrl = await blobToDataUrl(blob)
-      const workingTargetId = await storeImage(sourceDataUrl, 'upload')
+      const workingTargetId = await storeImageForCurrentMode(sourceDataUrl, 'upload')
       if (
         saveTokenRef.current !== token ||
         activeSessionIdRef.current !== savingSessionId ||

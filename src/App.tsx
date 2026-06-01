@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { initStore } from './store'
 import { useStore } from './store'
 import { buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './lib/urlSettings'
@@ -17,7 +17,9 @@ import ConfirmDialog from './components/ConfirmDialog'
 import Toast from './components/Toast'
 import MaskEditorModal from './components/MaskEditorModal'
 import ImageContextMenu from './components/ImageContextMenu'
+import AdminPage from './components/AdminPage'
 import SupportPromptModal from './components/SupportPromptModal'
+import LoginModal from './components/LoginModal'
 import { FavoriteCollectionPickerModal, FavoriteCollectionsView, ManageCollectionsModal } from './components/FavoriteCollections'
 import { useGlobalClickSuppression } from './lib/clickSuppression'
 
@@ -28,6 +30,9 @@ export default function App() {
   const appMode = useStore((s) => s.appMode)
   const filterFavorite = useStore((s) => s.filterFavorite)
   const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
+  const showLogin = useStore((s) => s.showLogin)
+  const setShowLogin = useStore((s) => s.setShowLogin)
+  const [pathName, setPathName] = useState(() => window.location.pathname)
   useDockerApiUrlMigrationNotice()
   useGlobalClickSuppression()
 
@@ -63,6 +68,12 @@ export default function App() {
   }, [setSettings])
 
   useEffect(() => {
+    const updatePathName = () => setPathName(window.location.pathname)
+    window.addEventListener('popstate', updatePathName)
+    return () => window.removeEventListener('popstate', updatePathName)
+  }, [])
+
+  useEffect(() => {
     const preventPageImageDrag = (e: DragEvent) => {
       if ((e.target as HTMLElement | null)?.closest('img')) {
         e.preventDefault()
@@ -72,6 +83,17 @@ export default function App() {
     document.addEventListener('dragstart', preventPageImageDrag)
     return () => document.removeEventListener('dragstart', preventPageImageDrag)
   }, [])
+
+  if (pathName === '/admin') {
+    return (
+      <>
+        <AdminPage />
+        {showLogin && <LoginModal onClose={() => setShowLogin(false)} />}
+        <ConfirmDialog />
+        <Toast />
+      </>
+    )
+  }
 
   return (
     <>
@@ -91,6 +113,7 @@ export default function App() {
       <Lightbox />
       <SettingsModal />
       <ConfirmDialog />
+      {showLogin && <LoginModal onClose={() => setShowLogin(false)} />}
       <SupportPromptModal />
       <FavoriteCollectionPickerModal />
       <ManageCollectionsModal />

@@ -80,18 +80,20 @@ export function resolveDevProxyConfig(input: unknown, isDev: boolean): DevProxyC
 }
 
 export function readClientDevProxyConfig(): DevProxyConfig | null {
+  const env = import.meta.env
+  if (!env) return null
   return resolveDevProxyConfig(
     typeof __DEV_PROXY_CONFIG__ === 'undefined' ? null : __DEV_PROXY_CONFIG__,
-    import.meta.env.DEV,
+    Boolean(env.DEV),
   )
 }
 
 export function isApiProxyAvailable(proxyConfig: DevProxyConfig | null = readClientDevProxyConfig()): boolean {
-  return readRuntimeEnv(import.meta.env.VITE_API_PROXY_AVAILABLE) === 'true' || Boolean(proxyConfig?.enabled)
+  return readRuntimeEnv(import.meta.env?.VITE_API_PROXY_AVAILABLE) === 'true' || Boolean(proxyConfig?.enabled)
 }
 
 export function isApiProxyLocked(proxyConfig: DevProxyConfig | null = readClientDevProxyConfig()): boolean {
-  return readRuntimeEnv(import.meta.env.VITE_API_PROXY_LOCKED) === 'true' && isApiProxyAvailable(proxyConfig)
+  return readRuntimeEnv(import.meta.env?.VITE_API_PROXY_LOCKED) === 'true' && isApiProxyAvailable(proxyConfig)
 }
 
 export function shouldUseApiProxy(apiProxy: boolean, proxyConfig: DevProxyConfig | null = readClientDevProxyConfig()): boolean {
