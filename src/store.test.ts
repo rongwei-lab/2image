@@ -97,7 +97,7 @@ vi.mock('./lib/agentApi', () => ({
 }))
 import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllTasks, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
-import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
+import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markExpiredOpenAIRunningTasks, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
@@ -1539,6 +1539,44 @@ describe('agent task lifecycle', () => {
       error: 'Agent 回复已结束，但图像工具未返回最终图片',
       sourceMode: 'agent',
     })
+  })
+
+  it('marks expired cloud OpenAI running tasks failed by their API profile timeout', () => {
+    const expiredTask = task({
+      id: 'expired-agent-task',
+      status: 'running',
+      error: null,
+      createdAt: 1_000,
+      finishedAt: null,
+      apiProvider: 'openai',
+      apiProfileId: responsesProfile.id,
+      sourceMode: 'agent',
+    })
+    const freshTask = task({
+      id: 'fresh-agent-task',
+      status: 'running',
+      error: null,
+      createdAt: 9_000,
+      finishedAt: null,
+      apiProvider: 'openai',
+      apiProfileId: responsesProfile.id,
+      sourceMode: 'agent',
+    })
+
+    const result = markExpiredOpenAIRunningTasks(
+      [expiredTask, freshTask],
+      useStore.getState().settings,
+      1_000 + (responsesProfile.timeout * 1000) + 1,
+    )
+
+    expect(result.expiredTasks).toHaveLength(1)
+    expect(result.tasks[0]).toMatchObject({
+      id: expiredTask.id,
+      status: 'error',
+      error: expect.stringContaining(`超过 ${responsesProfile.timeout} 秒`),
+      finishedAt: 1_000 + (responsesProfile.timeout * 1000) + 1,
+    })
+    expect(result.tasks[1]).toMatchObject({ id: freshTask.id, status: 'running' })
   })
 })
 

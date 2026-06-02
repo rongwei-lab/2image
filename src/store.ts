@@ -2171,6 +2171,35 @@ export function markInterruptedOpenAIRunningTasks(tasks: TaskRecord[], now = Dat
   return { tasks: updatedTasks, interruptedTasks }
 }
 
+export function markExpiredOpenAIRunningTasks(
+  tasks: TaskRecord[],
+  settings: AppSettings,
+  now = Date.now(),
+) {
+  const expiredTasks: TaskRecord[] = []
+  const updatedTasks = tasks.map((task) => {
+    if (!isRunningOpenAITask(task) || task.customTaskId) return task
+
+    const profile = getTaskApiProfile(settings, task) ?? getActiveApiProfile(settings)
+    const timeoutSeconds = Math.max(1, profile.timeout)
+    if (now - task.createdAt < timeoutSeconds * 1000) return task
+
+    const updated: TaskRecord = {
+      ...task,
+      status: 'error',
+      error: createOpenAITimeoutError(timeoutSeconds, profile),
+      falRecoverable: false,
+      customRecoverable: false,
+      finishedAt: now,
+      elapsed: Math.max(0, now - task.createdAt),
+    }
+    expiredTasks.push(updated)
+    return updated
+  })
+
+  return { tasks: updatedTasks, expiredTasks }
+}
+
 function clearOpenAIWatchdogTimer(taskId: string) {
   const timer = openAIWatchdogTimers.get(taskId)
   if (timer) clearTimeout(timer)
@@ -3990,6 +4019,12 @@ async function executeAgentRound(
 ) {
   const startedAt = Date.now()
   const controller = new AbortController()
+  const agentTimeoutSeconds = Math.max(1, activeProfile.timeout)
+  let agentRequestTimedOut = false
+  const agentTimeoutTimer = setTimeout(() => {
+    agentRequestTimedOut = true
+    controller.abort()
+  }, agentTimeoutSeconds * 1000)
   const controllerKey = getAgentRoundControllerKey(conversationId, roundId)
   agentRoundControllers.set(controllerKey, controller)
   try {
@@ -4575,17 +4610,19 @@ async function executeAgentRound(
       outputIds.length > 0 ? `Agent 回复已结束，共生成 ${outputIds.length} 张图片。` : 'Agent 回复已结束。',
     )
   } catch (err) {
-    if (controller.signal.aborted) {
+    if (controller.signal.aborted && !agentRequestTimedOut) {
       if (markAgentRoundStopped(conversationId, roundId)) {
         useStore.getState().showToast('已停止生成', 'info')
       }
       return
     }
 
-    let message = err instanceof Error ? err.message : String(err)
+    let message = agentRequestTimedOut
+      ? createOpenAITimeoutError(agentTimeoutSeconds, activeProfile)
+      : err instanceof Error ? err.message : String(err)
     const usesApiProxy = activeProfile.apiProxy ?? requestSettings.apiProxy
     const networkErrorHint = getApiRequestNetworkErrorHint(err, startedAt, usesApiProxy, activeProfile)
-    if (networkErrorHint && !message.includes(IMAGE_FETCH_CORS_HINT)) {
+    if (!agentRequestTimedOut && networkErrorHint && !message.includes(IMAGE_FETCH_CORS_HINT)) {
       message += `\n${networkErrorHint}`
     }
 
@@ -4628,6 +4665,7 @@ async function executeAgentRound(
     })
     useStore.getState().showToast(`Agent 请求失败：${message}`, 'error')
   } finally {
+    clearTimeout(agentTimeoutTimer)
     if (agentRoundControllers.get(controllerKey) === controller) {
       agentRoundControllers.delete(controllerKey)
     }
@@ -4711,7 +4749,17 @@ function subscribeToCloudTask(task: TaskRecord, options: { notifyDone?: boolean;
 }
 
 function resumeCloudRunningTasks(tasks: TaskRecord[]) {
+  const { settings } = useStore.getState()
+  const { expiredTasks } = markExpiredOpenAIRunningTasks(tasks, settings)
+  const expiredIds = new Set(expiredTasks.map((task) => task.id))
+
+  for (const task of expiredTasks) {
+    applyRemoteTaskUpdate(task)
+    void patchCloudTask(task)
+  }
+
   for (const task of tasks) {
+    if (expiredIds.has(task.id)) continue
     if (task.status === 'running') subscribeToCloudTask(task, { notifyDone: true, revealError: true })
   }
 }
