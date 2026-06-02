@@ -461,6 +461,14 @@ export async function getCloudAdminGenerationAudits(input: { userId?: string; ag
   return data.audits
 }
 
+export async function regenerateCloudAdminGenerationTask(input: { userId: string; taskId: string }): Promise<CloudAdminGenerationAudit> {
+  const data = await request<{ audit: CloudAdminGenerationAudit }>(
+    `/api/admin/users/${encodeURIComponent(input.userId)}/tasks/${encodeURIComponent(input.taskId)}/regenerate`,
+    { method: 'POST' },
+  )
+  return data.audit
+}
+
 export async function getCloudAdminPlatformSettings(): Promise<CloudPlatformSettings> {
   return request<CloudPlatformSettings>('/api/admin/platform-settings')
 }

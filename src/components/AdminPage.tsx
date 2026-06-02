@@ -12,6 +12,7 @@ import {
   getCloudAdminSystem,
   getCloudAdminUserDetail,
   getCloudAdminUsers,
+  regenerateCloudAdminGenerationTask,
   reviewCloudAdminRegistration,
   revokeCloudAdminUserSessions,
   scanCloudAdminOrphans,
@@ -605,7 +606,17 @@ function AuditImageGroup({ title, emptyText, images }: { title: string; emptyTex
   )
 }
 
-function GenerationAuditCard({ audit, showUser = true }: { audit: CloudAdminGenerationAudit; showUser?: boolean }) {
+function GenerationAuditCard({
+  audit,
+  showUser = true,
+  regenerating,
+  onRegenerate,
+}: {
+  audit: CloudAdminGenerationAudit
+  showUser?: boolean
+  regenerating?: boolean
+  onRegenerate?: (audit: CloudAdminGenerationAudit) => void
+}) {
   const { task } = audit
   const status = getTaskStatusMeta(task.status)
   const sourceIsAgent = isAgentAudit(audit)
@@ -650,15 +661,27 @@ function GenerationAuditCard({ audit, showUser = true }: { audit: CloudAdminGene
             {task.prompt || task.id}
           </p>
         </div>
-        <div className="flex max-w-full flex-wrap gap-1.5 text-[11px] text-gray-500 sm:justify-end">
-          <span className={`rounded px-2 py-1 ${sourceIsAgent ? 'bg-violet-50 text-violet-700 dark:bg-violet-500/10 dark:text-violet-300' : 'bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300'}`}>
-            {sourceIsAgent ? 'Agent' : '画廊'}
-          </span>
-          {sourceIsAgent && roundLabel && <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{roundLabel}</span>}
-          {sourceIsAgent && toolActionLabel && <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{toolActionLabel}</span>}
-          <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{task.apiProvider ?? 'unknown'}</span>
-          <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{task.apiMode ?? '-'}</span>
-          <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{task.apiModel ?? '-'}</span>
+        <div className="flex max-w-full flex-col items-start gap-2 sm:items-end">
+          <div className="flex max-w-full flex-wrap gap-1.5 text-[11px] text-gray-500 sm:justify-end">
+            <span className={`rounded px-2 py-1 ${sourceIsAgent ? 'bg-violet-50 text-violet-700 dark:bg-violet-500/10 dark:text-violet-300' : 'bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300'}`}>
+              {sourceIsAgent ? 'Agent' : '画廊'}
+            </span>
+            {sourceIsAgent && roundLabel && <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{roundLabel}</span>}
+            {sourceIsAgent && toolActionLabel && <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{toolActionLabel}</span>}
+            <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{task.apiProvider ?? 'unknown'}</span>
+            <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{task.apiMode ?? '-'}</span>
+            <span className="rounded bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">{task.apiModel ?? '-'}</span>
+          </div>
+          {sourceIsAgent && task.status !== 'running' && onRegenerate && (
+            <button
+              type="button"
+              onClick={() => onRegenerate(audit)}
+              disabled={regenerating}
+              className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-blue-400/30 dark:text-blue-200 dark:hover:bg-blue-500/10"
+            >
+              {regenerating ? '重生成中...' : '原任务重生成'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -763,7 +786,21 @@ function GenerationOverviewCard({
   )
 }
 
-function GenerationAuditDetailModal({ item, showUser, loading, onClose }: { item: GenerationAuditOverviewItem; showUser: boolean; loading: boolean; onClose: () => void }) {
+function GenerationAuditDetailModal({
+  item,
+  showUser,
+  loading,
+  regeneratingTaskId,
+  onRegenerate,
+  onClose,
+}: {
+  item: GenerationAuditOverviewItem
+  showUser: boolean
+  loading: boolean
+  regeneratingTaskId?: string | null
+  onRegenerate?: (audit: CloudAdminGenerationAudit) => void
+  onClose: () => void
+}) {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose()
@@ -805,7 +842,13 @@ function GenerationAuditDetailModal({ item, showUser, loading, onClose }: { item
           {loading && <div className="mb-4 rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-700 dark:bg-blue-500/10 dark:text-blue-300">正在加载完整 Agent 审计...</div>}
           <div className="space-y-3">
             {item.audits.map((audit) => (
-              <GenerationAuditCard key={`${audit.user.id}:${audit.task.id}`} audit={audit} showUser={showUser} />
+              <GenerationAuditCard
+                key={`${audit.user.id}:${audit.task.id}`}
+                audit={audit}
+                showUser={showUser}
+                regenerating={regeneratingTaskId === audit.task.id}
+                onRegenerate={onRegenerate}
+              />
             ))}
           </div>
         </div>
@@ -819,6 +862,7 @@ function GenerationAuditOverviewGrid({ audits, showUser = true, onError }: { aud
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [loadingKey, setLoadingKey] = useState<string | null>(null)
   const [expandedAudits, setExpandedAudits] = useState<Record<string, CloudAdminGenerationAudit[]>>({})
+  const [regeneratingTaskId, setRegeneratingTaskId] = useState<string | null>(null)
 
   useEffect(() => {
     if (selectedKey && !items.some((item) => item.key === selectedKey)) setSelectedKey(null)
@@ -846,6 +890,30 @@ function GenerationAuditOverviewGrid({ audits, showUser = true, onError }: { aud
     }
   }
 
+  const regenerateAudit = async (audit: CloudAdminGenerationAudit) => {
+    if (regeneratingTaskId) return
+    setRegeneratingTaskId(audit.task.id)
+    try {
+      const regenerated = await regenerateCloudAdminGenerationTask({
+        userId: audit.user.id,
+        taskId: audit.task.id,
+      })
+      setExpandedAudits((current) => {
+        if (!selectedKey || !current[selectedKey]) return current
+        return {
+          ...current,
+          [selectedKey]: current[selectedKey].map((item) =>
+            item.task.id === regenerated.task.id && item.user.id === regenerated.user.id ? regenerated : item,
+          ),
+        }
+      })
+    } catch (error) {
+      onError?.(error instanceof Error ? error.message : String(error))
+    } finally {
+      setRegeneratingTaskId(null)
+    }
+  }
+
   const selectedBaseItem = items.find((item) => item.key === selectedKey) ?? null
   const selectedItem = selectedBaseItem && expandedAudits[selectedBaseItem.key]
     ? { ...selectedBaseItem, audits: expandedAudits[selectedBaseItem.key], status: getAuditGroupStatus(expandedAudits[selectedBaseItem.key]) }
@@ -869,6 +937,8 @@ function GenerationAuditOverviewGrid({ audits, showUser = true, onError }: { aud
           item={selectedItem}
           showUser={showUser}
           loading={loadingKey === selectedItem.key}
+          regeneratingTaskId={regeneratingTaskId}
+          onRegenerate={(audit) => void regenerateAudit(audit)}
           onClose={() => setSelectedKey(null)}
         />
       )}

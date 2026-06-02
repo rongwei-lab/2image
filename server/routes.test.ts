@@ -2,12 +2,24 @@ import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_PARAMS, type AgentConversation, type PlatformSettings, type TaskRecord } from '../src/types'
-import { DEFAULT_SETTINGS } from '../src/lib/apiProfiles'
+import { createDefaultOpenAIProfile, DEFAULT_SETTINGS } from '../src/lib/apiProfiles'
 import { hashToken } from './crypto'
 import type { Db } from './db'
 import { registerCloudRoutes } from './routes'
 import type { ServerConfig } from './config'
-import type { S3Client } from '@aws-sdk/client-s3'
+import { S3Client } from '@aws-sdk/client-s3'
+
+const agentApiMocks = vi.hoisted(() => ({
+  callAgentResponsesApi: vi.fn(),
+}))
+
+vi.mock('../src/lib/agentApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/agentApi')>()
+  return {
+    ...actual,
+    callAgentResponsesApi: agentApiMocks.callAgentResponsesApi,
+  }
+})
 
 type MemoryUser = {
   id: string
@@ -109,8 +121,13 @@ function createMemoryDb() {
     [hashToken('token-a'), USER_A.id],
     [hashToken('token-b'), USER_B.id],
   ])
+  const userAProfile = createDefaultOpenAIProfile({
+    apiKey: 'test-key',
+    apiMode: 'responses',
+    model: 'gpt-image-2',
+  })
   const settings = new Map<string, { settings: typeof DEFAULT_SETTINGS; params: typeof DEFAULT_PARAMS; workspace: Record<string, unknown> }>([
-    [USER_A.id, { settings: { ...DEFAULT_SETTINGS, model: 'model-a' }, params: DEFAULT_PARAMS, workspace: { prompt: 'user-a-prompt' } }],
+    [USER_A.id, { settings: { ...DEFAULT_SETTINGS, profiles: [userAProfile], activeProfileId: userAProfile.id }, params: DEFAULT_PARAMS, workspace: { prompt: 'user-a-prompt' } }],
     [USER_B.id, { settings: { ...DEFAULT_SETTINGS, model: 'model-b' }, params: DEFAULT_PARAMS, workspace: { prompt: 'user-b-prompt' } }],
   ])
   const images = new Map([
@@ -191,7 +208,10 @@ function createMemoryDb() {
         createdAt: 1,
         finishedAt: 2,
       }],
-      messages: [],
+      messages: [
+        { id: 'message-user-a', role: 'user', content: '生成温州风景主视觉', roundId: 'round-a', createdAt: 1 },
+        { id: 'message-assistant-a', role: 'assistant', content: '请求失败：超时', roundId: 'round-a', outputTaskIds: ['task-owned'], createdAt: 2 },
+      ],
     }],
   ])
   const auditLogs: Array<{
@@ -303,6 +323,10 @@ function createMemoryDb() {
       const user = users.get(params[0] as string)
       return { rows: user ? [{ id: user.id }] : [] }
     }
+    if (sql.startsWith('SELECT id, email, is_admin FROM users WHERE id = $1')) {
+      const user = users.get(params[0] as string)
+      return { rows: user ? [{ id: user.id, email: user.email, is_admin: user.is_admin }] : [] }
+    }
     if (sql.startsWith('SELECT email, registration_status FROM users WHERE id = $1')) {
       const user = users.get(params[0] as string)
       return { rows: user ? [{ email: user.email, registration_status: user.registration_status }] : [] }
@@ -390,6 +414,10 @@ function createMemoryDb() {
 	        })),
 	      }
 	    }
+    if (sql.startsWith('SELECT conversation FROM agent_conversations WHERE user_id = $1 AND id = $2')) {
+      const conversation = agentConversations.get(rowKey(params[0] as string, params[1] as string))
+      return { rows: conversation ? [{ conversation }] : [] }
+    }
     if (sql.startsWith('SELECT user_id, id, conversation FROM agent_conversations')) {
       const userIds = new Set(params[0] as string[])
       const conversationIds = new Set(params[1] as string[])
@@ -407,6 +435,18 @@ function createMemoryDb() {
               conversation,
             }
           }),
+      }
+    }
+    if (sql.includes('tasks.user_id') && sql.includes('users.email AS user_email') && sql.includes('WHERE tasks.user_id = $1 AND tasks.id = $2')) {
+      const userId = params[0] as string
+      const record = tasks.get(rowKey(userId, params[1] as string))
+      return {
+        rows: record ? [{
+          user_id: userId,
+          user_email: users.get(userId)?.email ?? null,
+          record,
+          updated_at: NOW_ISO,
+        }] : [],
       }
     }
 	    if (sql.includes('tasks.user_id') && sql.includes('users.email AS user_email')) {
@@ -483,6 +523,7 @@ function createMemoryDb() {
       const row = settings.get(params[0] as string)
       return { rows: row ? [row] : [] }
     }
+    if (sql.startsWith('SELECT id, encrypted_api_key FROM api_profiles')) return { rows: [] }
     if (sql.startsWith('SELECT id FROM api_profiles')) return { rows: [] }
     if (sql.startsWith('SELECT id FROM tasks WHERE user_id = $1')) {
       const userId = params[0] as string
@@ -519,6 +560,14 @@ function createMemoryDb() {
       const row = thumbnails.get(rowKey(params[0] as string, params[1] as string))
       return { rows: row ? [row] : [] }
     }
+    if (sql.startsWith('INSERT INTO images')) {
+      images.set(rowKey(params[1] as string, params[0] as string), {
+        storage_key: params[4] as string,
+        mime_type: params[5] as string,
+        byte_size: params[6] as number,
+      })
+      return { rows: [] }
+    }
     if (sql.startsWith('DELETE FROM image_thumbnails') && sql.includes('image_id = $2')) {
       thumbnails.delete(rowKey(params[0] as string, params[1] as string))
       return { rows: [] }
@@ -545,6 +594,14 @@ function createMemoryDb() {
       const record = tasks.get(rowKey(params[0] as string, params[1] as string))
       return { rows: record ? [{ record }] : [] }
     }
+    if (sql.startsWith('SELECT record FROM tasks WHERE user_id = $1 ORDER BY created_at ASC')) {
+      const userId = params[0] as string
+      return {
+        rows: [...tasks.entries()]
+          .filter(([key]) => key.startsWith(`${userId}:`))
+          .map(([, record]) => ({ record })),
+      }
+    }
     if (sql.startsWith('DELETE FROM tasks') && sql.includes('id = $2')) {
       tasks.delete(rowKey(params[0] as string, params[1] as string))
       return { rows: [] }
@@ -561,6 +618,10 @@ function createMemoryDb() {
       for (const key of [...agentConversations.keys()]) {
         if (key.startsWith(`${userId}:`)) agentConversations.delete(key)
       }
+      return { rows: [] }
+    }
+    if (sql.startsWith('INSERT INTO agent_conversations')) {
+      agentConversations.set(rowKey(params[1] as string, params[0] as string), params[2] as AgentConversation)
       return { rows: [] }
     }
 	    if (sql.startsWith('UPDATE user_settings SET workspace')) {
@@ -593,7 +654,7 @@ function createMemoryDb() {
 }
 
 function createMemoryS3() {
-  const objects = new Map([
+  const objects = new Map<string, Buffer<ArrayBufferLike>>([
     ['users/user-a/library/images/image-owned.png', Buffer.from('owned-image')],
     ['users/user-a/library/thumbnails/image-owned.png', Buffer.from('owned-thumbnail')],
     ['users/user-b/library/images/image-private.png', Buffer.from('private-image')],
@@ -601,7 +662,13 @@ function createMemoryS3() {
     ['users/orphan/library/images/orphan.png', Buffer.from('orphan')],
   ])
   const deletedKeys: string[] = []
-  const send = vi.fn(async (command: { input?: { Key?: string; Prefix?: string }; constructor: { name: string } }) => {
+  const s3 = new S3Client({
+    endpoint: 'http://localhost:9000',
+    region: 'us-east-1',
+    forcePathStyle: true,
+    credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+  })
+  const send = vi.fn(async (command: { input?: { Key?: string; Prefix?: string; Body?: unknown }; constructor: { name: string } }) => {
     const key = command.input?.Key ?? ''
     if (command.constructor.name === 'ListObjectsV2Command') {
       const prefix = command.input?.Prefix ?? ''
@@ -615,6 +682,11 @@ function createMemoryS3() {
       const body = objects.get(key)
       return { Body: body ? { transformToByteArray: async () => Uint8Array.from(body) } : undefined }
     }
+    if (command.constructor.name === 'PutObjectCommand') {
+      const body = command.input?.Body
+      objects.set(key, Buffer.isBuffer(body) ? body : Buffer.from(body as Uint8Array))
+      return {}
+    }
     if (command.constructor.name === 'DeleteObjectCommand') {
       deletedKeys.push(key)
       objects.delete(key)
@@ -622,7 +694,8 @@ function createMemoryS3() {
     }
     throw new Error(`未处理的 S3 命令：${command.constructor.name}`)
   })
-  return { s3: { send } as unknown as S3Client, objects, deletedKeys }
+  s3.send = send as unknown as S3Client['send']
+  return { s3, objects, deletedKeys, send }
 }
 
 async function createTestApp() {
@@ -901,6 +974,118 @@ describe('云端多用户隔离', () => {
     })
     expect(imageResponse.statusCode).toBe(200)
     expect(imageResponse.headers['content-type']).toContain('image/png')
+  })
+
+  it('管理员可以带完整 Agent 上下文原地重新生成失败任务', async () => {
+    agentApiMocks.callAgentResponsesApi.mockReset()
+    const { app, tasks, agentConversations, auditLogs } = await createTestApp()
+    const taskKey = rowKey(USER_A.id, 'task-owned')
+    const failedTask = tasks.get(taskKey)!
+    tasks.set(rowKey(USER_A.id, 'task-parent'), {
+      ...failedTask,
+      id: 'task-parent',
+      prompt: '上一轮温州参考底图',
+      outputImages: ['image-owned'],
+      status: 'done',
+      error: null,
+      agentRoundId: 'round-parent',
+      agentToolCallId: 'ig-parent',
+      createdAt: 1,
+      finishedAt: 2,
+      elapsed: 1,
+    })
+    tasks.set(taskKey, {
+      ...failedTask,
+      status: 'error',
+      error: '请求超时',
+      outputImages: [],
+      finishedAt: 2,
+      elapsed: 1,
+    })
+    const conversationKey = rowKey(USER_A.id, 'agent-conversation-a')
+    const conversation = agentConversations.get(conversationKey)!
+    agentConversations.set(conversationKey, {
+      ...conversation,
+      activeRoundId: 'round-a',
+      rounds: [
+        {
+          id: 'round-parent',
+          index: 1,
+          userMessageId: 'message-parent-user',
+          assistantMessageId: 'message-parent-assistant',
+          prompt: '先生成温州参考底图',
+          inputImageIds: [],
+          outputTaskIds: ['task-parent'],
+          responseOutput: [{ type: 'message', content: [{ type: 'output_text', text: '已生成参考底图。' }] }],
+          status: 'done',
+          error: null,
+          createdAt: 1,
+          finishedAt: 2,
+        },
+        {
+          ...conversation.rounds[0],
+          index: 2,
+          parentRoundId: 'round-parent',
+          outputTaskIds: ['task-owned'],
+        },
+      ],
+      messages: [
+        { id: 'message-parent-user', role: 'user', content: '先生成温州参考底图', roundId: 'round-parent', createdAt: 1 },
+        { id: 'message-parent-assistant', role: 'assistant', content: '已生成参考底图。', roundId: 'round-parent', outputTaskIds: ['task-parent'], createdAt: 2 },
+        ...conversation.messages,
+      ],
+    })
+    const taskKeysBefore = [...tasks.keys()].filter((key) => key.startsWith(`${USER_A.id}:`)).sort()
+    agentApiMocks.callAgentResponsesApi.mockResolvedValueOnce({
+      responseId: 'response-regenerated',
+      text: '已重新生成。',
+      images: [{
+        toolCallId: 'ig-regenerated',
+        action: 'generate',
+        dataUrl: 'data:image/png;base64,cmVnZW4=',
+        revisedPrompt: '重新生成的温州风景主视觉',
+        actualParams: { quality: 'high' },
+      }],
+      outputItems: [{ type: 'message', content: [{ type: 'output_text', text: '已重新生成。' }] }],
+      rawResponsePayload: '{"output":[]}',
+    })
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/admin/users/${USER_A.id}/tasks/task-owned/regenerate`,
+      headers: { cookie: 'gip_session=token-admin' },
+    })
+    await app.close()
+
+    expect(response.statusCode, response.body).toBe(200)
+    const updatedTask = tasks.get(taskKey)!
+    expect(updatedTask).toMatchObject({
+      id: 'task-owned',
+      status: 'done',
+      error: null,
+      agentToolCallId: 'ig-regenerated',
+    })
+    expect(updatedTask.outputImages).toHaveLength(1)
+    expect([...tasks.keys()].filter((key) => key.startsWith(`${USER_A.id}:`)).sort()).toEqual(taskKeysBefore)
+    expect(agentApiMocks.callAgentResponsesApi).toHaveBeenCalledTimes(1)
+    const agentCall = agentApiMocks.callAgentResponsesApi.mock.calls[0][0]
+    expect(agentCall.imageOnly).toBe(true)
+    const input = JSON.stringify(agentCall.input)
+    expect(input).toContain('先生成温州参考底图')
+    expect(input).toContain('生成温州风景主视觉')
+    expect(input).toContain('round-1-image-1')
+    expect(input).toContain('data:image/png;base64,b3duZWQtaW1hZ2U=')
+    expect(input).toContain('目标任务 ID：task-owned')
+    expect(response.json().audit.task).toMatchObject({ id: 'task-owned', status: 'done' })
+    expect(response.json().audit.images).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'output', missing: false }),
+    ]))
+    expect(auditLogs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        action: 'generation.regenerate',
+        target_user_id: USER_A.id,
+      }),
+    ]))
   })
 
   it('管理员可以创建新用户', async () => {

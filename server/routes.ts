@@ -1,11 +1,17 @@
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { S3Client } from '@aws-sdk/client-s3'
 import net from 'node:net'
-import type { AgentConversation, ApiProfile, AppSettings, PlatformSettings, TaskRecord, TaskParams } from '../src/types'
+import type { AgentConversation, AgentMessage, AgentRound, ApiProfile, AppSettings, PlatformSettings, ResponsesApiResponse, ResponsesOutputItem, TaskRecord, TaskParams } from '../src/types'
 import { DEFAULT_PARAMS } from '../src/types'
 import { getActiveApiProfile, normalizeSettings } from '../src/lib/apiProfiles'
 import { applyPlatformSettingsToAppSettings, normalizePlatformSettings, sanitizePlatformSettingsForClient } from '../src/lib/platformSettings'
 import { callImageApi } from '../src/lib/api'
+import {
+  collectAgentRoundOutputImageSlots,
+  getAgentCurrentReferenceId,
+  getAgentGeneratedImageReferenceId,
+  replaceAgentPromptImageReferencesForApi,
+} from '../src/lib/agentImageReferences'
 import {
   callAgentConversationTitleApi,
   callAgentResponsesApi,
@@ -1239,6 +1245,545 @@ async function getAdminGenerationAudits(db: Db, input: { userId?: string; agentC
   })))
 }
 
+async function getAdminGenerationAuditByTask(db: Db, userId: string, taskId: string) {
+  const result = await db.query<AdminGenerationTaskRow>(
+    `
+      SELECT
+        tasks.user_id,
+        users.email AS user_email,
+        tasks.record,
+        tasks.updated_at
+      FROM tasks
+      INNER JOIN users ON users.id = tasks.user_id
+      WHERE tasks.user_id = $1 AND tasks.id = $2
+    `,
+    [userId, taskId],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  const conversationsByKey = await getAdminGenerationConversationMap(db, [row])
+  return {
+    user: {
+      id: row.user_id,
+      email: row.user_email,
+    },
+    task: row.record,
+    updatedAt: row.updated_at,
+    agentContext: getAdminGenerationAgentContext(row.record, conversationsByKey.get(`${row.user_id}:${row.record.agentConversationId}`)),
+    images: await getAdminGenerationAuditImages(db, row.user_id, row.record),
+  }
+}
+
+function getAdminAgentRoundPath(conversation: AgentConversation, roundId: string | null | undefined) {
+  if (!roundId) return []
+  const byId = new Map(conversation.rounds.map((round) => [round.id, round]))
+  const path: AgentRound[] = []
+  const seen = new Set<string>()
+  let current = byId.get(roundId) ?? null
+
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id)
+    path.unshift(current)
+    current = current.parentRoundId ? byId.get(current.parentRoundId) ?? null : null
+  }
+
+  return path
+}
+
+async function readImageDataUrlIfExists(db: Db, s3: S3Client, config: ServerConfig, userId: string, imageId: string) {
+  try {
+    return await readImageDataUrl(db, s3, config, userId, imageId)
+  } catch {
+    return null
+  }
+}
+
+async function readAdminAgentImageDataUrls(db: Db, s3: S3Client, config: ServerConfig, userId: string, imageIds: string[]) {
+  const dataUrls: string[] = []
+  for (const imageId of imageIds) {
+    const dataUrl = await readImageDataUrlIfExists(db, s3, config, userId, imageId)
+    if (dataUrl) dataUrls.push(dataUrl)
+  }
+  return dataUrls
+}
+
+async function createAdminAgentUserInputItem(
+  db: Db,
+  s3: S3Client,
+  config: ServerConfig,
+  userId: string,
+  conversation: AgentConversation,
+  round: AgentRound,
+  message: AgentMessage,
+  tasks: TaskRecord[],
+) {
+  const imageDataUrls = await readAdminAgentImageDataUrls(db, s3, config, userId, round.inputImageIds)
+  const rounds = getAdminAgentRoundPath(conversation, round.id)
+  const text = replaceAgentPromptImageReferencesForApi(message.content, round, rounds, tasks)
+  const referenceText = round.inputImageIds.length > 0
+    ? `\n\n<available_refs>${round.inputImageIds.map((_, index) => `\n  <ref id="${getAgentCurrentReferenceId(round, index)}" />`).join('')}\n</available_refs>`
+    : ''
+  return {
+    role: 'user',
+    content: [
+      { type: 'input_text', text: `${text}${referenceText}` },
+      ...imageDataUrls.map((dataUrl) => ({ type: 'input_image', image_url: dataUrl })),
+    ],
+  }
+}
+
+function escapeXmlAttribute(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function truncateAgentReferencePrompt(prompt: string) {
+  const normalized = prompt.replace(/\s+/g, ' ').trim()
+  return normalized.length > 1200 ? `${normalized.slice(0, 1200)}...` : normalized
+}
+
+async function createAdminAgentGeneratedImagesInputItem(
+  db: Db,
+  s3: S3Client,
+  config: ServerConfig,
+  userId: string,
+  round: AgentRound,
+  tasks: TaskRecord[],
+) {
+  const contentParts: Array<{ type: string; text?: string; image_url?: string }> = []
+  let imageIndex = 0
+  for (const taskId of round.outputTaskIds) {
+    const task = tasks.find((item) => item.id === taskId)
+    if (!task) {
+      contentParts.push({ type: 'input_text', text: `<removed_ref id="${getAgentGeneratedImageReferenceId(round, imageIndex)}" />` })
+      imageIndex += 1
+      continue
+    }
+    for (const imageId of task.outputImages) {
+      const dataUrl = await readImageDataUrlIfExists(db, s3, config, userId, imageId)
+      if (dataUrl) contentParts.push({ type: 'input_image', image_url: dataUrl })
+      const refId = getAgentGeneratedImageReferenceId(round, imageIndex)
+      const prompt = truncateAgentReferencePrompt(task.prompt || '')
+      const promptAttribute = prompt ? ` prompt="${escapeXmlAttribute(prompt)}"` : ''
+      contentParts.push({ type: 'input_text', text: `<ref id="${refId}"${promptAttribute} />` })
+      imageIndex += 1
+    }
+  }
+  return contentParts.length > 0 ? { role: 'user', content: contentParts } : null
+}
+
+function parseResponseOutputFromPayload(rawResponsePayload?: string): ResponsesOutputItem[] | null {
+  if (!rawResponsePayload) return null
+  try {
+    const payload = JSON.parse(rawResponsePayload) as ResponsesApiResponse
+    return Array.isArray(payload.output) ? payload.output : null
+  } catch {
+    return null
+  }
+}
+
+function sanitizeResponseOutputItemForInput(item: ResponsesOutputItem): unknown | null {
+  if (item.type === 'web_search_call' || item.type === 'image_generation_call') return null
+  if (item.type === 'message') {
+    const content = (item.content ?? [])
+      .map((part) => {
+        if (typeof part.text !== 'string') return null
+        if (part.type === 'output_text' || part.type === 'text') {
+          return { type: 'output_text', text: part.text }
+        }
+        return null
+      })
+      .filter((part): part is { type: 'output_text'; text: string } => Boolean(part))
+
+    return content.length > 0 ? { role: 'assistant', content } : null
+  }
+  return item
+}
+
+function sanitizeResponseOutputForInput(output: ResponsesOutputItem[]) {
+  const items = output
+    .map(sanitizeResponseOutputItemForInput)
+    .filter((item): item is unknown => item != null)
+
+  const functionCallIds = new Set<string>()
+  const functionOutputCallIds = new Set<string>()
+  for (const item of items) {
+    if (!isRecord(item)) continue
+    const callId = typeof item.call_id === 'string' ? item.call_id : ''
+    if (!callId) continue
+    if (item.type === 'function_call') functionCallIds.add(callId)
+    if (item.type === 'function_call_output') functionOutputCallIds.add(callId)
+  }
+
+  return items.filter((item) => {
+    if (!isRecord(item)) return true
+    const callId = typeof item.call_id === 'string' ? item.call_id : ''
+    if (item.type === 'function_call') return callId && functionOutputCallIds.has(callId)
+    if (item.type === 'function_call_output') return callId && functionCallIds.has(callId)
+    return true
+  })
+}
+
+function getAdminAgentRoundResponseOutput(round: AgentRound, tasks: TaskRecord[]) {
+  if (round.responseOutput?.length) return round.responseOutput
+  for (const taskId of round.outputTaskIds) {
+    const task = tasks.find((item) => item.id === taskId)
+    const output = parseResponseOutputFromPayload(task?.rawResponsePayload)
+    if (output?.length) return output
+  }
+  return null
+}
+
+function createAdminAgentAssistantFallbackItem(text: string) {
+  return {
+    role: 'assistant',
+    content: [{ type: 'output_text', text }],
+  }
+}
+
+async function buildAdminAgentRegenerationInput(
+  db: Db,
+  s3: S3Client,
+  config: ServerConfig,
+  userId: string,
+  conversation: AgentConversation,
+  currentRound: AgentRound,
+  targetTask: TaskRecord,
+  tasks: TaskRecord[],
+) {
+  const input: unknown[] = []
+  const rounds = getAdminAgentRoundPath(conversation, currentRound.id)
+
+  for (const round of rounds) {
+    const userMessage = conversation.messages.find((message) => message.id === round.userMessageId)
+    if (!userMessage) continue
+
+    input.push(await createAdminAgentUserInputItem(db, s3, config, userId, conversation, round, userMessage, tasks))
+    if (round.id === currentRound.id) continue
+
+    const output = getAdminAgentRoundResponseOutput(round, tasks)
+    const assistantMessage = round.assistantMessageId
+      ? conversation.messages.find((message) => message.id === round.assistantMessageId)
+      : null
+    if (output?.length) {
+      const sanitizedOutput = sanitizeResponseOutputForInput(output)
+      input.push(...(sanitizedOutput.length > 0
+        ? sanitizedOutput
+        : [createAdminAgentAssistantFallbackItem(assistantMessage?.content || '图像已生成。')]))
+    } else {
+      input.push(createAdminAgentAssistantFallbackItem(assistantMessage?.content || '[No text response]'))
+    }
+
+    // 普通 Agent 轮次会把已生成图片作为独立 user 消息注入；后台重生成也必须镜像这一点，
+    // 否则前序轮次有文字回复时，模型只能看到文字而看不到真正的参考图。
+    if (round.outputTaskIds.length > 0) {
+      const generatedImagesItem = await createAdminAgentGeneratedImagesInputItem(db, s3, config, userId, round, tasks)
+      if (generatedImagesItem) input.push(generatedImagesItem)
+    }
+  }
+
+  input.push({
+    role: 'user',
+    content: [{
+      type: 'input_text',
+      text: [
+        '[System] 管理员正在原地重新生成一个已有 Agent 图片任务。',
+        `目标任务 ID：${targetTask.id}`,
+        '请使用上方完整对话上下文重新生成这一张图片，直接调用 image_generation。',
+        '不要调用 generate_image_batch，不要调用 continue_generation，不要生成新的任务或额外图片。',
+        targetTask.prompt ? `原图像提示词：${targetTask.prompt}` : `当前轮用户请求：${currentRound.prompt}`,
+      ].filter(Boolean).join('\n'),
+    }],
+  })
+
+  return input
+}
+
+function selectTaskApiProfile(settings: AppSettings, task: TaskRecord) {
+  const normalized = normalizeSettings(settings)
+  const byId = task.apiProfileId
+    ? normalized.profiles.find((profile) => profile.id === task.apiProfileId)
+    : null
+  return byId ?? getActiveApiProfile(normalized)
+}
+
+async function getAdminTargetUser(db: Db, userId: string): Promise<AuthUser | null> {
+  const result = await db.query<{ id: string; email: string; is_admin: boolean }>(
+    'SELECT id, email, is_admin FROM users WHERE id = $1',
+    [userId],
+  )
+  const row = result.rows[0]
+  return row ? { id: row.id, email: row.email, isAdmin: row.is_admin } : null
+}
+
+async function getAgentConversation(db: Db, userId: string, conversationId: string) {
+  const result = await db.query<{ conversation: AgentConversation }>(
+    'SELECT conversation FROM agent_conversations WHERE user_id = $1 AND id = $2',
+    [userId, conversationId],
+  )
+  return result.rows[0]?.conversation ?? null
+}
+
+async function putAgentConversationRecord(db: Db, userId: string, conversation: AgentConversation) {
+  await db.query(
+    `
+      INSERT INTO agent_conversations (id, user_id, conversation, updated_at)
+      VALUES ($1, $2, $3, to_timestamp($4 / 1000.0))
+      ON CONFLICT (user_id, id)
+      DO UPDATE SET conversation = EXCLUDED.conversation, updated_at = EXCLUDED.updated_at
+    `,
+    [conversation.id, userId, conversation, conversation.updatedAt ?? Date.now()],
+  )
+}
+
+function updateConversationForRegeneratedTask(
+  conversation: AgentConversation,
+  task: TaskRecord,
+  result: AgentApiResult,
+  now: number,
+): AgentConversation {
+  const roundId = task.agentRoundId
+  if (!roundId) return conversation
+  const round = conversation.rounds.find((item) => item.id === roundId)
+  if (!round) return conversation
+
+  const assistantMessageId = task.agentMessageId
+    ?? round.assistantMessageId
+    ?? conversation.messages.find((message) => message.roundId === roundId && message.role === 'assistant')?.id
+    ?? `${task.id}-assistant`
+  const assistantContent = result.text.trim() || '图像已生成。'
+  const assistantMessage: AgentMessage = {
+    id: assistantMessageId,
+    role: 'assistant',
+    content: assistantContent,
+    roundId,
+    outputTaskIds: [task.id],
+    createdAt: now,
+  }
+
+  return {
+    ...conversation,
+    activeRoundId: roundId,
+    updatedAt: now,
+    rounds: conversation.rounds.map((item) => item.id === roundId
+      ? {
+          ...item,
+          assistantMessageId,
+          outputTaskIds: item.outputTaskIds.includes(task.id) ? item.outputTaskIds : [...item.outputTaskIds, task.id],
+          responseId: result.responseId,
+          responseOutput: result.outputItems,
+          status: 'done' as const,
+          error: null,
+          finishedAt: now,
+        }
+      : item,
+    ),
+    messages: conversation.messages.some((message) => message.id === assistantMessageId)
+      ? conversation.messages.map((message) => message.id === assistantMessageId ? assistantMessage : message)
+      : [...conversation.messages, assistantMessage],
+  }
+}
+
+function updateConversationForRegenerationError(conversation: AgentConversation, task: TaskRecord, error: string, now: number): AgentConversation {
+  const roundId = task.agentRoundId
+  if (!roundId) return conversation
+  const round = conversation.rounds.find((item) => item.id === roundId)
+  if (!round) return conversation
+
+  const assistantMessageId = task.agentMessageId
+    ?? round.assistantMessageId
+    ?? conversation.messages.find((message) => message.roundId === roundId && message.role === 'assistant')?.id
+    ?? `${task.id}-assistant`
+  const assistantMessage: AgentMessage = {
+    id: assistantMessageId,
+    role: 'assistant',
+    content: `请求失败：${error}`,
+    roundId,
+    outputTaskIds: [task.id],
+    createdAt: now,
+  }
+
+  return {
+    ...conversation,
+    activeRoundId: roundId,
+    updatedAt: now,
+    rounds: conversation.rounds.map((item) => item.id === roundId
+      ? {
+          ...item,
+          assistantMessageId,
+          outputTaskIds: item.outputTaskIds.includes(task.id) ? item.outputTaskIds : [...item.outputTaskIds, task.id],
+          status: 'error' as const,
+          error,
+          finishedAt: now,
+        }
+      : item,
+    ),
+    messages: conversation.messages.some((message) => message.id === assistantMessageId)
+      ? conversation.messages.map((message) => message.id === assistantMessageId ? assistantMessage : message)
+      : [...conversation.messages, assistantMessage],
+  }
+}
+
+async function regenerateAdminAgentTask(
+  db: Db,
+  s3: S3Client,
+  config: ServerConfig,
+  admin: AuthUser,
+  userId: string,
+  taskId: string,
+  request: Parameters<typeof writeAuditLog>[1],
+) {
+  const targetUser = await getAdminTargetUser(db, userId)
+  if (!targetUser) throw createBadRequestError('用户不存在')
+  const task = await getTask(db, userId, taskId)
+  if (!task) throw createBadRequestError('任务不存在')
+  if (task.status === 'running') throw createBadRequestError('任务正在运行中，请等待完成后再重试')
+  if (task.sourceMode !== 'agent' || !task.agentConversationId || !task.agentRoundId) {
+    throw createBadRequestError('仅支持重新生成 Agent 图片任务')
+  }
+
+  const conversation = await getAgentConversation(db, userId, task.agentConversationId)
+  if (!conversation) throw createBadRequestError('找不到任务所属 Agent 对话')
+  const round = conversation.rounds.find((item) => item.id === task.agentRoundId)
+  if (!round) throw createBadRequestError('找不到任务所属 Agent 轮次')
+
+  const settings = await loadGenerationSettings(db, config, userId)
+  if (!settings) throw new Error('缺少云端 API 配置')
+  const profile = selectTaskApiProfile(settings, task)
+  if (profile.provider !== 'openai' || profile.apiMode !== 'responses') {
+    throw createBadRequestError('仅支持 Responses API 的 Agent 任务重新生成')
+  }
+  if (!profile.apiKey.trim()) throw new Error('缺少云端 API Key，请在后台配置中保存 API Key')
+
+  const allTasks = await db.query<{ record: TaskRecord }>(
+    'SELECT record FROM tasks WHERE user_id = $1 ORDER BY created_at ASC',
+    [userId],
+  )
+  const tasks = allTasks.rows.map((row) => row.record)
+  const startedAt = Date.now()
+  const runningTask = applyTaskPatch(task, {
+    status: 'running',
+    error: null,
+    outputImages: [],
+    streamPartialImageIds: [],
+    rawImageUrls: [],
+    rawResponsePayload: undefined,
+    actualParams: undefined,
+    actualParamsByImage: undefined,
+    revisedPromptByImage: undefined,
+    createdAt: startedAt,
+    finishedAt: null,
+    elapsed: null,
+  })
+  await putTaskRecord(db, userId, runningTask)
+  publishTaskEvent(userId, taskId, { type: 'task', task: runningTask })
+
+  let latestConversation = conversation
+  try {
+    const input = await buildAdminAgentRegenerationInput(db, s3, config, userId, conversation, round, runningTask, tasks)
+    const maskImageId = runningTask.maskImageId ?? round.maskImageId
+    const maskDataUrl = maskImageId ? await readImageDataUrl(db, s3, config, userId, maskImageId) : undefined
+    const completedImages: AgentApiResultImage[] = []
+    const result = await callAgentResponsesApi({
+      settings,
+      profile,
+      params: { ...runningTask.params, n: 1 },
+      input,
+      maskDataUrl,
+      onImageToolCompleted: (image) => {
+        completedImages.push(image)
+      },
+      onImagePartialImage: async (event) => {
+        const partial = await upsertImage(db, s3, config, targetUser, {
+          dataUrl: event.image,
+          source: 'generated',
+          taskId,
+        })
+        const latest = await getTask(db, userId, taskId)
+        if (!latest || latest.status !== 'running') return
+        const streamPartialImageIds = Array.from(new Set([...(latest.streamPartialImageIds ?? []), partial.id]))
+        const next = applyTaskPatch(latest, { streamPartialImageIds })
+        await putTaskRecord(db, userId, next)
+        publishTaskEvent(userId, taskId, { type: 'partial', taskId, image: event.image, requestIndex: event.partialImageIndex })
+      },
+      imageOnly: true,
+    })
+    const images = [...completedImages, ...result.images]
+      .filter((image, index, list) => list.findIndex((item) => item.dataUrl === image.dataUrl) === index)
+    if (!images.length) throw new Error('接口未返回图片数据')
+
+    const outputIds: string[] = []
+    const actualParamsByImage: Record<string, Partial<TaskParams>> = {}
+    const revisedPromptByImage: Record<string, string> = {}
+    for (const image of images) {
+      const saved = await upsertImage(db, s3, config, targetUser, {
+        dataUrl: image.dataUrl,
+        source: 'generated',
+        taskId,
+      })
+      outputIds.push(saved.id)
+      const actualParams = { ...(image.actualParams ?? {}), n: 1 }
+      actualParamsByImage[saved.id] = actualParams
+      if (image.revisedPrompt?.trim()) revisedPromptByImage[saved.id] = image.revisedPrompt
+    }
+
+    const now = Date.now()
+    const latest = await getTask(db, userId, taskId)
+    const doneTask = applyTaskPatch(latest ?? runningTask, {
+      prompt: images[0]?.revisedPrompt ?? runningTask.prompt ?? round.prompt,
+      outputImages: outputIds,
+      actualParams: { ...(images[0]?.actualParams ?? {}), n: outputIds.length },
+      actualParamsByImage,
+      revisedPromptByImage: Object.keys(revisedPromptByImage).length ? revisedPromptByImage : undefined,
+      rawResponsePayload: result.rawResponsePayload,
+      status: 'done',
+      error: null,
+      finishedAt: now,
+      elapsed: now - startedAt,
+      agentToolCallId: images[0]?.toolCallId ?? runningTask.agentToolCallId,
+      agentToolAction: images[0]?.action ?? runningTask.agentToolAction,
+    })
+    await putTaskRecord(db, userId, doneTask)
+    latestConversation = updateConversationForRegeneratedTask(conversation, doneTask, result, now)
+    await putAgentConversationRecord(db, userId, latestConversation)
+    publishTaskEvent(userId, taskId, { type: 'done', task: doneTask })
+    await writeAuditLog(db, request, {
+      actor: admin,
+      targetUserId: userId,
+      action: 'generation.regenerate',
+      details: { taskId, agentConversationId: task.agentConversationId, status: 'done' },
+    })
+  } catch (error) {
+    const now = Date.now()
+    const message = formatGenerationError(error, profile)
+    const latest = await getTask(db, userId, taskId)
+    const failedTask = applyTaskPatch(latest ?? runningTask, {
+      status: 'error',
+      error: message,
+      finishedAt: now,
+      elapsed: now - startedAt,
+    })
+    await putTaskRecord(db, userId, failedTask)
+    latestConversation = updateConversationForRegenerationError(conversation, failedTask, message, now)
+    await putAgentConversationRecord(db, userId, latestConversation)
+    publishTaskEvent(userId, taskId, { type: 'error', task: failedTask })
+    await writeAuditLog(db, request, {
+      actor: admin,
+      targetUserId: userId,
+      action: 'generation.regenerate',
+      details: { taskId, agentConversationId: task.agentConversationId, status: 'error', error: message },
+    })
+    throw error
+  } finally {
+    closeTaskSubscribers(userId, taskId)
+  }
+
+  return getAdminGenerationAuditByTask(db, userId, taskId)
+}
+
 async function getReferencedObjectKeys(db: Db) {
   const result = await db.query<{ storage_key: string }>(
     `
@@ -1515,6 +2060,15 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
     const userId = typeof query.userId === 'string' && query.userId.trim() ? query.userId.trim() : undefined
     if (userId && !(await adminUserExists(db, userId))) return reply.code(404).send({ error: '用户不存在' })
     return { audits: await getAdminGenerationAudits(db, { userId, agentConversationId, limit }) }
+  })
+
+  app.post('/api/admin/users/:userId/tasks/:taskId/regenerate', async (request, reply) => {
+    const admin = await requireAdmin(db, request, reply)
+    if (!admin) return
+    const { userId, taskId } = request.params as { userId: string; taskId: string }
+    const audit = await regenerateAdminAgentTask(db, s3, config, admin, userId, taskId, request)
+    if (!audit) return reply.code(404).send({ error: '任务不存在' })
+    return { audit }
   })
 
   app.get('/api/admin/users/:userId/images/:imageId/data', async (request, reply) => {

@@ -79,6 +79,40 @@ describe('callAgentResponsesApi', () => {
     expect(body.tools[0].input_image_mask).toEqual({ image_url: 'data:image/png;base64,bWFzaw==' })
   })
 
+  it('can limit Agent regeneration to the built-in image tool', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      output: [{
+        type: 'image_generation_call',
+        id: 'ig_admin',
+        result: 'cmVnZW4=',
+      }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const profile = createDefaultOpenAIProfile({
+      apiKey: 'test-key',
+      apiMode: 'responses',
+    })
+
+    await callAgentResponsesApi({
+      settings: { ...DEFAULT_SETTINGS, agentWebSearch: true },
+      profile,
+      params: DEFAULT_PARAMS,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'regenerate' }] }],
+      imageOnly: true,
+    })
+
+    const [, init] = fetchMock.mock.calls[0]
+    const body = JSON.parse(String((init as RequestInit).body))
+    expect(body.tools).toHaveLength(1)
+    expect(body.tools[0].type).toBe('image_generation')
+    expect(body.tools).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'function' }),
+      expect.objectContaining({ type: 'web_search' }),
+    ]))
+  })
+
   it('extracts image_generation results from base64 object fields', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       output: [{

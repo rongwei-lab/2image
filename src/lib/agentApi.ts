@@ -110,8 +110,15 @@ function createImageTool(params: TaskParams, profile: ApiProfile, maskDataUrl?: 
   return tool
 }
 
-function createAgentTools(params: TaskParams, profile: ApiProfile, settings: AppSettings, maskDataUrl?: string): Array<Record<string, unknown>> {
+function createAgentTools(
+  params: TaskParams,
+  profile: ApiProfile,
+  settings: AppSettings,
+  maskDataUrl?: string,
+  options: { imageOnly?: boolean } = {},
+): Array<Record<string, unknown>> {
   const tools: Array<Record<string, unknown>> = [createImageTool(params, profile, maskDataUrl)]
+  if (options.imageOnly) return tools
 
   // generate_image_batch: custom function tool for concurrent multi-image generation
   tools.push({
@@ -613,8 +620,10 @@ export async function callAgentResponsesApi(opts: {
   onImageToolStarted?: (event: { toolCallId: string; outputIndex?: number }) => void | Promise<void>
   onImagePartialImage?: (event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number }) => void | Promise<void>
   onImageToolCompleted?: (image: AgentApiResultImage) => void | Promise<void>
+  /** 后台原任务重生成只允许内置图片工具，避免 Agent 批量工具创建额外任务。 */
+  imageOnly?: boolean
 }): Promise<AgentApiResult> {
-  const { settings, profile, params, input, maskDataUrl, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted } = opts
+  const { settings, profile, params, input, maskDataUrl, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted, imageOnly } = opts
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
@@ -629,7 +638,7 @@ export async function callAgentResponsesApi(opts: {
       model: profile.model || settings.model,
       instructions: createAgentInstructions(settings),
       input,
-      tools: createAgentTools(params, profile, settings, maskDataUrl),
+      tools: createAgentTools(params, profile, settings, maskDataUrl, { imageOnly }),
     }
     if (profile.streamImages) {
       body.stream = true

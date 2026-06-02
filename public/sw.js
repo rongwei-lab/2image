@@ -1,4 +1,4 @@
-const CACHE_NAME = 'gpt-image-playground-v0.5.4-agent-timeout-1'
+const CACHE_NAME = 'gpt-image-playground-v0.5.4-admin-regenerate-1'
 const APP_SHELL = ['./', './index.html', './manifest.webmanifest', './pwa-icon.svg']
 
 async function refreshWindowClients() {
