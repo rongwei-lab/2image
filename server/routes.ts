@@ -2125,6 +2125,7 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
         apiManaged: saved.api.managed,
         activeProfileId: saved.api.settings.activeProfileId,
         agentLocked: saved.agent.lockSettings,
+        zipDownloadRouteCount: saved.download.zipDownloadRoutes.length,
       },
     })
     return saved

@@ -3,6 +3,16 @@
 export type ApiMode = 'images' | 'responses'
 export type AppMode = 'gallery' | 'agent'
 export type ReferenceImageEditAction = 'ask' | 'replace-reference' | 'add-mask'
+export const ZIP_DOWNLOAD_ROUTE_VALUES = [
+  'task-selection',
+  'favorite-collection-selection',
+  'image-context-menu-all',
+  'task-detail-all',
+  'task-detail-partial',
+  'agent-round-all',
+] as const
+export type ZipDownloadRoute = typeof ZIP_DOWNLOAD_ROUTE_VALUES[number]
+export const DEFAULT_ZIP_DOWNLOAD_ROUTES: ZipDownloadRoute[] = ['task-selection', 'favorite-collection-selection']
 export type BuiltInApiProvider = 'openai' | 'fal'
 export type ApiProvider = BuiltInApiProvider | string
 export type CustomProviderTemplate = 'http-image'
@@ -94,6 +104,7 @@ export interface AppSettings {
   taskCompletionNotification: boolean
   enterSubmit: boolean
   referenceImageEditAction: ReferenceImageEditAction
+  zipDownloadRoutes: ZipDownloadRoute[]
   agentScrollToBottomAfterSubmit: boolean
   agentMaxToolRounds: number
   agentWebSearch: boolean
@@ -118,6 +129,10 @@ export interface PlatformSettings {
     lockSettings: boolean
     maxToolRounds: number
     webSearchEnabled: boolean
+  }
+  download: {
+    /** 后台统一控制哪些批量下载入口使用 ZIP，避免多用户环境下前台配置不一致 */
+    zipDownloadRoutes: ZipDownloadRoute[]
   }
   updatedAt?: string | null
 }

@@ -32,7 +32,7 @@ import {
 } from '../lib/cloudApi'
 import { DEFAULT_SETTINGS, normalizeSettings, normalizeStreamPartialImages } from '../lib/apiProfiles'
 import { applyPlatformSettingsToAppSettings } from '../lib/platformSettings'
-import { DEFAULT_AGENT_MAX_TOOL_ROUNDS } from '../types'
+import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, type ZipDownloadRoute } from '../types'
 import { useStore } from '../store'
 import { CloseIcon, PlusIcon, RefreshIcon, TrashIcon } from './icons'
 
@@ -91,6 +91,15 @@ const generationSourceFilters: Array<{ value: GenerationSourceFilter; label: str
   { value: 'agent', label: 'Agent' },
 ]
 
+const zipDownloadRouteOptions: Array<{ route: ZipDownloadRoute; label: string; description: string }> = [
+  { route: 'task-selection', label: '任务列表多选', description: '主页或收藏夹详情中选中多个任务后的下载。' },
+  { route: 'favorite-collection-selection', label: '收藏夹多选', description: '收藏夹概览页选中一个或多个收藏夹后的下载。' },
+  { route: 'image-context-menu-all', label: '右键下载全部', description: '图片右键菜单中下载同一组输出图片。' },
+  { route: 'task-detail-all', label: '任务详情下载全部', description: '任务详情弹窗中下载当前任务的所有输出图。' },
+  { route: 'task-detail-partial', label: '任务详情中间图', description: '任务详情弹窗中下载流式生成保留的中间步骤图。' },
+  { route: 'agent-round-all', label: 'Agent 轮次图片', description: 'Agent 对话中下载某轮回复关联的全部图片。' },
+]
+
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
   const units = ['KiB', 'MiB', 'GiB', 'TiB']
@@ -145,6 +154,7 @@ const auditDetailLabels: Record<string, string> = {
   storageQuotaBytes: '存储额度',
   taskQuotaCount: '任务额度',
   webSearchEnabled: '联网搜索',
+  zipDownloadRouteCount: 'ZIP 下载入口',
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -204,6 +214,9 @@ function createFallbackPlatformSettings(): CloudPlatformSettings {
       lockSettings: false,
       maxToolRounds: DEFAULT_AGENT_MAX_TOOL_ROUNDS,
       webSearchEnabled: false,
+    },
+    download: {
+      zipDownloadRoutes: DEFAULT_SETTINGS.zipDownloadRoutes,
     },
     updatedAt: null,
   }
@@ -1369,6 +1382,22 @@ export default function AdminPage() {
     })
   }
 
+  const setPlatformZipDownloadRouteEnabled = (route: ZipDownloadRoute, enabled: boolean) => {
+    updatePlatformDraft((current) => {
+      const currentRoutes = current.download.zipDownloadRoutes
+      const nextRoutes = enabled
+        ? Array.from(new Set([...currentRoutes, route]))
+        : currentRoutes.filter((item) => item !== route)
+      return {
+        ...current,
+        download: {
+          ...current.download,
+          zipDownloadRoutes: nextRoutes,
+        },
+      }
+    })
+  }
+
   const buildPlatformDraftForSubmit = (): CloudPlatformSettings | null => {
     const draft = platformDraft ?? createFallbackPlatformSettings()
     let customProviders: unknown
@@ -2190,6 +2219,42 @@ export default function AdminPage() {
                             Codex CLI 兼容
                           </label>
                         )}
+                      </div>
+
+                      <div className="rounded-lg border border-gray-100 p-4 dark:border-white/[0.06]">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <h3 className="text-xs font-semibold text-gray-500">下载策略</h3>
+                            <p className="mt-1 text-xs text-gray-500">
+                              后台统一控制批量下载是否打包为 ZIP，前台个人设置不再单独提供该入口。
+                            </p>
+                          </div>
+                          <span className="rounded-full bg-gray-100 px-2 py-1 text-[11px] text-gray-500 dark:bg-white/[0.06] dark:text-gray-300">
+                            已开启 {platformDraft.download.zipDownloadRoutes.length} 项
+                          </span>
+                        </div>
+                        <div className="mt-3 grid gap-2 md:grid-cols-2">
+                          {zipDownloadRouteOptions.map((option) => {
+                            const checked = platformDraft.download.zipDownloadRoutes.includes(option.route)
+                            return (
+                              <label
+                                key={option.route}
+                                className={`flex cursor-pointer gap-3 rounded-lg border p-3 text-sm transition-colors ${checked ? 'border-blue-200 bg-blue-50/60 dark:border-blue-500/25 dark:bg-blue-500/10' : 'border-gray-100 bg-gray-50/60 hover:bg-gray-100 dark:border-white/[0.06] dark:bg-white/[0.03] dark:hover:bg-white/[0.05]'}`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={(event) => setPlatformZipDownloadRouteEnabled(option.route, event.target.checked)}
+                                  className="mt-0.5"
+                                />
+                                <span className="min-w-0">
+                                  <span className="block font-medium text-gray-800 dark:text-gray-100">{option.label}</span>
+                                  <span className="mt-1 block text-xs leading-relaxed text-gray-500 dark:text-gray-400">{option.description}</span>
+                                </span>
+                              </label>
+                            )
+                          })}
+                        </div>
                       </div>
                     </div>
 

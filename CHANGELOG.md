@@ -42,4 +42,5 @@
 
 ### 上游同步
 
+- 合并上游 `CookSleep/gpt_image_playground` 至 `v0.5.5`：同步批量下载 ZIP 途径配置并接入后台平台配置，通过 `dompurify >= 3.4.7` 修复上游安全依赖漏洞。
 - 合并上游 `CookSleep/gpt_image_playground` 至 `v0.5.3`，并保留本项目二开功能。

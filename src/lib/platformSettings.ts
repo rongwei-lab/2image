@@ -1,6 +1,6 @@
 import type { AppSettings, PlatformSettings } from '../types'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS } from '../types'
-import { DEFAULT_SETTINGS, normalizeAgentMaxToolRounds, normalizeSettings } from './apiProfiles'
+import { DEFAULT_SETTINGS, normalizeAgentMaxToolRounds, normalizeSettings, normalizeZipDownloadRoutes } from './apiProfiles'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
@@ -20,6 +20,7 @@ export function normalizePlatformSettings(input: unknown): PlatformSettings {
   const registrationRecord = isRecord(record.registration) ? record.registration : {}
   const apiRecord = isRecord(record.api) ? record.api : {}
   const agentRecord = isRecord(record.agent) ? record.agent : {}
+  const downloadRecord = isRecord(record.download) ? record.download : {}
 
   return {
     registration: {
@@ -34,6 +35,9 @@ export function normalizePlatformSettings(input: unknown): PlatformSettings {
       lockSettings: Boolean(agentRecord.lockSettings),
       maxToolRounds: normalizeAgentMaxToolRounds(agentRecord.maxToolRounds, DEFAULT_AGENT_MAX_TOOL_ROUNDS),
       webSearchEnabled: typeof agentRecord.webSearchEnabled === 'boolean' ? agentRecord.webSearchEnabled : false,
+    },
+    download: {
+      zipDownloadRoutes: normalizeZipDownloadRoutes(downloadRecord.zipDownloadRoutes),
     },
     updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : null,
   }
@@ -82,6 +86,12 @@ export function applyPlatformSettingsToAppSettings(settings: AppSettings, platfo
       agentWebSearch: platform.agent.webSearchEnabled ? next.agentWebSearch : false,
     })
   }
+
+  // 下载入口属于平台体验策略，统一从后台下发，避免同一部署下不同设备行为不一致。
+  next = normalizeSettings({
+    ...next,
+    zipDownloadRoutes: platform.download.zipDownloadRoutes,
+  })
 
   return next
 }
