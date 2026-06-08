@@ -272,6 +272,7 @@ function getImageRoleLabel(role: CloudAdminGenerationAuditImage['role']) {
     mask: '遮罩',
     output: '输出',
     partial: '中间',
+    original: '原图',
   }
   return labels[role]
 }
@@ -318,7 +319,7 @@ function getAuditTime(audit: CloudAdminGenerationAudit) {
 }
 
 function getAuditOutputImages(audit: CloudAdminGenerationAudit) {
-  return audit.images.filter((image) => image.role === 'output' || image.role === 'partial')
+  return audit.images.filter((image) => image.role === 'output' || image.role === 'partial' || image.role === 'original')
 }
 
 function getAuditPreviewImages(audit: CloudAdminGenerationAudit) {
@@ -636,7 +637,7 @@ function GenerationAuditCard({
   const roundLabel = getRoundLabel(audit)
   const toolActionLabel = getToolActionLabel(audit.agentContext?.toolAction ?? task.agentToolAction)
   const requestImages = audit.images.filter((image) => image.role === 'input' || image.role === 'mask')
-  const outputImages = audit.images.filter((image) => image.role === 'output' || image.role === 'partial')
+  const outputImages = audit.images.filter((image) => image.role === 'output' || image.role === 'partial' || image.role === 'original')
   const requestPayload = {
     prompt: task.prompt,
     params: task.params,
@@ -651,6 +652,7 @@ function GenerationAuditCard({
   }
   const responsePayload = {
     outputImages: task.outputImages,
+    transparentOriginalImages: task.transparentOriginalImages ?? [],
     streamPartialImageIds: task.streamPartialImageIds ?? [],
     actualParams: task.actualParams ?? null,
     actualParamsByImage: task.actualParamsByImage ?? null,

@@ -26,6 +26,7 @@ import { hashPassword, requireAuth, type AuthUser } from './auth'
 import { decryptText, encryptText } from './crypto'
 import { bufferToDataUrl, parseImageDataUrl, resolveImageStorageId } from './imageData'
 import { createSignedImageUrl, deleteObjects, getObjectBuffer, listObjectKeys, putObject } from './storage'
+import { removeKeyedBackgroundFromDataUrl } from './transparentImage'
 
 type TaskEvent =
   | { type: 'task'; task: TaskRecord }
@@ -1096,10 +1097,13 @@ async function getAuditLogs(db: Db, limit: number) {
 }
 
 function getTaskImageRefs(task: TaskRecord) {
-  const refs: Array<{ id: string; role: 'input' | 'mask' | 'output' | 'partial' }> = []
+  const refs: Array<{ id: string; role: 'input' | 'mask' | 'output' | 'partial' | 'original' }> = []
   for (const id of task.inputImageIds) refs.push({ id, role: 'input' })
   if (task.maskImageId) refs.push({ id: task.maskImageId, role: 'mask' })
   for (const id of task.outputImages) refs.push({ id, role: 'output' })
+  for (const id of task.transparentOriginalImages ?? []) {
+    if (id) refs.push({ id, role: 'original' })
+  }
   for (const id of task.streamPartialImageIds ?? []) refs.push({ id, role: 'partial' })
 
   const seen = new Set<string>()
@@ -1667,6 +1671,10 @@ async function regenerateAdminAgentTask(
   const runningTask = applyTaskPatch(task, {
     status: 'running',
     error: null,
+    params: { ...task.params, transparent_output: false },
+    transparentOutput: false,
+    transparentPrompt: undefined,
+    transparentOriginalImages: undefined,
     outputImages: [],
     streamPartialImageIds: [],
     rawImageUrls: [],
@@ -1690,7 +1698,7 @@ async function regenerateAdminAgentTask(
     const result = await callAgentResponsesApi({
       settings,
       profile,
-      params: { ...runningTask.params, n: 1 },
+      params: { ...runningTask.params, n: 1, transparent_output: false },
       input,
       maskDataUrl,
       onImageToolCompleted: (image) => {
@@ -1888,6 +1896,7 @@ async function assertTaskImagesBelongToUser(db: Db, userId: string, task: TaskRe
     ...task.inputImageIds,
     ...(task.maskImageId ? [task.maskImageId] : []),
     ...task.outputImages,
+    ...(task.transparentOriginalImages ?? []).filter(Boolean),
     ...(task.streamPartialImageIds ?? []),
   ]
   if (!ids.length) return
@@ -1912,6 +1921,57 @@ function applyTaskPatch(task: TaskRecord, patch: Partial<TaskRecord>): TaskRecor
   return { ...task, ...patch }
 }
 
+async function storeGeneratedTaskOutputImages(
+  db: Db,
+  s3: S3Client,
+  config: ServerConfig,
+  user: AuthUser,
+  task: TaskRecord,
+  images: string[],
+) {
+  const outputIds: string[] = []
+  const outputDataUrls: string[] = []
+  const transparentOriginalImageIds: string[] = []
+
+  for (const dataUrl of images) {
+    let outputDataUrl = dataUrl
+
+    if (task.transparentOutput) {
+      const original = await upsertImage(db, s3, config, user, {
+        dataUrl,
+        source: 'generated',
+        taskId: task.id,
+      })
+
+      try {
+        outputDataUrl = removeKeyedBackgroundFromDataUrl(dataUrl)
+        transparentOriginalImageIds.push(original.id)
+      } catch (error) {
+        // 云端任务不能因为透明后处理失败而丢失模型原图；空字符串用于前端标记该张图回退。
+        console.warn('透明背景后处理失败，已回退为原始输出', error)
+        outputIds.push(original.id)
+        outputDataUrls.push(dataUrl)
+        transparentOriginalImageIds.push('')
+        continue
+      }
+    }
+
+    const output = await upsertImage(db, s3, config, user, {
+      dataUrl: outputDataUrl,
+      source: 'generated',
+      taskId: task.id,
+    })
+    outputIds.push(output.id)
+    outputDataUrls.push(outputDataUrl)
+  }
+
+  return {
+    outputIds,
+    outputDataUrls,
+    transparentOriginalImageIds: transparentOriginalImageIds.length ? transparentOriginalImageIds : undefined,
+  }
+}
+
 async function runTask(
   db: Db,
   s3: S3Client,
@@ -1933,9 +1993,13 @@ async function runTask(
       ? await readImageDataUrl(db, s3, config, user.id, task.maskImageId)
       : undefined
 
+    const requestPrompt = task.transparentOutput && task.transparentPrompt
+      ? task.transparentPrompt
+      : task.prompt
+
     const result = await callImageApi({
       settings,
-      prompt: task.prompt,
+      prompt: requestPrompt,
       params: task.params,
       inputImageDataUrls,
       maskDataUrl,
@@ -1949,15 +2013,7 @@ async function runTask(
       },
     })
 
-    const outputIds: string[] = []
-    for (const dataUrl of result.images) {
-      const image = await upsertImage(db, s3, config, user, {
-        dataUrl,
-        source: 'generated',
-        taskId,
-      })
-      outputIds.push(image.id)
-    }
+    const { outputIds, transparentOriginalImageIds } = await storeGeneratedTaskOutputImages(db, s3, config, user, task, result.images)
 
     const latestBeforeSave = await getTask(db, user.id, taskId)
     if (!latestBeforeSave || latestBeforeSave.status !== 'running') return
@@ -1965,6 +2021,7 @@ async function runTask(
     const now = Date.now()
     const doneTask = applyTaskPatch(latestBeforeSave, {
       outputImages: outputIds,
+      transparentOriginalImages: transparentOriginalImageIds,
       rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
       actualParams: { ...result.actualParams, n: outputIds.length },
       actualParamsByImage: result.actualParamsList?.reduce<Record<string, Partial<TaskParams>>>((acc, params, index) => {

@@ -73,7 +73,7 @@ export interface CloudAdminUserDetail {
 
 export interface CloudAdminGenerationAuditImage {
   id: string
-  role: 'input' | 'mask' | 'output' | 'partial'
+  role: 'input' | 'mask' | 'output' | 'partial' | 'original'
   source: string
   byteSize: number
   width: number | null

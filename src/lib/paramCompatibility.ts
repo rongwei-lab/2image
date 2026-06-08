@@ -21,6 +21,7 @@ export function normalizeParamsForSettings(
     ...params,
     size: normalizeImageSize(params.size) || DEFAULT_PARAMS.size,
     n: Math.min(outputImageLimit, Math.max(1, params.n || DEFAULT_PARAMS.n)),
+    transparent_output: Boolean(params.transparent_output),
   }
 
   if (activeProfile.provider === 'openai' && activeProfile.codexCli) {
@@ -32,10 +33,14 @@ export function normalizeParamsForSettings(
     if (nextParams.quality === 'auto') nextParams.quality = 'high'
     nextParams.moderation = DEFAULT_PARAMS.moderation
     nextParams.output_compression = DEFAULT_PARAMS.output_compression
+    nextParams.transparent_output = DEFAULT_PARAMS.transparent_output
   }
 
   if (nextParams.output_format === 'png') {
     nextParams.output_compression = DEFAULT_PARAMS.output_compression
+  } else {
+    // 透明背景后处理需要 PNG 的 alpha 通道，非 PNG 输出统一关闭，避免旧配置跨格式残留。
+    nextParams.transparent_output = DEFAULT_PARAMS.transparent_output
   }
 
   return nextParams
