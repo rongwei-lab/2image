@@ -11,6 +11,7 @@ import { dismissAllTooltips } from '../lib/tooltipDismiss'
 import { downloadImageEntriesAsZip, downloadImageIds, getImageZipEntries } from '../lib/downloadImages'
 import { isAgentTaskPromptPending } from '../lib/taskPromptDisplay'
 import { replaceImageMentionsForApi } from '../lib/promptImageMentions'
+import { applyPromptStylePreset } from '../lib/promptStyles'
 import { CloseIcon, CodeIcon, CopyIcon, DownloadIcon, EditIcon, LinkIcon, TrashIcon } from './icons'
 
 import ViewportTooltip from './ViewportTooltip'
@@ -20,7 +21,6 @@ export default function DetailModal() {
   const detailTaskId = useStore((s) => s.detailTaskId)
   const setDetailTaskId = useStore((s) => s.setDetailTaskId)
   const setLightboxImageId = useStore((s) => s.setLightboxImageId)
-  const setMaskEditorImageId = useStore((s) => s.setMaskEditorImageId)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const showToast = useStore((s) => s.showToast)
   const openFavoritePicker = useStore((s) => s.openFavoritePicker)
@@ -91,9 +91,11 @@ export default function DetailModal() {
   useEffect(() => {
     const count = task?.status === 'running'
       ? streamPreviewItems.length
-      : task?.outputImages?.length ?? 0
+      : task
+      ? (task.outputErrors?.length ? Math.max(task.params.n, task.outputImages.length + task.outputErrors.length) : task.outputImages.length)
+      : 0
     if (count > 0 && imageIndex >= count) setImageIndex(count - 1)
-  }, [imageIndex, streamPreviewItems.length, task?.outputImages?.length, task?.status])
+  }, [imageIndex, streamPreviewItems.length, task, task?.status])
 
   useCloseOnEscape(Boolean(task), () => setDetailTaskId(null))
   usePreventBackgroundScroll(Boolean(task), [modalRef, rawUrlsModalRef, rawResponseModalRef])
@@ -143,13 +145,40 @@ export default function DetailModal() {
     }
   }, [task])
 
-  const currentOutputImageId = task?.outputImages?.[imageIndex] || ''
-  const currentOriginalOutputImageId = task?.transparentOriginalImages?.[imageIndex] || ''
-  const currentOutputPreviewSrc = currentOutputImageId ? outputPreviewSrcs[currentOutputImageId] || '' : ''
   const maskTargetId = task?.maskTargetImageId || null
   const maskTargetSrc = maskTargetId ? imageSrcs[maskTargetId] || '' : ''
   const maskSrc = task?.maskImageId ? imageSrcs[task.maskImageId] || '' : ''
   const allInputImageIds = task?.inputImageIds ?? []
+  const outputSlots = useMemo(() => {
+    if (!task) return []
+    const outputErrors = task.outputErrors ?? []
+    if (outputErrors.length === 0) {
+      return task.outputImages.map((imageId, outputImageIndex) => ({
+        requestIndex: outputImageIndex,
+        outputImageIndex,
+        imageId,
+        error: '',
+      }))
+    }
+
+    const errorsByIndex = new Map(outputErrors.map((item) => [item.requestIndex, item.error]))
+    const requestedCount = Math.max(task.params.n, task.outputImages.length + outputErrors.length)
+    let outputImageIndex = 0
+    return Array.from({ length: requestedCount }, (_, requestIndex) => {
+      const error = errorsByIndex.get(requestIndex)
+      if (error) return { requestIndex, outputImageIndex: -1, imageId: '', error }
+      const imageId = task.outputImages[outputImageIndex] ?? ''
+      const slot = { requestIndex, outputImageIndex, imageId, error: '' }
+      outputImageIndex += 1
+      return slot
+    })
+  }, [task])
+  const currentOutputSlot = outputSlots[imageIndex]
+  const currentOutputImageId = currentOutputSlot?.imageId || ''
+  const currentOutputImageIndex = currentOutputSlot?.outputImageIndex ?? -1
+  const currentOutputError = currentOutputSlot?.error || ''
+  const currentOriginalOutputImageId = currentOutputImageIndex >= 0 ? task?.transparentOriginalImages?.[currentOutputImageIndex] || '' : ''
+  const currentOutputPreviewSrc = currentOutputImageId ? outputPreviewSrcs[currentOutputImageId] || '' : ''
 
   useEffect(() => {
     const outputImageIds = task?.outputImages ?? []
@@ -206,7 +235,7 @@ export default function DetailModal() {
   const isAgentEditTool = task.status === 'done' && String(task.agentToolAction ?? '').toLowerCase() === 'edit'
   const showReferenceSection = allInputImageIds.length > 0 || isAgentEditTool
 
-  const outputLen = task.outputImages?.length || 0
+  const outputLen = outputSlots.length
   const currentImageRatio = currentOutputImageId ? imageRatios[currentOutputImageId] : ''
   const currentImageSize = currentOutputImageId ? imageSizes[currentOutputImageId] : ''
   const currentActualParams = currentOutputImageId ? task.actualParamsByImage?.[currentOutputImageId] : undefined
@@ -215,7 +244,7 @@ export default function DetailModal() {
   // 避免仅由本地请求预处理导致的不一致被当作“API 改写”。
   const requestPrompt = task.transparentOutput && task.transparentPrompt
     ? task.transparentPrompt
-    : task.prompt
+    : applyPromptStylePreset(task.prompt, task.promptStylePresetId)
   const promptSentToApi = replaceImageMentionsForApi(requestPrompt, task.inputImageIds.length).trim()
   const showRevisedPrompt = Boolean(currentRevisedPrompt && currentRevisedPrompt !== promptSentToApi)
   const codexCliPromptKey = getCodexCliPromptKey(settings)
@@ -235,7 +264,7 @@ export default function DetailModal() {
   const streamPartialImageIds = task.streamPartialImageIds ?? []
   const isPngOutput = task.params.output_format === 'png'
   const transparentOutputText = task.transparentOutput || task.params.transparent_output ? 'true' : 'false'
-  const currentTransparentOutputFailed = Boolean(currentOutputImageId && task.transparentOutput && task.transparentOriginalImages?.[imageIndex] === '')
+  const currentTransparentOutputFailed = Boolean(currentOutputImageId && task.transparentOutput && task.transparentOriginalImages?.[currentOutputImageIndex] === '')
   const outputCompressionText = task.params.output_compression == null ? '未设置' : String(task.params.output_compression)
 
   const formatTime = (ts: number | null) => {
@@ -264,13 +293,6 @@ export default function DetailModal() {
 
   const handleEdit = () => {
     editOutputs(task)
-    setDetailTaskId(null)
-  }
-
-  const handleMaskEditCurrentOutput = () => {
-    const imgId = task.outputImages?.[imageIndex]
-    if (!imgId) return
-    setMaskEditorImageId(imgId)
     setDetailTaskId(null)
   }
 
@@ -433,26 +455,28 @@ export default function DetailModal() {
 
         {/* 左侧：图片 */}
         <div className="md:w-1/2 w-full h-64 md:h-auto bg-gray-100 dark:bg-black/20 relative flex items-center justify-center flex-shrink-0 min-h-[16rem]">
-          {task.status === 'done' && outputLen > 0 && (
+          {task.status === 'done' && outputLen > 0 && (currentOutputImageId || task.outputImages.length > 0) && (
             <div className="absolute right-3 top-[15px] z-20 flex items-center gap-1.5">
-              <div className="relative group flex">
-                <button
-                  type="button"
-                  {...downloadImageTooltip.handlers}
-                  onClick={(e) => {
-                    downloadImageTooltip.handlers.onClick()
-                    handleDownloadCurrentOutput(e)
-                  }}
-                    className="flex items-center justify-center px-1.5 py-0.5 bg-black/50 text-white rounded backdrop-blur-sm hover:bg-black/70 transition focus:outline-none focus:ring-1 focus:ring-white/50"
-                  aria-label="下载图片"
-                >
-                  <DownloadIcon className="h-4 w-4" />
-                </button>
-                <ViewportTooltip visible={downloadImageTooltip.visible} className="whitespace-nowrap">
-                  下载图片
-                </ViewportTooltip>
-              </div>
-              {outputLen > 1 && (
+              {currentOutputImageId && (
+                <div className="relative group flex">
+                  <button
+                    type="button"
+                    {...downloadImageTooltip.handlers}
+                    onClick={(e) => {
+                      downloadImageTooltip.handlers.onClick()
+                      handleDownloadCurrentOutput(e)
+                    }}
+                      className="flex items-center justify-center px-1.5 py-0.5 bg-black/50 text-white rounded backdrop-blur-sm hover:bg-black/70 transition focus:outline-none focus:ring-1 focus:ring-white/50"
+                    aria-label="下载图片"
+                  >
+                    <DownloadIcon className="h-4 w-4" />
+                  </button>
+                  <ViewportTooltip visible={downloadImageTooltip.visible} className="whitespace-nowrap">
+                    下载图片
+                  </ViewportTooltip>
+                </div>
+              )}
+              {task.outputImages.length > 1 && (
                 <div className="relative group flex">
                   <button
                     type="button"
@@ -494,7 +518,7 @@ export default function DetailModal() {
                   }
                 }}
                 onClick={() =>
-                  setLightboxImageId(task.outputImages[imageIndex], task.outputImages)
+                  setLightboxImageId(currentOutputImageId, task.outputImages)
                 }
                 alt=""
               />
@@ -569,6 +593,47 @@ export default function DetailModal() {
                 </div>
               )}
             </>
+          )}
+          {task.status === 'done' && outputLen > 0 && currentOutputError && (
+            <div className="w-full max-w-md px-4 text-center">
+              <svg className="w-10 h-10 text-red-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <p className="text-sm font-medium text-red-500">第 {currentOutputSlot.requestIndex + 1} 张生成失败</p>
+              <p
+                className="mt-2 overflow-hidden whitespace-pre-line text-sm leading-6 text-red-500 break-words"
+                style={{
+                  display: '-webkit-box',
+                  WebkitBoxOrient: 'vertical',
+                  WebkitLineClamp: 8,
+                }}
+              >
+                {currentOutputError}
+              </p>
+              {outputLen > 1 && (
+                <>
+                  <button
+                    onClick={() => setImageIndex((imageIndex - 1 + outputLen) % outputLen)}
+                    className="absolute left-2 top-1/2 -translate-y-1/2 p-1.5 rounded-full bg-black/30 text-white hover:bg-black/50 transition"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                    </svg>
+                  </button>
+                  <button
+                    onClick={() => setImageIndex((imageIndex + 1) % outputLen)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-full bg-black/30 text-white hover:bg-black/50 transition"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
+                  </button>
+                  <span className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-black/50 text-white text-xs px-2 py-0.5 rounded-full">
+                    {imageIndex + 1} / {outputLen}
+                  </span>
+                </>
+              )}
+            </div>
           )}
           {(task.status === 'running' || isFalReconnecting) && (
             <>
@@ -661,7 +726,7 @@ export default function DetailModal() {
                   <button
                     type="button"
                     {...copyErrorTooltip.handlers}
-                    onClick={(e) => {
+                    onClick={() => {
                       copyErrorTooltip.handlers.onClick()
                       handleCopyError()
                     }}
@@ -679,7 +744,7 @@ export default function DetailModal() {
                     <button
                       type="button"
                       {...viewRawResponseTooltip.handlers}
-                      onClick={(e) => {
+                      onClick={() => {
                         dismissAllTooltips()
                         setShowRawResponseModal(true)
                       }}
@@ -698,7 +763,7 @@ export default function DetailModal() {
                     <button
                       type="button"
                       {...copyRawUrlsTooltip.handlers}
-                      onClick={async (e) => {
+                      onClick={async () => {
                         if (task.rawImageUrls!.length === 1) {
                           copyRawUrlsTooltip.handlers.onClick()
                           try {
@@ -727,7 +792,7 @@ export default function DetailModal() {
                     <button
                       type="button"
                       {...downloadPartialImagesTooltip.handlers}
-                      onClick={(e) => {
+                      onClick={() => {
                         downloadPartialImagesTooltip.handlers.onClick()
                         void handleDownloadPartialImages()
                       }}
@@ -745,7 +810,7 @@ export default function DetailModal() {
                   <button
                     type="button"
                     {...retryTooltip.handlers}
-                    onClick={(e) => {
+                    onClick={() => {
                       retryTooltip.handlers.onClick()
                       handleRetry()
                     }}

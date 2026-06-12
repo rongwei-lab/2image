@@ -4,8 +4,10 @@ import net from 'node:net'
 import type { AgentConversation, AgentMessage, AgentRound, ApiProfile, AppSettings, PlatformSettings, ResponsesApiResponse, ResponsesOutputItem, TaskRecord, TaskParams } from '../src/types'
 import { DEFAULT_PARAMS } from '../src/types'
 import { getActiveApiProfile, normalizeSettings } from '../src/lib/apiProfiles'
-import { applyPlatformSettingsToAppSettings, normalizePlatformSettings, sanitizePlatformSettingsForClient } from '../src/lib/platformSettings'
+import { applyPlatformSettingsToAppSettings, getPlatformManagedTaskParams, normalizePlatformSettings, sanitizePlatformSettingsForClient } from '../src/lib/platformSettings'
 import { callImageApi } from '../src/lib/api'
+import { normalizeParamsForSettings } from '../src/lib/paramCompatibility'
+import { applyPromptStylePreset, normalizePromptStylePresetId } from '../src/lib/promptStyles'
 import {
   collectAgentRoundOutputImageSlots,
   getAgentCurrentReferenceId,
@@ -26,6 +28,7 @@ import { hashPassword, requireAuth, type AuthUser } from './auth'
 import { decryptText, encryptText } from './crypto'
 import { bufferToDataUrl, parseImageDataUrl, resolveImageStorageId } from './imageData'
 import { createSignedImageUrl, deleteObjects, getObjectBuffer, listObjectKeys, putObject } from './storage'
+import { createTransparentOutputMeta } from '../src/lib/transparentImage'
 import { removeKeyedBackgroundFromDataUrl } from './transparentImage'
 
 type TaskEvent =
@@ -38,6 +41,7 @@ const taskSubscribers = new Map<string, Set<FastifyReply>>()
 const PLATFORM_SETTINGS_KEY = 'platform'
 const UPSTREAM_CONNECT_TIMEOUT_MS = 8_000
 const PLATFORM_TEST_TIMEOUT_MS = 10_000
+const PLATFORM_IMAGE_TEST_TIMEOUT_MS = 120_000
 
 type SseEvent =
   | { type: 'text_delta'; delta: string }
@@ -285,6 +289,144 @@ function buildOpenAiCompatibleEndpoint(baseUrl: string, endpoint: string) {
   return url.toString()
 }
 
+function getStringFromRecord(source: unknown, key: string): string | undefined {
+  if (!isRecord(source)) return undefined
+  const value = source[key]
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function getResponsesFailureMessage(event: unknown): string | null {
+  if (!isRecord(event)) return null
+  const error = event.error
+  if (isRecord(error)) {
+    const message = getStringFromRecord(error, 'message')
+    if (message) return message
+  } else if (typeof error === 'string' && error.trim()) {
+    return error
+  }
+
+  const response = event.response
+  if (isRecord(response) && isRecord(response.error)) {
+    const message = getStringFromRecord(response.error, 'message')
+    if (message) return message
+  }
+
+  const type = getStringFromRecord(event, 'type')
+  if (type?.endsWith('.failed')) return getStringFromRecord(event, 'message') ?? 'Responses 流式请求失败'
+  return null
+}
+
+function outputContainsImageResult(output: unknown): boolean {
+  if (!Array.isArray(output)) return false
+  return output.some((item) => isRecord(item) && item.type === 'image_generation_call' && Boolean(item.result))
+}
+
+async function parsePlatformImageTestStream(response: Response) {
+  if (!response.body) throw new Error('真实出图测试未返回可读取的流式响应')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let hasImageResult = false
+  let sawImageTool = false
+  let eventCount = 0
+
+  const processBlock = (block: string) => {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart())
+      .join('\n')
+      .trim()
+    if (!data || data === '[DONE]') return
+
+    let event: unknown
+    try {
+      event = JSON.parse(data)
+    } catch {
+      throw new Error('真实出图测试返回了无法解析的流式 JSON 事件')
+    }
+    eventCount += 1
+
+    const failureMessage = getResponsesFailureMessage(event)
+    if (failureMessage) throw new Error(failureMessage)
+
+    const output = isRecord(event)
+      ? (isRecord(event.response) && Array.isArray(event.response.output) ? event.response.output : isRecord(event.item) ? [event.item] : null)
+      : null
+    if (outputContainsImageResult(output)) hasImageResult = true
+    if (Array.isArray(output) && output.some((item) => isRecord(item) && item.type === 'image_generation_call')) {
+      sawImageTool = true
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let separatorIndex = buffer.search(/\r?\n\r?\n/)
+    while (separatorIndex >= 0) {
+      const separator = buffer.match(/\r?\n\r?\n/)?.[0] ?? '\n\n'
+      processBlock(buffer.slice(0, separatorIndex))
+      buffer = buffer.slice(separatorIndex + separator.length)
+      separatorIndex = buffer.search(/\r?\n\r?\n/)
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) processBlock(buffer)
+
+  return { hasImageResult, sawImageTool, eventCount }
+}
+
+async function assertPlatformImageGenerationWorks(profile: ApiProfile) {
+  const endpoint = buildOpenAiCompatibleEndpoint(profile.baseUrl, 'responses')
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${profile.apiKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+    },
+    body: JSON.stringify({
+      model: profile.model,
+      input: 'Generate a tiny simple red square icon on a white background.',
+      tools: [{
+        type: 'image_generation',
+        size: '1024x1024',
+        quality: 'low',
+        output_format: 'jpeg',
+        moderation: 'low',
+        ...(profile.streamImages ? { partial_images: Math.max(1, profile.streamPartialImages ?? 1) } : {}),
+      }],
+      tool_choice: 'required',
+      ...(profile.streamImages ? { stream: true } : {}),
+    }),
+    signal: AbortSignal.timeout(PLATFORM_IMAGE_TEST_TIMEOUT_MS),
+  })
+
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '')
+    throw new Error(`真实出图测试失败（HTTP ${response.status}）：${errorText.slice(0, 500) || response.statusText}`)
+  }
+
+  if (contentType.includes('text/event-stream')) {
+    const result = await parsePlatformImageTestStream(response)
+    if (!result.hasImageResult) {
+      throw new Error(result.sawImageTool
+        ? '真实出图测试调用了 image_generation，但上游未返回最终图片'
+        : '真实出图测试未触发 image_generation 工具')
+    }
+    return `真实出图测试通过：流式响应返回最终图片（${result.eventCount} 个事件）`
+  }
+
+  const payload = await response.json().catch(() => null) as ResponsesApiResponse | null
+  if (!outputContainsImageResult(payload?.output)) {
+    const text = JSON.stringify(payload ?? {}).slice(0, 500)
+    throw new Error(`真实出图测试未返回图片数据：${text || '空响应'}`)
+  }
+  return '真实出图测试通过：Responses 返回最终图片'
+}
+
 function getProfileForPlatformTest(saved: PlatformSettings, draftInput: unknown) {
   const draft = normalizePlatformSettings(draftInput ?? saved)
   const savedSettings = normalizeSettings(saved.api.settings)
@@ -420,6 +562,17 @@ async function testPlatformSettings(db: Db, config: ServerConfig, draftInput: un
     checks.push(createPlatformTestCheck('auth', '接口认证', 'error', formatGenerationError(error, profile)))
   }
 
+  if (profile.apiMode === 'responses') {
+    try {
+      const measured = await measureCheck(() => assertPlatformImageGenerationWorks(profile))
+      checks.push(createPlatformTestCheck('image-generation', '真实出图', 'success', measured.detail, measured.elapsedMs))
+    } catch (error) {
+      checks.push(createPlatformTestCheck('image-generation', '真实出图', 'error', formatGenerationError(error, profile)))
+    }
+  } else {
+    checks.push(createPlatformTestCheck('image-generation', '真实出图', 'skipped', '当前配置不是 Responses API，暂不执行 image_generation 工具测试。'))
+  }
+
   return {
     ok: !checks.some((check) => check.status === 'error'),
     testedAt: new Date().toISOString(),
@@ -504,6 +657,41 @@ async function loadActiveGenerationProfile(db: Db, config: ServerConfig, userId:
   const profile = getActiveApiProfile(settings)
   if (!profile.apiKey.trim()) throw new Error('缺少云端 API Key，请在设置中保存 API Key')
   return { settings, profile }
+}
+
+async function loadManagedGenerationParams(db: Db, config: ServerConfig): Promise<TaskParams | null> {
+  return getPlatformManagedTaskParams(await loadPlatformSettings(db, config))
+}
+
+function normalizeGenerationParams(params: TaskParams, settings: AppSettings, hasInputImages: boolean) {
+  return normalizeParamsForSettings(params, settings, { hasInputImages })
+}
+
+async function applyManagedTaskParams(
+  db: Db,
+  config: ServerConfig,
+  task: TaskRecord,
+  settings: AppSettings,
+): Promise<TaskRecord> {
+  const managedParams = await loadManagedGenerationParams(db, config)
+  if (!managedParams) return task
+  const normalizedParams = normalizeGenerationParams(managedParams, settings, task.inputImageIds.length > 0)
+  const taskParams = normalizedParams.output_format === 'png' && normalizedParams.transparent_output
+    ? { ...normalizedParams, output_format: 'png' as const, output_compression: null, transparent_output: true }
+    : { ...normalizedParams, transparent_output: false }
+  const styledPrompt = applyPromptStylePreset(task.prompt.trim(), task.promptStylePresetId)
+  const transparentMeta = taskParams.transparent_output
+    ? createTransparentOutputMeta(styledPrompt)
+    : null
+
+  return {
+    ...task,
+    // 服务端覆盖任务参数，防止旧前端或手写请求绕过后台统一策略。
+    params: taskParams,
+    promptStylePresetId: normalizePromptStylePresetId(task.promptStylePresetId),
+    transparentOutput: transparentMeta?.transparentOutput,
+    transparentPrompt: transparentMeta?.effectivePrompt,
+  }
 }
 
 function closeTaskSubscribers(userId: string, taskId: string) {
@@ -706,6 +894,7 @@ async function upsertSettings(
   body: {
     settings: AppSettings
     params: TaskParams
+    promptStylePresetId?: string
     activeAgentConversationId?: string | null
     appMode?: string
     agentSidebarCollapsed?: boolean
@@ -727,6 +916,7 @@ async function upsertSettings(
     agentSidebarCollapsed: Boolean(body.agentSidebarCollapsed),
     agentAssetTab: body.agentAssetTab === 'references' ? 'references' : 'outputs',
     agentAssetPanelCollapsed: Boolean(body.agentAssetPanelCollapsed),
+    promptStylePresetId: normalizePromptStylePresetId(body.promptStylePresetId),
     prompt: typeof body.prompt === 'string' ? body.prompt : '',
     inputImages: Array.isArray(body.inputImages) ? body.inputImages : [],
 	    maskDraft: body.maskDraft ?? null,
@@ -1995,7 +2185,7 @@ async function runTask(
 
     const requestPrompt = task.transparentOutput && task.transparentPrompt
       ? task.transparentPrompt
-      : task.prompt
+      : applyPromptStylePreset(task.prompt, task.promptStylePresetId)
 
     const result = await callImageApi({
       settings,
@@ -2614,7 +2804,10 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
   app.post('/api/tasks', async (request, reply) => {
     const user = await requireAuth(db, request, reply)
     if (!user) return
-    const task = request.body as TaskRecord
+    const incomingTask = request.body as TaskRecord
+    const settings = await loadGenerationSettings(db, config, user.id)
+    if (!settings) return reply.code(400).send({ error: '缺少云端 API 配置' })
+    const task = await applyManagedTaskParams(db, config, incomingTask, settings)
     await assertTaskImagesBelongToUser(db, user.id, task)
     await assertUserLimits(db, user.id, { creatingTask: true })
     await putTaskRecord(db, user.id, task)
@@ -2767,10 +2960,16 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
       const maskDataUrl = body.maskImageId
         ? await readImageDataUrl(db, s3, config, user.id, body.maskImageId)
         : body.maskDataUrl
+      const managedParams = await loadManagedGenerationParams(db, config)
+      const requestParams = normalizeGenerationParams(
+        managedParams ?? body.params ?? DEFAULT_PARAMS,
+        settings,
+        Boolean(maskDataUrl),
+      )
       const result = await callAgentResponsesApi({
         settings,
         profile,
-        params: body.params ?? DEFAULT_PARAMS,
+        params: { ...requestParams, n: 1, transparent_output: false },
         input: body.input,
         maskDataUrl,
         onTextDelta: (delta) => writeSse(reply, { type: 'text_delta', delta }),
@@ -2801,12 +3000,18 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
     }
     openSse(reply)
     try {
-      const { profile } = await loadActiveGenerationProfile(db, config, user.id)
+      const { settings, profile } = await loadActiveGenerationProfile(db, config, user.id)
       activeProfile = profile
       await assertUpstreamTcpReachable(profile)
+      const managedParams = await loadManagedGenerationParams(db, config)
+      const requestParams = normalizeGenerationParams(
+        managedParams ?? body.params ?? DEFAULT_PARAMS,
+        settings,
+        Boolean(body.referenceImageDataUrls?.length || body.referenceIds?.length),
+      )
       const result = await callBatchImageSingle({
         profile,
-        params: body.params ?? DEFAULT_PARAMS,
+        params: { ...requestParams, n: 1, transparent_output: false },
         batchItemId: body.batchItemId ?? '',
         prompt: body.prompt ?? '',
         referenceImageDataUrls: body.referenceImageDataUrls ?? [],

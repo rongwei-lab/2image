@@ -68,9 +68,9 @@ import {
   type CloudSettingsSnapshot,
   type CloudUser,
 } from './lib/cloudApi'
-import { applyPlatformSettingsToAppSettings } from './lib/platformSettings'
+import { applyPlatformSettingsToAppSettings, getPlatformManagedTaskParams } from './lib/platformSettings'
 import { callImageApi } from './lib/api'
-import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type BatchImageCallResult } from './lib/agentApi'
+import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage } from './lib/agentApi'
 import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
 import { showBrowserNotification } from './lib/browserNotification'
 import { IMAGE_FETCH_CORS_HINT } from './lib/imageApiShared'
@@ -80,6 +80,7 @@ import { validateMaskMatchesImage } from './lib/canvasImage'
 import { orderInputImagesForMask } from './lib/mask'
 import { getChangedParams, normalizeParamsForSettings } from './lib/paramCompatibility'
 import { createTransparentOutputMeta, getTransparentRequestParams, removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
+import { applyPromptStylePreset, normalizePromptStylePresetId, type PromptStylePresetId } from './lib/promptStyles'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
 
 export const ALL_FAVORITES_COLLECTION_ID = '__all_favorites__'
@@ -735,6 +736,7 @@ export function getPersistedState(state: AppState) {
   return {
     settings,
     params: state.params,
+    promptStylePresetId: state.promptStylePresetId,
     ...(settings.persistInputOnRestart && (state.appMode === 'gallery' || galleryInputDraft)
       ? {
           prompt: galleryInputDraft?.prompt ?? '',
@@ -779,6 +781,7 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
 
   const persisted = persistedState as Partial<AppState>
   const settings = normalizeSettings(persisted.settings ?? currentState.settings)
+  const promptStylePresetId = normalizePromptStylePresetId(persisted.promptStylePresetId)
   const hasPersistedAgentConversations = Array.isArray(persisted.agentConversations)
   if (hasPersistedAgentConversations && normalizeAgentConversations(persisted.agentConversations).length > 0) {
     agentConversationMigrationPending = true
@@ -825,6 +828,7 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
     ...currentState,
     ...persisted,
     settings,
+    promptStylePresetId,
     appMode,
     galleryInputDraft: galleryInputDraft && !isEmptyAgentInputDraft(galleryInputDraft) ? galleryInputDraft : null,
     agentConversations,
@@ -871,6 +875,8 @@ interface AppState {
   // 输入
   prompt: string
   setPrompt: (p: string) => void
+  promptStylePresetId: PromptStylePresetId
+  setPromptStylePresetId: (id: PromptStylePresetId) => void
   inputImages: InputImage[]
   addInputImage: (img: InputImage) => void
   replaceInputImage: (idx: number, img: InputImage) => void
@@ -1373,6 +1379,8 @@ export const useStore = create<AppState>()(
       // Input
       prompt: '',
       setPrompt: (prompt) => set((s) => syncActiveInputDraft(s, { prompt })),
+      promptStylePresetId: '',
+      setPromptStylePresetId: (promptStylePresetId) => set({ promptStylePresetId: normalizePromptStylePresetId(promptStylePresetId) }),
       inputImages: [],
       addInputImage: (img) => {
         const nextImage = isCloudMode() && img.dataUrl
@@ -1842,6 +1850,7 @@ function buildCloudSettingsSnapshot(state: AppState): CloudSettingsSnapshot {
   return {
     settings: normalizeSettings(state.settings),
     params: state.params,
+    promptStylePresetId: state.promptStylePresetId,
     activeAgentConversationId: state.activeAgentConversationId,
     appMode: state.appMode,
     agentSidebarCollapsed: state.agentSidebarCollapsed,
@@ -2235,6 +2244,32 @@ function scheduleOpenAIWatchdog(taskId: string, timeoutSeconds: number, profile?
     if (failed) useStore.getState().showToast('OpenAI 任务请求超时', 'error')
   }, remainingMs)
   openAIWatchdogTimers.set(taskId, timer)
+}
+
+function usesConcurrentOpenAIImageRequests(profile: ApiProfile, params: TaskParams) {
+  const n = params.n > 0 ? params.n : 1
+  if (profile.provider !== 'openai' || n <= 1) return false
+  if (profile.apiMode === 'responses') return true
+  return profile.apiMode === 'images' && (profile.codexCli || profile.streamImages)
+}
+
+export function taskHasOutputErrors(task: Pick<TaskRecord, 'outputErrors'>) {
+  return Boolean(task.outputErrors?.length)
+}
+
+export function taskMatchesFilterStatus(task: TaskRecord, filterStatus: AppState['filterStatus']) {
+  if (filterStatus === 'all') return true
+  if (filterStatus === 'error') return task.status === 'error' || taskHasOutputErrors(task)
+  return task.status === filterStatus
+}
+
+export function taskMatchesSearchQuery(task: TaskRecord, query: string) {
+  const q = query.trim().toLowerCase()
+  if (!q) return true
+  const prompt = (task.prompt || '').toLowerCase()
+  const paramStr = JSON.stringify(task.params).toLowerCase()
+  const errorStr = [task.error, ...(task.outputErrors ?? []).map((item) => item.error)].filter(Boolean).join('\n').toLowerCase()
+  return prompt.includes(q) || paramStr.includes(q) || errorStr.includes(q)
 }
 
 export function showCodexCliPrompt(force = false, reason = '接口返回的提示词已被改写') {
@@ -2637,6 +2672,7 @@ export async function initStore() {
 	          cloudAuthChecked: true,
 	          settings: applyPlatformSettingsToAppSettings(normalizeSettings(nextSnapshot.settings), platformSettings),
 	          params: nextSnapshot.params ?? state.params,
+	          promptStylePresetId: normalizePromptStylePresetId(nextSnapshot.promptStylePresetId),
 	          appMode: nextSnapshot.appMode ?? state.appMode,
 	          galleryInputDraft: nextGalleryInputDraft,
 	          agentConversations: normalizedConversations,
@@ -2896,7 +2932,7 @@ export async function initStore() {
 
 /** 提交新任务 */
 export async function submitTask(options: { allowFullMask?: boolean; useCurrentApiProfileWhenReusedMissing?: boolean } = {}) {
-  const { settings, prompt, inputImages, maskDraft, params, reusedTaskApiProfileId, reusedTaskApiProfileName, reusedTaskApiProfileMissing, showToast, setConfirmDialog } =
+  const { settings, prompt, promptStylePresetId, inputImages, maskDraft, params, platformSettings, reusedTaskApiProfileId, reusedTaskApiProfileName, reusedTaskApiProfileMissing, showToast, setConfirmDialog } =
     useStore.getState()
 
   const normalizedSettings = normalizeSettings(settings)
@@ -2974,13 +3010,16 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     await storeImage(img.dataUrl)
   }
 
-  const normalizedParams = normalizeParamsForSettings(params, requestSettings, { hasInputImages: orderedInputImages.length > 0 })
+  // 后台接管参数时，提交链路直接使用平台默认值；这样旧 UI 状态或手动改请求也不会改变生成参数。
+  const sourceParams = getPlatformManagedTaskParams(platformSettings) ?? params
+  const normalizedParams = normalizeParamsForSettings(sourceParams, requestSettings, { hasInputImages: orderedInputImages.length > 0 })
   const shouldUseTransparentOutput = normalizedParams.output_format === 'png' && normalizedParams.transparent_output
   const taskParams = shouldUseTransparentOutput
     ? getTransparentRequestParams(normalizedParams)
     : { ...normalizedParams, transparent_output: false }
+  const styledPrompt = applyPromptStylePreset(prompt.trim(), promptStylePresetId)
   const transparentMeta = taskParams.transparent_output
-    ? createTransparentOutputMeta(prompt.trim())
+    ? createTransparentOutputMeta(styledPrompt)
     : null
   const normalizedParamPatch = getChangedParams(params, taskParams)
   if (Object.keys(normalizedParamPatch).length) {
@@ -2991,6 +3030,7 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
   const task: TaskRecord = {
     id: taskId,
     prompt: prompt.trim(),
+    promptStylePresetId,
     params: taskParams,
     apiProvider: activeProfile.provider,
     apiProfileId: activeProfile.id,
@@ -3061,6 +3101,22 @@ function appendAgentStoppedMessage(content: string) {
   return `${trimmed}\n\n${AGENT_STOPPED_MESSAGE}`
 }
 
+function summarizeAgentFailureText(text: string, maxLength = 220) {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+  if (!normalized) return ''
+  const chars = Array.from(normalized)
+  return chars.length > maxLength ? `${chars.slice(0, maxLength - 1).join('')}...` : normalized
+}
+
+function createAgentMissingImageError(agentText: string) {
+  const summary = summarizeAgentFailureText(agentText)
+  // 有些上游会把图片工具失败包装成普通 assistant 文本，而不是结构化 error 事件。
+  // 这里把那段文本挂到任务错误上，避免用户只看到“未返回最终图片”的空泛提示。
+  return summary
+    ? `Agent 已调用图像工具，但上游未返回最终图片。上游回复：${summary}`
+    : 'Agent 已调用图像工具，但上游未返回最终图片'
+}
+
 function markAgentRoundTasksStopped(conversationId: string, roundId: string, now = Date.now()) {
   const runningTasks = useStore.getState().tasks.filter((task) =>
     task.status === 'running' &&
@@ -3081,31 +3137,34 @@ function markAgentRoundTasksStopped(conversationId: string, roundId: string, now
   return runningTasks.length > 0
 }
 
-function markAgentRoundRunningTasksFailed(
+function markAgentRoundTasksFailed(
   conversationId: string,
   roundId: string,
   error: string,
+  rawResponsePayload?: string,
+  shouldFailTask: (task: TaskRecord) => boolean = () => true,
   now = Date.now(),
 ) {
   const runningTasks = useStore.getState().tasks.filter((task) =>
     task.status === 'running' &&
     task.agentConversationId === conversationId &&
-    task.agentRoundId === roundId,
+    task.agentRoundId === roundId &&
+    shouldFailTask(task),
   )
 
   for (const task of runningTasks) {
+    useStore.getState().setTaskStreamPreview(task.id)
     updateTaskInStore(task.id, {
       status: 'error',
       error,
+      ...(rawResponsePayload ? { rawResponsePayload } : {}),
       falRecoverable: false,
       customRecoverable: false,
       finishedAt: now,
       elapsed: Math.max(0, now - task.createdAt),
     })
-    useStore.getState().setTaskStreamPreview(task.id)
   }
-
-  return runningTasks.length
+  return runningTasks.length > 0
 }
 
 function markAgentRoundStopped(conversationId: string, roundId: string) {
@@ -3713,10 +3772,6 @@ function countResponseToolCalls(output: ResponsesOutputItem[]) {
   return output.filter((item) => item.type === 'image_generation_call').length
 }
 
-function countResponseImageCalls(output: ResponsesOutputItem[]) {
-  return output.filter((item) => item.type === 'image_generation_call').length
-}
-
 function createAgentContinuationInputItem(newImageRefs: string[], toolCallsUsed: number, maxToolCalls: number) {
   const lines = [
     '[System] The app has saved your generated outputs and is continuing the same Agent turn.',
@@ -3807,7 +3862,7 @@ async function buildAgentApiInput(conversation: AgentConversation, currentRound:
 
 export async function submitAgentMessage() {
   const state = useStore.getState()
-  const { settings, prompt, inputImages, maskDraft, params, showToast } = state
+  const { settings, prompt, inputImages, maskDraft, params, platformSettings, showToast } = state
   const normalizedSettings = normalizeSettings(settings)
   const activeProfile = getActiveApiProfile(normalizedSettings)
 
@@ -3885,8 +3940,10 @@ export async function submitAgentMessage() {
   const activeLeafId = activeRounds[activeRounds.length - 1]?.id ?? null
   const parentRoundId = editingRound ? editingRound.parentRoundId ?? null : activeLeafId
   const parentPath = parentRoundId ? getAgentRoundPath(conversation, parentRoundId) : []
+  // Agent 生成图片也走同一套后台参数，但数量和透明背景仍按 Agent 约束固定。
+  const sourceParams = getPlatformManagedTaskParams(platformSettings) ?? params
   const normalizedParams = {
-    ...normalizeParamsForSettings(params, requestSettings, { hasInputImages: inputImageIds.length > 0 }),
+    ...normalizeParamsForSettings(sourceParams, requestSettings, { hasInputImages: inputImageIds.length > 0 }),
     n: DEFAULT_PARAMS.n,
     transparent_output: false,
   }
@@ -3959,7 +4016,7 @@ export async function submitAgentMessage() {
 
 export async function regenerateAgentAssistantMessage(conversationId: string, roundId: string) {
   const state = useStore.getState()
-  const { settings, params, showToast } = state
+  const { settings, params, platformSettings, showToast } = state
   const normalizedSettings = normalizeSettings(settings)
   const activeProfile = getActiveApiProfile(normalizedSettings)
 
@@ -3992,8 +4049,9 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
 
   const inputImageIds = uniqueIds(sourceRound.inputImageIds)
   const requestSettings = createSettingsForApiProfile(normalizedSettings, activeProfile)
+  const sourceParams = getPlatformManagedTaskParams(platformSettings) ?? params
   const normalizedParams = {
-    ...normalizeParamsForSettings(params, requestSettings, { hasInputImages: inputImageIds.length > 0 }),
+    ...normalizeParamsForSettings(sourceParams, requestSettings, { hasInputImages: inputImageIds.length > 0 }),
     n: DEFAULT_PARAMS.n,
     transparent_output: false,
   }
@@ -4137,12 +4195,18 @@ async function executeAgentRound(
       if (existingTask) {
         taskIdByToolCallId.set(toolCallId, existingTask.id)
         attachTaskToAgentRound(existingTask.id)
+        const fallbackPrompt = (taskPrompt || round.prompt || userMessage.content).trim()
+        if (!existingTask.prompt.trim() && fallbackPrompt) {
+          updateTaskInStore(existingTask.id, { prompt: fallbackPrompt })
+        }
         return existingTask.id
       }
 
+      const fallbackPrompt = (taskPrompt || round.prompt || userMessage.content).trim()
+
       const task: TaskRecord = {
         id: genId(),
-        prompt: taskPrompt,
+        prompt: fallbackPrompt,
         params: { ...params, n: 1 },
         apiProvider: activeProfile.provider,
         apiProfileId: activeProfile.id,
@@ -4201,6 +4265,24 @@ async function executeAgentRound(
       })
       useStore.getState().setTaskStreamPreview(taskId)
       return taskId
+    }
+
+    const failAgentImageTask = (toolCallId: string, error: string, rawResponsePayload?: string) => {
+      const taskId = taskIdByToolCallId.get(toolCallId)
+      if (!taskId) return
+      const latestTask = useStore.getState().tasks.find((task) => task.id === taskId)
+      if (!latestTask || latestTask.status !== 'running') return
+
+      useStore.getState().setTaskStreamPreview(taskId)
+      updateTaskInStore(taskId, {
+        status: 'error',
+        error,
+        rawResponsePayload,
+        falRecoverable: false,
+        customRecoverable: false,
+        finishedAt: Date.now(),
+        elapsed: Date.now() - latestTask.createdAt,
+      })
     }
 
     if (shouldStreamAssistantMessage) {
@@ -4360,16 +4442,21 @@ async function executeAgentRound(
         const batchItem = batchItems[i]
         if (settled.status === 'fulfilled') {
           const r = settled.value
+          if (!r.image) {
+            failAgentImageTask(batchExecutionItems[i].batchToolCallId, r.error ?? '接口未返回图片数据', r.rawResponsePayload)
+          }
           outputImages.push({
             id: r.batchItemId,
             status: r.image ? 'done' : 'error',
             ...(r.error ? { error: r.error } : {}),
           })
         } else {
+          const error = settled.reason instanceof Error ? settled.reason.message : String(settled.reason)
+          failAgentImageTask(batchExecutionItems[i].batchToolCallId, error)
           outputImages.push({
             id: batchItem.id,
             status: 'error',
-            error: settled.reason instanceof Error ? settled.reason.message : String(settled.reason),
+            error,
           })
         }
       }
@@ -4391,6 +4478,7 @@ async function executeAgentRound(
         onImageToolStarted?: (event: { toolCallId: string; outputIndex?: number }) => Promise<void>
         onImagePartialImage?: (event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number }) => Promise<void>
         onImageToolCompleted?: (image: AgentApiResultImage) => Promise<void>
+        onImageToolFailed?: (event: { toolCallId: string; error: string }) => Promise<void>
       } = {
         signal: controller.signal,
         onTextDelta: shouldStreamAssistantMessage
@@ -4437,6 +4525,14 @@ async function executeAgentRound(
           ? async (image: AgentApiResultImage) => {
               if (controller.signal.aborted) return
               await completeAgentImageTask(image)
+            }
+          : undefined,
+        onImageToolFailed: shouldStreamAssistantMessage
+          ? async ({ toolCallId, error }: { toolCallId: string; error: string }) => {
+              if (controller.signal.aborted) return
+              await ensureStreamingAgentTask(toolCallId)
+              if (controller.signal.aborted) return
+              failAgentImageTask(toolCallId, error)
             }
           : undefined,
       }
@@ -4623,9 +4719,18 @@ async function executeAgentRound(
 
     const taskIds: string[] = [...streamingTaskIds]
     const outputIds = taskIds.flatMap((taskId) => useStore.getState().tasks.find((task) => task.id === taskId)?.outputImages ?? [])
-    markAgentRoundRunningTasksFailed(conversationId, roundId, 'Agent 回复已结束，但图像工具未返回最终图片')
     const limitNotice = reachedToolLimit ? `已达到最大工具调用次数（${maxToolCalls}），已停止自动续跑。` : ''
     const joinedText = textSegments.join('\n\n').trim()
+    const missingImageError = createAgentMissingImageError(joinedText)
+    markAgentRoundTasksFailed(
+      conversationId,
+      roundId,
+      missingImageError,
+      undefined,
+      (task) => Boolean(task.agentToolCallId && !task.agentBatchCallId),
+    )
+    // 批量工具或旧记录也可能遗留 running 任务；第二次兜底只会命中仍未结束的任务。
+    markAgentRoundTasksFailed(conversationId, roundId, missingImageError)
     const finalContent = [joinedText, limitNotice]
       .filter(Boolean)
       .join(joinedText ? '\n\n' : '')
@@ -4684,7 +4789,7 @@ async function executeAgentRound(
       message += `\n${networkErrorHint}`
     }
 
-    markAgentRoundRunningTasksFailed(conversationId, roundId, message)
+    markAgentRoundTasksFailed(conversationId, roundId, message, getRawErrorPayload(err).rawResponsePayload)
     updateAgentConversation(conversationId, (current) => {
       const failedRound = current.rounds.find((round) => round.id === roundId)
       const existingAssistantMessage = failedRound?.assistantMessageId
@@ -4870,7 +4975,11 @@ async function executeTask(taskId: string) {
     ? { taskId: task.customTaskId }
     : null
 
-  if (taskProvider !== 'fal' && !isAsyncCustomProviderTask(requestSettings, taskProvider, task.inputImageIds.length > 0)) {
+  if (
+    taskProvider !== 'fal' &&
+    !isAsyncCustomProviderTask(requestSettings, taskProvider, task.inputImageIds.length > 0) &&
+    !usesConcurrentOpenAIImageRequests(activeProfile, task.params)
+  ) {
     scheduleOpenAIWatchdog(taskId, activeProfile.timeout, activeProfile)
   }
 
@@ -4890,7 +4999,7 @@ async function executeTask(taskId: string) {
 
     const requestPrompt = task.transparentOutput && task.transparentPrompt
       ? task.transparentPrompt
-      : task.prompt
+      : applyPromptStylePreset(task.prompt, task.promptStylePresetId)
 
     const result = await callImageApi({
       settings: requestSettings,
@@ -4969,6 +5078,7 @@ async function executeTask(taskId: string) {
     updateTaskInStore(taskId, {
       outputImages: outputIds,
       transparentOriginalImages: transparentOriginalImageIds,
+      outputErrors: result.failedRequests?.length ? result.failedRequests : undefined,
       streamPartialImageIds: undefined,
       rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
       actualParams,
@@ -4982,8 +5092,12 @@ async function executeTask(taskId: string) {
     })
     void deleteUnreferencedImageIds(partialImageIdsToClean)
 
-    useStore.getState().showToast(`生成完成，共 ${outputIds.length} 张图片`, 'success')
-    if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `生成完成，共 ${outputIds.length} 张图片。`)
+    const failedCount = result.failedRequests?.length ?? 0
+    const completionMessage = failedCount > 0
+      ? `生成完成：成功 ${outputIds.length} 张，失败 ${failedCount} 张`
+      : `生成完成，共 ${outputIds.length} 张图片`
+    useStore.getState().showToast(completionMessage, failedCount > 0 ? 'error' : 'success')
+    if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `${completionMessage}。`)
     const currentMask = useStore.getState().maskDraft
     if (
       maskDataUrl &&
@@ -5251,13 +5365,15 @@ export async function retryTask(task: TaskRecord) {
   const taskParams = shouldUseTransparentOutput
     ? getTransparentRequestParams(normalizedParams)
     : { ...normalizedParams, transparent_output: false }
+  const styledPrompt = applyPromptStylePreset(task.prompt.trim(), task.promptStylePresetId)
   const transparentMeta = taskParams.transparent_output
-    ? createTransparentOutputMeta(task.prompt.trim())
+    ? createTransparentOutputMeta(styledPrompt)
     : null
   const taskId = genId()
   const newTask: TaskRecord = {
     id: taskId,
     prompt: task.prompt,
+    promptStylePresetId: normalizePromptStylePresetId(task.promptStylePresetId),
     params: taskParams,
     apiProvider: activeProfile.provider,
     apiProfileId: activeProfile.id,
@@ -5289,7 +5405,7 @@ export async function retryTask(task: TaskRecord) {
 
 /** 复用配置 */
 export async function reuseConfig(task: TaskRecord) {
-  const { settings, setPrompt, setParams, setInputImages, setMaskDraft, clearMaskDraft, showToast, setConfirmDialog, setReusedTaskApiProfile } = useStore.getState()
+  const { settings, setPrompt, setPromptStylePresetId, setParams, setInputImages, setMaskDraft, clearMaskDraft, showToast, setConfirmDialog, setReusedTaskApiProfile } = useStore.getState()
   const normalizedSettings = normalizeSettings(settings)
   const currentProfile = getActiveApiProfile(settings)
   const matchedProfile = normalizedSettings.reuseTaskApiProfileTemporarily ? getTaskApiProfile(normalizedSettings, task) : null
@@ -5316,6 +5432,7 @@ export async function reuseConfig(task: TaskRecord) {
   }
   setInputImages(imgs)
   setPrompt(task.prompt)
+  setPromptStylePresetId(normalizePromptStylePresetId(task.promptStylePresetId))
   const maskTargetImageId = task.maskTargetImageId ?? (task.maskImageId ? task.inputImageIds[0] : null)
   if (maskTargetImageId && task.maskImageId && imgs.some((img) => img.id === maskTargetImageId)) {
     const maskDataUrl = await ensureImageCached(task.maskImageId)
@@ -5371,7 +5488,7 @@ export async function editOutputs(task: TaskRecord) {
 
 /** 删除多条任务 */
 export async function removeMultipleTasks(taskIds: string[]) {
-  const { tasks, setTasks, inputImages, galleryInputDraft, showToast, clearSelection, selectedTaskIds } = useStore.getState()
+  const { tasks, setTasks, inputImages, galleryInputDraft, showToast, selectedTaskIds } = useStore.getState()
   
   if (!taskIds.length) return
 
@@ -5422,12 +5539,27 @@ export async function removeMultipleTasks(taskIds: string[]) {
 /** 删除所有失败任务，可传入筛选后的任务 id 集合 */
 export async function clearFailedTasks(taskIds?: string[]) {
   const targetTaskIds = taskIds ? new Set(taskIds) : null
-  const failedTaskIds = useStore.getState().tasks
-    .filter((task) => task.status === 'error' && (!targetTaskIds || targetTaskIds.has(task.id)))
+  const failedTasks = useStore.getState().tasks
+    .filter((task) => taskMatchesFilterStatus(task, 'error') && (!targetTaskIds || targetTaskIds.has(task.id)))
+  const failedTaskIds = failedTasks
+    .filter((task) => task.status === 'error')
     .map((task) => task.id)
+  const partialFailedTaskIds = new Set(
+    failedTasks
+      .filter((task) => task.status !== 'error' && taskHasOutputErrors(task))
+      .map((task) => task.id),
+  )
 
-  if (!failedTaskIds.length) return
-  await removeMultipleTasks(failedTaskIds)
+  if (failedTaskIds.length) await removeMultipleTasks(failedTaskIds)
+  if (partialFailedTaskIds.size) {
+    const { tasks, setTasks, selectedTaskIds, setSelectedTaskIds, showToast } = useStore.getState()
+    const updated = tasks.map((task) => partialFailedTaskIds.has(task.id) ? { ...task, outputErrors: undefined } : task)
+    setTasks(updated)
+    const nextSelectedTaskIds = selectedTaskIds.filter((id) => !partialFailedTaskIds.has(id))
+    if (nextSelectedTaskIds.length !== selectedTaskIds.length) setSelectedTaskIds(nextSelectedTaskIds)
+    await Promise.all(updated.filter((task) => partialFailedTaskIds.has(task.id)).map((task) => putTask(task)))
+    showToast(`已清除 ${partialFailedTaskIds.size} 条部分失败记录`, 'success')
+  }
 }
 
 /** 删除单条任务 */
@@ -5504,7 +5636,7 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
   }
 
   if (options.clearConfig) {
-    useStore.setState({ dismissedCodexCliPrompts: [], supportPromptDismissed: false })
+    useStore.setState({ dismissedCodexCliPrompts: [], promptStylePresetId: '', supportPromptDismissed: false })
     setSettings({ ...DEFAULT_SETTINGS })
     setParams({ ...DEFAULT_PARAMS })
   }

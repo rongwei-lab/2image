@@ -1,9 +1,11 @@
 import { useRef, useEffect, useCallback, useState, useMemo, useLayoutEffect, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { ALL_FAVORITES_COLLECTION_ID, deleteFavoriteCollection, getTaskFavoriteCollectionIds, useStore, submitTask, submitAgentMessage, stopAgentResponse, addImageFromFile, createInputImageFromFile, deleteImageIfUnreferenced, removeMultipleTasks, getCachedImage, ensureImageCached, getActiveAgentRounds } from '../store'
+import { ALL_FAVORITES_COLLECTION_ID, deleteFavoriteCollection, getTaskFavoriteCollectionIds, useStore, submitTask, submitAgentMessage, stopAgentResponse, addImageFromFile, createInputImageFromFile, deleteImageIfUnreferenced, removeMultipleTasks, getCachedImage, ensureImageCached, getActiveAgentRounds, taskMatchesFilterStatus, taskMatchesSearchQuery } from '../store'
 import { DEFAULT_PARAMS, type TaskRecord } from '../types'
 import { getActiveApiProfile, normalizeSettings } from '../lib/apiProfiles'
 import { DEFAULT_FAL_IMAGE_SIZE, getChangedParams, getOutputImageLimitForSettings, normalizeParamsForSettings } from '../lib/paramCompatibility'
+import { getPlatformManagedTaskParams } from '../lib/platformSettings'
+import { PROMPT_STYLE_PRESETS } from '../lib/promptStyles'
 import { getAtImageQuery, getImageMentionLabel, getPromptIndexFromVisibleIndex, getPromptMentionParts, getSelectedImageMentionLabel, getSelectedTextMentionLabel, imageMentionMatches, insertImageMentionAtVisibleRange, insertTextMentionAtVisibleRange, isCursorInSelectedImageMention, stripImageMentionMarkers } from '../lib/promptImageMentions'
 import { normalizeImageSize } from '../lib/size'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
@@ -432,6 +434,8 @@ export default function InputBar() {
   const prompt = useStore((s) => s.prompt)
   const appMode = useStore((s) => s.appMode)
   const setPrompt = useStore((s) => s.setPrompt)
+  const promptStylePresetId = useStore((s) => s.promptStylePresetId)
+  const setPromptStylePresetId = useStore((s) => s.setPromptStylePresetId)
   const inputImages = useStore((s) => s.inputImages)
   const addInputImage = useStore((s) => s.addInputImage)
   const replaceInputImage = useStore((s) => s.replaceInputImage)
@@ -475,13 +479,8 @@ export default function InputBar() {
         if (!t.isFavorite) return false
         if (activeFavoriteCollectionId && activeFavoriteCollectionId !== ALL_FAVORITES_COLLECTION_ID && !getTaskFavoriteCollectionIds(t).includes(activeFavoriteCollectionId)) return false
       }
-      const matchStatus = filterStatus === 'all' || t.status === filterStatus
-      if (!matchStatus) return false
-      
-      if (!q) return true
-      const prompt = (t.prompt || '').toLowerCase()
-      const paramStr = JSON.stringify(t.params).toLowerCase()
-      return prompt.includes(q) || paramStr.includes(q)
+      if (!taskMatchesFilterStatus(t, filterStatus)) return false
+      return taskMatchesSearchQuery(t, q)
     })
   }, [tasks, searchQuery, filterStatus, filterFavorite, activeFavoriteCollectionId])
 
@@ -662,7 +661,6 @@ export default function InputBar() {
   }, [clearFavoriteCollectionSelection, favoriteCollections, selectedFavoriteCollectionIds, setConfirmDialog, showToast, tasks])
 
   const maskDraft = useStore((s) => s.maskDraft)
-  const clearMaskDraft = useStore((s) => s.clearMaskDraft)
   const setMaskEditorImageId = useStore((s) => s.setMaskEditorImageId)
   const moveInputImage = useStore((s) => s.moveInputImage)
 
@@ -746,6 +744,7 @@ export default function InputBar() {
 
   const currentActiveProfile = useMemo(() => getActiveApiProfile(settings), [settings])
   const platformApiManaged = platformSettings?.api.managed === true
+  const platformManagedParams = useMemo(() => getPlatformManagedTaskParams(platformSettings), [platformSettings])
   const platformActiveProfile = useMemo(() => (
     platformApiManaged ? getActiveApiProfile(platformSettings.api.settings) : null
   ), [platformApiManaged, platformSettings])
@@ -1019,12 +1018,13 @@ export default function InputBar() {
   }, [agentAutoImageCount, params.n])
 
   useEffect(() => {
-    const normalizedParams = normalizeParamsForSettings(params, effectiveSettings, { hasInputImages: inputImages.length > 0 })
+    const sourceParams = platformManagedParams ?? params
+    const normalizedParams = normalizeParamsForSettings(sourceParams, effectiveSettings, { hasInputImages: inputImages.length > 0 })
     const patch = getChangedParams(params, normalizedParams)
     if (Object.keys(patch).length) {
       setParams(patch)
     }
-  }, [inputImages.length, params, effectiveSettings, setParams])
+  }, [inputImages.length, params, effectiveSettings, platformManagedParams, setParams])
 
   useEffect(() => () => {
     if (imageHintTimerRef.current != null) {
@@ -2204,6 +2204,21 @@ export default function InputBar() {
     </div>
   )
 
+  const renderStylePreset = () => (
+    <label className="flex min-w-[9rem] flex-col gap-0.5 text-xs">
+      <span className="text-gray-400 dark:text-gray-500 ml-1">风格</span>
+      <Select
+        value={promptStylePresetId}
+        onChange={(value) => setPromptStylePresetId(value)}
+        options={[
+          { label: '无风格', value: '' },
+          ...PROMPT_STYLE_PRESETS.map((preset) => ({ label: preset.label, value: preset.id })),
+        ]}
+        className={selectClass}
+      />
+    </label>
+  )
+
   const showFavoriteCollectionBatchBar = inCollectionOverview && selectedFavoriteCollectionIds.length > 0
   const showTaskBatchBar = !showFavoriteCollectionBatchBar && selectedTaskIds.length > 0
 
@@ -2518,7 +2533,14 @@ export default function InputBar() {
           <div className="mt-3">
             {/* 桌面端布局 */}
             <div className="hidden sm:flex items-end justify-between gap-3">
-              {renderParams('grid-cols-6')}
+              {platformManagedParams ? (
+                <div className="flex flex-1 items-end justify-end">{renderStylePreset()}</div>
+              ) : (
+                <div className="flex flex-1 items-end gap-2">
+                  {renderStylePreset()}
+                  {renderParams('grid-cols-6')}
+                </div>
+              )}
 
               <div className="flex gap-2 flex-shrink-0 mb-0.5">
                 <div
@@ -2576,7 +2598,14 @@ export default function InputBar() {
             <div className="sm:hidden flex flex-col gap-2">
               <div className={`collapse-section${mobileCollapsed ? ' collapsed' : ''}`}>
                 <div className="collapse-inner">
-                  {renderParams('grid-cols-2')}
+                  {platformManagedParams ? (
+                    renderStylePreset()
+                  ) : (
+                    <div className="space-y-2">
+                      {renderStylePreset()}
+                      {renderParams('grid-cols-2')}
+                    </div>
+                  )}
                   <div className="h-2" />
                 </div>
               </div>

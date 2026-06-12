@@ -30,9 +30,9 @@ import {
   type CloudAdminUser,
   type CloudAdminUserDetail,
 } from '../lib/cloudApi'
-import { DEFAULT_SETTINGS, normalizeSettings, normalizeStreamPartialImages } from '../lib/apiProfiles'
+import { DEFAULT_IMAGES_MODEL, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings, normalizeStreamPartialImages } from '../lib/apiProfiles'
 import { applyPlatformSettingsToAppSettings } from '../lib/platformSettings'
-import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, type ZipDownloadRoute } from '../types'
+import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_PARAMS, type TaskParams, type ZipDownloadRoute } from '../types'
 import { useStore } from '../store'
 import { CloseIcon, PlusIcon, RefreshIcon, TrashIcon } from './icons'
 
@@ -205,6 +205,10 @@ function createFallbackPlatformSettings(): CloudPlatformSettings {
     registration: {
       requireApproval: true,
     },
+    params: {
+      managed: false,
+      defaults: { ...DEFAULT_PARAMS },
+    },
     api: {
       managed: false,
       allowUserProfiles: true,
@@ -219,6 +223,41 @@ function createFallbackPlatformSettings(): CloudPlatformSettings {
       zipDownloadRoutes: DEFAULT_SETTINGS.zipDownloadRoutes,
     },
     updatedAt: null,
+  }
+}
+
+function migrateFalProfileToOpenAICompatible(profile: CloudPlatformSettings['api']['settings']['profiles'][number]) {
+  const apiMode = profile.apiMode === 'responses' ? 'responses' : 'images'
+  return {
+    ...profile,
+    provider: 'openai',
+    baseUrl: DEFAULT_SETTINGS.baseUrl,
+    model: apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL,
+    apiMode,
+    codexCli: false,
+    apiProxy: DEFAULT_SETTINGS.apiProxy,
+    responseFormatB64Json: undefined,
+    streamImages: DEFAULT_SETTINGS.streamImages,
+    streamPartialImages: DEFAULT_SETTINGS.streamPartialImages,
+  }
+}
+
+function removeFalFromPlatformSettings(settings: CloudPlatformSettings): CloudPlatformSettings {
+  const apiSettings = normalizeSettings(settings.api.settings)
+  const nextApiSettings = normalizeSettings({
+    ...apiSettings,
+    // fal.ai 不再作为后台可选服务商；旧配置迁移为 OpenAI 兼容接口，避免隐藏选项继续被保存。
+    providerOrder: apiSettings.providerOrder?.filter((provider) => provider !== 'fal'),
+    profiles: apiSettings.profiles.map((profile) =>
+      profile.provider === 'fal' ? migrateFalProfileToOpenAICompatible(profile) : profile,
+    ),
+  })
+  return {
+    ...settings,
+    api: {
+      ...settings.api,
+      settings: nextApiSettings,
+    },
   }
 }
 
@@ -1056,10 +1095,11 @@ export default function AdminPage() {
     if (!canManage) return
     try {
       const next = await getCloudAdminPlatformSettings()
-      setPlatformSettings(next)
-      setPlatformDraft(next)
-      syncPlatformSettingsToWorkbench(next)
-      setPlatformCustomProvidersJson(JSON.stringify(next.api.settings.customProviders, null, 2))
+      const visibleSettings = removeFalFromPlatformSettings(next)
+      setPlatformSettings(visibleSettings)
+      setPlatformDraft(visibleSettings)
+      syncPlatformSettingsToWorkbench(visibleSettings)
+      setPlatformCustomProvidersJson(JSON.stringify(visibleSettings.api.settings.customProviders, null, 2))
       setPlatformTestResult(null)
     } catch (error) {
       showToast(error instanceof Error ? error.message : String(error), 'error')
@@ -1119,7 +1159,6 @@ export default function AdminPage() {
     const customOptions = platformApiSettings?.customProviders.map((provider) => ({ value: provider.id, label: provider.name })) ?? []
     return [
       { value: 'openai', label: 'OpenAI' },
-      { value: 'fal', label: 'fal.ai' },
       ...customOptions,
     ]
   }, [platformApiSettings])
@@ -1400,8 +1439,21 @@ export default function AdminPage() {
     })
   }
 
+  const updatePlatformParams = (patch: Partial<TaskParams>) => {
+    updatePlatformDraft((current) => ({
+      ...current,
+      params: {
+        ...current.params,
+        defaults: {
+          ...current.params.defaults,
+          ...patch,
+        },
+      },
+    }))
+  }
+
   const buildPlatformDraftForSubmit = (): CloudPlatformSettings | null => {
-    const draft = platformDraft ?? createFallbackPlatformSettings()
+    const draft = removeFalFromPlatformSettings(platformDraft ?? createFallbackPlatformSettings())
     let customProviders: unknown
     try {
       customProviders = JSON.parse(platformCustomProvidersJson.trim() || '[]')
@@ -1418,8 +1470,20 @@ export default function AdminPage() {
       ...draft.api.settings,
       customProviders,
     })
+    const normalizedCompression = draft.params.defaults.output_compression == null
+      ? null
+      : Math.min(100, Math.max(0, Math.trunc(Number(draft.params.defaults.output_compression) || 0)))
     const nextDraft = {
       ...draft,
+      params: {
+        ...draft.params,
+        defaults: {
+          ...draft.params.defaults,
+          output_compression: draft.params.defaults.output_format === 'png' ? null : normalizedCompression,
+          n: Math.min(10, Math.max(1, Math.trunc(Number(draft.params.defaults.n) || DEFAULT_PARAMS.n))),
+          transparent_output: draft.params.defaults.output_format === 'png' && Boolean(draft.params.defaults.transparent_output),
+        },
+      },
       api: {
         ...draft.api,
         settings: nextSettings,
@@ -2221,6 +2285,114 @@ export default function AdminPage() {
                             Codex CLI 兼容
                           </label>
                         )}
+                      </div>
+
+                      <div className="rounded-lg border border-gray-100 p-4 dark:border-white/[0.06]">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <h3 className="text-xs font-semibold text-gray-500">生成参数策略</h3>
+                            <p className="mt-1 text-xs text-gray-500">
+                              开启后，前台隐藏个人参数控件，提交任务时由服务端强制使用这里的默认参数。
+                            </p>
+                          </div>
+                          <label className="inline-flex items-center gap-2 text-sm">
+                            <input
+                              type="checkbox"
+                              checked={platformDraft.params.managed}
+                              onChange={(event) => updatePlatformDraft((current) => ({
+                                ...current,
+                                params: { ...current.params, managed: event.target.checked },
+                              }))}
+                            />
+                            后台接管生成参数
+                          </label>
+                        </div>
+                        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                          <label className="block text-xs text-gray-500">
+                            尺寸
+                            <input
+                              value={platformDraft.params.defaults.size}
+                              onChange={(event) => updatePlatformParams({ size: event.target.value })}
+                              placeholder="auto 或 1024x1024"
+                              className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
+                            />
+                          </label>
+                          <label className="block text-xs text-gray-500">
+                            质量
+                            <select
+                              value={platformDraft.params.defaults.quality}
+                              onChange={(event) => updatePlatformParams({ quality: event.target.value as TaskParams['quality'] })}
+                              className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
+                            >
+                              <option value="auto">auto</option>
+                              <option value="low">low</option>
+                              <option value="medium">medium</option>
+                              <option value="high">high</option>
+                            </select>
+                          </label>
+                          <label className="block text-xs text-gray-500">
+                            格式
+                            <select
+                              value={platformDraft.params.defaults.output_format}
+                              onChange={(event) => updatePlatformParams({
+                                output_format: event.target.value as TaskParams['output_format'],
+                                ...(event.target.value === 'png' ? { output_compression: null } : { transparent_output: false }),
+                              })}
+                              className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
+                            >
+                              <option value="png">PNG</option>
+                              <option value="jpeg">JPEG</option>
+                              <option value="webp">WebP</option>
+                            </select>
+                          </label>
+                          <label className="block text-xs text-gray-500">
+                            压缩率
+                            <input
+                              value={platformDraft.params.defaults.output_compression ?? ''}
+                              onChange={(event) => updatePlatformParams({
+                                output_compression: event.target.value.trim() === '' ? null : Number(event.target.value),
+                              })}
+                              disabled={platformDraft.params.defaults.output_format === 'png'}
+                              type="number"
+                              min={0}
+                              max={100}
+                              placeholder="0-100"
+                              className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 disabled:bg-gray-100 disabled:text-gray-400 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100 dark:disabled:bg-white/[0.04]"
+                            />
+                          </label>
+                          <label className="block text-xs text-gray-500">
+                            审核
+                            <select
+                              value={platformDraft.params.defaults.moderation}
+                              onChange={(event) => updatePlatformParams({ moderation: event.target.value as TaskParams['moderation'] })}
+                              className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
+                            >
+                              <option value="auto">auto</option>
+                              <option value="low">low</option>
+                            </select>
+                          </label>
+                          <label className="block text-xs text-gray-500">
+                            数量
+                            <input
+                              value={platformDraft.params.defaults.n}
+                              onChange={(event) => updatePlatformParams({ n: Number(event.target.value) || DEFAULT_PARAMS.n })}
+                              type="number"
+                              min={1}
+                              max={10}
+                              className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
+                            />
+                          </label>
+                          {platformDraft.params.defaults.output_format === 'png' && (
+                            <label className="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                              <input
+                                type="checkbox"
+                                checked={platformDraft.params.defaults.transparent_output}
+                                onChange={(event) => updatePlatformParams({ transparent_output: event.target.checked, output_compression: null })}
+                              />
+                              透明背景后处理
+                            </label>
+                          )}
+                        </div>
                       </div>
 
                       <div className="rounded-lg border border-gray-100 p-4 dark:border-white/[0.06]">

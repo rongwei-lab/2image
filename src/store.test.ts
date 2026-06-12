@@ -97,7 +97,11 @@ vi.mock('./lib/agentApi', () => ({
 }))
 import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllTasks, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
-import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markExpiredOpenAIRunningTasks, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
+import { callImageApi } from './lib/api'
+import { getFalQueuedImageResult } from './lib/falAiImageApi'
+import { getPromptStylePreset } from './lib/promptStyles'
+import { removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
+import { cleanStaleAgentInputDrafts, clearFailedTasks, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markExpiredOpenAIRunningTasks, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
@@ -214,6 +218,7 @@ describe('mask draft lifecycle in store actions', () => {
     useStore.setState({
       settings: { ...DEFAULT_SETTINGS, apiKey: 'test-key' },
       prompt: 'prompt',
+      promptStylePresetId: '',
       inputImages: [],
       maskDraft: null,
       maskEditorImageId: null,
@@ -270,6 +275,22 @@ describe('mask draft lifecycle in store actions', () => {
     expect(state.prompt).toBe('prompt')
     expect(state.taskScrollTargetId).toBe(state.tasks[0]?.id)
     expect(state.showToast).toHaveBeenCalledWith('任务已提交', 'success')
+  })
+
+  it('appends the selected style preset only to the API prompt', async () => {
+    const cinematic = getPromptStylePreset('cinematic')
+    useStore.setState({ promptStylePresetId: 'cinematic' })
+    vi.mocked(callImageApi).mockClear()
+
+    await submitTask()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    const state = useStore.getState()
+    expect(state.tasks[0]).toMatchObject({
+      prompt: 'prompt',
+      promptStylePresetId: 'cinematic',
+    })
+    expect(vi.mocked(callImageApi).mock.calls[0]?.[0].prompt).toContain(cinematic?.value)
   })
 
   it('clears prompt and references after submit when the setting is enabled', async () => {
@@ -1536,9 +1557,56 @@ describe('agent task lifecycle', () => {
     const failedTask = useStore.getState().tasks.find((item) => item.agentToolCallId === 'tool-empty')
     expect(failedTask).toMatchObject({
       status: 'error',
-      error: 'Agent 回复已结束，但图像工具未返回最终图片',
+      prompt: '生成一张图',
+      error: 'Agent 已调用图像工具，但上游未返回最终图片。上游回复：已处理',
       sourceMode: 'agent',
     })
+  })
+
+  it('matches partial failures in failed filters and searches error text', () => {
+    const partial = task({
+      id: 'partial-task',
+      status: 'done',
+      outputImages: ['done-image-a', 'done-image-b'],
+      outputErrors: [{ requestIndex: 2, error: 'Failed to fetch' }],
+    })
+
+    expect(taskMatchesFilterStatus(partial, 'error')).toBe(true)
+    expect(taskMatchesFilterStatus(partial, 'done')).toBe(true)
+    expect(taskMatchesSearchQuery(partial, 'failed to fetch')).toBe(true)
+  })
+
+  it('clears partial failure markers without deleting successful outputs', async () => {
+    const partial = task({
+      id: 'partial-task',
+      status: 'done',
+      outputImages: ['done-image-a'],
+      outputErrors: [{ requestIndex: 1, error: 'Failed to fetch' }],
+    })
+    useStore.setState({ tasks: [partial], selectedTaskIds: ['partial-task'], showToast: vi.fn() })
+
+    await clearFailedTasks(['partial-task'])
+
+    const state = useStore.getState()
+    expect(state.tasks).toHaveLength(1)
+    expect(state.tasks[0]).toMatchObject({ id: 'partial-task', outputImages: ['done-image-a'], outputErrors: undefined })
+    expect(state.selectedTaskIds).toEqual([])
+    expect(state.showToast).toHaveBeenCalledWith('已清除 1 条部分失败记录', 'success')
+  })
+
+  it('keeps failed tasks created after the cleanup snapshot', async () => {
+    const failedAtConfirmOpen = task({ id: 'failed-at-confirm-open', status: 'error', error: '生成失败' })
+    const failedAfterConfirmOpen = task({ id: 'failed-after-confirm-open', status: 'error', error: '生成失败' })
+    useStore.setState({ tasks: [failedAtConfirmOpen] })
+    const failedTaskIds = useStore.getState().tasks
+      .filter((item) => item.status === 'error')
+      .map((item) => item.id)
+    useStore.setState({ tasks: [failedAtConfirmOpen, failedAfterConfirmOpen] })
+
+    await clearFailedTasks(failedTaskIds)
+
+    const state = useStore.getState()
+    expect(state.tasks.map((item) => item.id)).toEqual(['failed-after-confirm-open'])
   })
 
   it('marks expired cloud OpenAI running tasks failed by their API profile timeout', () => {
@@ -1577,6 +1645,132 @@ describe('agent task lifecycle', () => {
       finishedAt: 1_000 + (responsesProfile.timeout * 1000) + 1,
     })
     expect(result.tasks[1]).toMatchObject({ id: freshTask.id, status: 'running' })
+  })
+})
+
+describe('agent built-in image tool failure', () => {
+  const responsesProfile = createDefaultOpenAIProfile({
+    id: 'responses-profile',
+    apiKey: 'test-key',
+    apiMode: 'responses',
+    model: DEFAULT_RESPONSES_MODEL,
+    streamImages: true,
+  })
+
+  beforeEach(async () => {
+    await clearTasks()
+    await clearImages()
+    await clearAgentConversations()
+    vi.mocked(callAgentResponsesApi).mockClear()
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        apiKey: 'test-key',
+        apiMode: 'responses',
+        model: DEFAULT_RESPONSES_MODEL,
+        streamImages: true,
+        profiles: [responsesProfile],
+        activeProfileId: responsesProfile.id,
+      }),
+      prompt: '画一张图',
+      inputImages: [],
+      maskDraft: null,
+      params: { ...DEFAULT_PARAMS },
+      appMode: 'agent',
+      tasks: [],
+      streamPreviews: {},
+      streamPreviewSlots: {},
+      agentConversations: [agentConversation({
+        id: 'conversation-a',
+        activeRoundId: null,
+        rounds: [],
+        messages: [],
+      })],
+      activeAgentConversationId: 'conversation-a',
+      agentEditingRoundId: null,
+      showToast: vi.fn(),
+    })
+  })
+
+  it('marks a started built-in image task as error when the stream fails', async () => {
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-fail' })
+      await opts.onImagePartialImage?.({
+        toolCallId: 'ig-fail',
+        image: 'data:image/png;base64,cGFydGlhbA==',
+        partialImageIndex: 0,
+      })
+      throw new Error('image_generation failed')
+    })
+
+    await submitAgentMessage()
+    for (let i = 0; i < 10 && useStore.getState().tasks[0]?.status !== 'error'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const state = useStore.getState()
+    const failedTask = state.tasks[0]
+    expect(failedTask).toMatchObject({
+      status: 'error',
+      error: 'image_generation failed',
+      agentToolCallId: 'ig-fail',
+      sourceMode: 'agent',
+    })
+    expect(state.streamPreviews[failedTask.id]).toBeUndefined()
+    expect(state.streamPreviewSlots[failedTask.id]).toBeUndefined()
+
+    const round = state.agentConversations[0].rounds[0]
+    expect(round).toMatchObject({
+      status: 'error',
+      error: 'image_generation failed',
+      outputTaskIds: [failedTask.id],
+    })
+  })
+
+  it('marks a failed built-in image task as error while the Agent stream continues', async () => {
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-fail' })
+      await opts.onImagePartialImage?.({
+        toolCallId: 'ig-fail',
+        image: 'data:image/png;base64,cGFydGlhbA==',
+        partialImageIndex: 0,
+      })
+      await opts.onImageToolFailed?.({ toolCallId: 'ig-fail', error: 'safety rejected' })
+      opts.onTextDelta?.('图片失败，但回复继续。')
+      return {
+        text: '图片失败，但回复继续。',
+        images: [],
+        outputItems: [{ type: 'message', content: [{ type: 'output_text', text: '图片失败，但回复继续。' }] }],
+        responseId: 'response-continued',
+      }
+    })
+
+    await submitAgentMessage()
+    for (let i = 0; i < 10 && useStore.getState().agentConversations[0].rounds[0]?.status !== 'done'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const state = useStore.getState()
+    const failedTask = state.tasks[0]
+    expect(failedTask).toMatchObject({
+      status: 'error',
+      error: 'safety rejected',
+      agentToolCallId: 'ig-fail',
+      sourceMode: 'agent',
+    })
+    expect(state.streamPreviews[failedTask.id]).toBeUndefined()
+    expect(state.streamPreviewSlots[failedTask.id]).toBeUndefined()
+
+    const round = state.agentConversations[0].rounds[0]
+    expect(round).toMatchObject({
+      status: 'done',
+      error: null,
+      outputTaskIds: [failedTask.id],
+    })
+    expect(state.agentConversations[0].messages.find((message) => message.role === 'assistant')).toMatchObject({
+      content: '图片失败，但回复继续。',
+      outputTaskIds: [failedTask.id],
+    })
   })
 })
 

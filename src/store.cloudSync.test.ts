@@ -43,6 +43,7 @@ describe('cloud settings sync', () => {
       cloudSyncing: false,
       settings: { ...DEFAULT_SETTINGS },
       params: { ...DEFAULT_PARAMS },
+      promptStylePresetId: '',
       appMode: 'gallery',
       prompt: '',
       inputImages: [],

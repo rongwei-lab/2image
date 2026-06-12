@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_SETTINGS, normalizeSettings } from './apiProfiles'
 import { applyPlatformSettingsToAppSettings, normalizePlatformSettings } from './platformSettings'
+import { DEFAULT_PARAMS } from '../types'
 
 describe('platform settings', () => {
   it('为旧版平台配置补齐默认 ZIP 下载入口', () => {
@@ -17,6 +18,10 @@ describe('platform settings', () => {
 
     const applied = applyPlatformSettingsToAppSettings(localSettings, {
       registration: { requireApproval: true },
+      params: {
+        managed: false,
+        defaults: DEFAULT_PARAMS,
+      },
       api: {
         managed: false,
         allowUserProfiles: true,

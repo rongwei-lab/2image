@@ -140,6 +140,7 @@ export interface CloudPlatformTestResult {
 export interface CloudSettingsSnapshot {
   settings: AppSettings
   params: TaskParams
+  promptStylePresetId?: string
   activeAgentConversationId: string | null
   appMode: AppMode
   agentSidebarCollapsed: boolean
