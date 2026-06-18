@@ -49,6 +49,7 @@ type SseEvent =
   | { type: 'image_tool_started'; event: { toolCallId: string; outputIndex?: number } }
   | { type: 'image_partial_image'; event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number } }
   | { type: 'image_tool_completed'; image: AgentApiResultImage }
+  | { type: 'image_tool_failed'; event: { toolCallId: string; error: string } }
   | { type: 'batch_image_started' }
   | { type: 'batch_partial_image'; event: { image: string; partialImageIndex?: number } }
   | { type: 'batch_image_completed'; image: AgentApiResultImage }
@@ -2977,6 +2978,9 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
         onImageToolStarted: (event) => writeSse(reply, { type: 'image_tool_started', event }),
         onImagePartialImage: (event) => writeSse(reply, { type: 'image_partial_image', event }),
         onImageToolCompleted: (image) => writeSse(reply, { type: 'image_tool_completed', image }),
+        // 云端模式需要把内置图片工具的结构化失败也转给前端；
+        // 否则前端已创建的 running 任务收不到失败事件，会一直停在加载态。
+        onImageToolFailed: (event) => writeSse(reply, { type: 'image_tool_failed', event }),
       })
       writeSse(reply, { type: 'done', result })
     } catch (error) {

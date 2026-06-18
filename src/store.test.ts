@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { strToU8, zipSync } from 'fflate'
 import { DEFAULT_PARAMS } from './types'
 import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings } from './lib/apiProfiles'
@@ -103,8 +103,38 @@ vi.mock('./lib/agentApi', () => ({
     }
   }),
 }))
+vi.mock('./lib/cloudApi', () => ({
+  callCloudAgentConversationTitleApi: vi.fn(async () => '标题'),
+  callCloudAgentResponsesApi: vi.fn(() => new Promise(() => {})),
+  callCloudBatchImageSingle: vi.fn(),
+  clearCloudData: vi.fn(),
+  createCloudTask: vi.fn(),
+  deleteCloudImage: vi.fn(),
+  deleteCloudTask: vi.fn(),
+  getCloudAgentConversations: vi.fn(async () => []),
+  getCloudImageDataUrl: vi.fn(),
+  getCloudImageThumbnail: vi.fn(),
+  getCloudSettings: vi.fn(async () => null),
+  getCloudTasks: vi.fn(async () => []),
+  getCurrentUser: vi.fn(async () => null),
+  getPlatformSettings: vi.fn(async () => null),
+  loginCloud: vi.fn(),
+  logoutCloud: vi.fn(),
+  patchCloudTask: vi.fn(),
+  saveCloudAgentConversations: vi.fn(),
+  saveCloudSettings: vi.fn(async (snapshot: unknown) => snapshot),
+  subscribeCloudTask: vi.fn(),
+  uploadCloudImage: vi.fn(async (image: { id: string; width?: number; height?: number }) => ({
+    id: image.id,
+    source: 'generated',
+    width: image.width,
+    height: image.height,
+  })),
+  uploadCloudImageThumbnail: vi.fn(),
+}))
 import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllTasks, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
+import { callCloudAgentResponsesApi } from './lib/cloudApi'
 import { callImageApi } from './lib/api'
 import { getFalQueuedImageResult } from './lib/falAiImageApi'
 import { getPromptStylePreset } from './lib/promptStyles'
@@ -1718,6 +1748,7 @@ describe('agent built-in image tool failure', () => {
     await clearImages()
     await clearAgentConversations()
     vi.mocked(callAgentResponsesApi).mockClear()
+    vi.mocked(callCloudAgentResponsesApi).mockClear()
     useStore.setState({
       settings: normalizeSettings({
         ...DEFAULT_SETTINGS,
@@ -1744,8 +1775,13 @@ describe('agent built-in image tool failure', () => {
       })],
       activeAgentConversationId: 'conversation-a',
       agentEditingRoundId: null,
+      cloudUser: null,
       showToast: vi.fn(),
     })
+  })
+
+  afterEach(() => {
+    useStore.setState({ cloudUser: null })
   })
 
   it('marks a started built-in image task as error when the stream fails', async () => {
@@ -1825,6 +1861,54 @@ describe('agent built-in image tool failure', () => {
     })
     expect(state.agentConversations[0].messages.find((message) => message.role === 'assistant')).toMatchObject({
       content: '图片失败，但回复继续。',
+      outputTaskIds: [failedTask.id],
+    })
+  })
+
+  it('marks a failed cloud built-in image task as error while the Agent stream continues', async () => {
+    vi.mocked(callCloudAgentResponsesApi).mockImplementationOnce(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-cloud-fail' })
+      await opts.onImagePartialImage?.({
+        toolCallId: 'ig-cloud-fail',
+        image: 'data:image/png;base64,Y2xvdWQtcGFydGlhbA==',
+        partialImageIndex: 0,
+      })
+      await opts.onImageToolFailed?.({ toolCallId: 'ig-cloud-fail', error: 'cloud safety rejected' })
+      opts.onTextDelta?.('云端图片失败，但回复继续。')
+      return {
+        text: '云端图片失败，但回复继续。',
+        images: [],
+        outputItems: [{ type: 'message', content: [{ type: 'output_text', text: '云端图片失败，但回复继续。' }] }],
+        responseId: 'cloud-response-continued',
+      }
+    })
+    useStore.setState({ cloudUser: { id: 'cloud-user', email: 'cloud@example.com' } })
+
+    await submitAgentMessage()
+    for (let i = 0; i < 10 && useStore.getState().agentConversations[0].rounds[0]?.status !== 'done'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const state = useStore.getState()
+    const failedTask = state.tasks[0]
+    expect(failedTask).toMatchObject({
+      status: 'error',
+      error: 'cloud safety rejected',
+      agentToolCallId: 'ig-cloud-fail',
+      sourceMode: 'agent',
+    })
+    expect(state.streamPreviews[failedTask.id]).toBeUndefined()
+    expect(state.streamPreviewSlots[failedTask.id]).toBeUndefined()
+    expect(callAgentResponsesApi).not.toHaveBeenCalled()
+
+    const round = state.agentConversations[0].rounds[0]
+    expect(round).toMatchObject({
+      status: 'done',
+      error: null,
+      outputTaskIds: [failedTask.id],
+    })
+    expect(state.agentConversations[0].messages.find((message) => message.role === 'assistant')).toMatchObject({
+      content: '云端图片失败，但回复继续。',
       outputTaskIds: [failedTask.id],
     })
   })

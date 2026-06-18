@@ -187,6 +187,7 @@ type CloudAgentEvent =
   | { type: 'image_tool_started'; event: { toolCallId: string; outputIndex?: number } }
   | { type: 'image_partial_image'; event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number } }
   | { type: 'image_tool_completed'; image: AgentApiResultImage }
+  | { type: 'image_tool_failed'; event: { toolCallId: string; error: string } }
   | { type: 'batch_image_started' }
   | { type: 'batch_partial_image'; event: { image: string; partialImageIndex?: number } }
   | { type: 'batch_image_completed'; image: AgentApiResultImage }
@@ -607,6 +608,7 @@ export async function callCloudAgentResponsesApi(opts: {
   onImageToolStarted?: (event: { toolCallId: string; outputIndex?: number }) => void | Promise<void>
   onImagePartialImage?: (event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number }) => void | Promise<void>
   onImageToolCompleted?: (image: AgentApiResultImage) => void | Promise<void>
+  onImageToolFailed?: (event: { toolCallId: string; error: string }) => void | Promise<void>
 }): Promise<AgentApiResult> {
   return postEventStream<AgentApiResult>('/api/agent/responses/stream', {
     params: opts.params,
@@ -619,6 +621,7 @@ export async function callCloudAgentResponsesApi(opts: {
     if (event.type === 'image_tool_started') await opts.onImageToolStarted?.(event.event)
     if (event.type === 'image_partial_image') await opts.onImagePartialImage?.(event.event)
     if (event.type === 'image_tool_completed') await opts.onImageToolCompleted?.(event.image)
+    if (event.type === 'image_tool_failed') await opts.onImageToolFailed?.(event.event)
   }, opts.signal)
 }
 
