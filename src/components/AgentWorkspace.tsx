@@ -1,63 +1,15 @@
-import { useEffect, useMemo, useState, useRef, useCallback, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, useRef, useCallback, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import type { AgentConversation, AgentMessage, AgentRound, ResponsesOutputItem, TaskRecord } from '../types'
-import { deleteAgentRoundFromConversation, editOutputs, getActiveAgentRounds, getAgentBranchLeafId, getAgentSiblingRounds, getCachedImage, ensureImageCached, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeMultipleTasks, removeTask, reuseConfig, useStore } from '../store'
+import { deleteAgentRoundFromConversation, editOutputs, getActiveAgentRounds, getAgentBranchLeafId, getAgentRoundTaskIds, getAgentSiblingRounds, getCachedImage, ensureImageCached, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeMultipleTasks, removeTask, reuseConfig, useStore } from '../store'
 import { getPromptMentionParts } from '../lib/promptImageMentions'
 import { copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
 import { collectWebSearchCalls, getAgentRoundOutputItems, getWebSearchStatusForCalls, type AgentWebSearchStatus } from '../lib/agentWebSearch'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
 import { downloadImageEntriesAsZip, downloadImageIds, getImageZipEntries } from '../lib/downloadImages'
 import TaskCard from './TaskCard'
-import ViewportTooltip from './ViewportTooltip'
 import MarkdownRenderer from './MarkdownRenderer'
+import { TooltipButton as AgentActionButton } from './TooltipButton'
 import { TrashIcon, DownloadIcon, EditIcon, ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon, SidebarLeftIcon, FavoriteIcon, CloseIcon, CopyIcon, RefreshIcon, ArrowDownIcon } from './icons'
-
-function AgentActionButton({
-  tooltip,
-  className,
-  disabled = false,
-  onClick,
-  onMouseDown,
-  children,
-}: {
-  tooltip: string
-  className: string
-  disabled?: boolean
-  onClick?: (e: ReactMouseEvent<HTMLButtonElement>) => void
-  onMouseDown?: (e: ReactMouseEvent<HTMLButtonElement>) => void
-  children: ReactNode
-}) {
-  const [tooltipVisible, setTooltipVisible] = useState(false)
-
-  return (
-    <span
-      className="relative inline-flex"
-      onMouseEnter={() => setTooltipVisible(true)}
-      onMouseLeave={() => setTooltipVisible(false)}
-      onFocus={() => setTooltipVisible(true)}
-      onBlur={() => setTooltipVisible(false)}
-    >
-      <button
-        type="button"
-        className={className}
-        disabled={disabled}
-        aria-label={tooltip}
-        onClick={(e) => {
-          setTooltipVisible(false)
-          onClick?.(e)
-        }}
-        onMouseDown={(e) => {
-          setTooltipVisible(false)
-          onMouseDown?.(e)
-        }}
-      >
-        {children}
-      </button>
-      <ViewportTooltip visible={tooltipVisible} className="whitespace-nowrap">
-        {tooltip}
-      </ViewportTooltip>
-    </span>
-  )
-}
 
 function ChatImageThumb({ imageId, imageIndex, maskImageId }: { imageId: string; imageIndex: number; maskImageId?: string | null }) {
   const [src, setSrc] = useState<string>(() => getCachedImage(imageId) || '')
@@ -170,8 +122,13 @@ function markToolStatusStopped(status: AgentWebSearchStatus): AgentWebSearchStat
 }
 
 function getImageTaskForOutputItem(item: ResponsesOutputItem, tasksForRound: TaskRecord[]) {
-  if (item.type !== 'image_generation_call') return null
-  return tasksForRound.find((task) => task.agentToolCallId && task.agentToolCallId === item.id) ?? null
+  if (item.type === 'image_generation_call') {
+    return tasksForRound.find((task) => task.agentToolCallId && task.agentToolCallId === item.id) ?? null
+  }
+  if (item.type === 'function_call' && item.name === 'generate_image' && item.call_id) {
+    return tasksForRound.find((task) => task.agentToolCallId === item.call_id) ?? null
+  }
+  return null
 }
 
 function getBatchImageTasksForOutputItem(item: ResponsesOutputItem, tasksForRound: TaskRecord[]) {
@@ -718,16 +675,15 @@ export default function AgentWorkspace() {
 
   const handleDeleteMessage = (message: AgentMessage, round: AgentRound) => {
     const isUserMessage = message.role === 'user'
-    const existingTaskIds = new Set(tasks.map((task) => task.id))
     const assistantTaskIds = isUserMessage
       ? []
       : Array.from(new Set([
           ...(message.outputTaskIds ?? []),
-          ...round.outputTaskIds,
+          ...getAgentRoundTaskIds(round, tasks),
           ...tasks
             .filter((task) => task.agentMessageId === message.id || task.agentRoundId === round.id)
             .map((task) => task.id),
-        ])).filter((taskId) => existingTaskIds.has(taskId))
+        ]))
     setConfirmDialog({
       title: isUserMessage ? '删除轮次' : '删除消息',
       message: isUserMessage
@@ -735,7 +691,8 @@ export default function AgentWorkspace() {
         : '确定要删除这条消息吗？这会同时删除这条回复生成的图片。',
       action: async () => {
         if (isUserMessage) {
-          if (round.outputTaskIds.length > 0) await removeMultipleTasks(round.outputTaskIds)
+          const roundTaskIds = getAgentRoundTaskIds(round, tasks)
+          if (roundTaskIds.length > 0) await removeMultipleTasks(roundTaskIds)
 
           useStore.setState((state) => {
             const targetConversationId = conversation?.id

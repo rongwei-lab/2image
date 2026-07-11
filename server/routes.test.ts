@@ -2,7 +2,7 @@ import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_PARAMS, type AgentConversation, type PlatformSettings, type TaskRecord } from '../src/types'
-import { createDefaultOpenAIProfile, DEFAULT_SETTINGS } from '../src/lib/apiProfiles'
+import { createDefaultOpenAIProfile, DEFAULT_SETTINGS, normalizeSettings } from '../src/lib/apiProfiles'
 import { hashToken } from './crypto'
 import type { Db } from './db'
 import { registerCloudRoutes } from './routes'
@@ -13,11 +13,23 @@ const agentApiMocks = vi.hoisted(() => ({
   callAgentResponsesApi: vi.fn(),
 }))
 
+const imageApiMocks = vi.hoisted(() => ({
+  callImageApi: vi.fn(),
+}))
+
 vi.mock('../src/lib/agentApi', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/lib/agentApi')>()
   return {
     ...actual,
     callAgentResponsesApi: agentApiMocks.callAgentResponsesApi,
+  }
+})
+
+vi.mock('../src/lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/api')>()
+  return {
+    ...actual,
+    callImageApi: imageApiMocks.callImageApi,
   }
 })
 
@@ -650,7 +662,7 @@ function createMemoryDb() {
     throw new Error(`未处理的测试 SQL：${sql}`)
   })
 
-  return { db: { query } as unknown as Db, users, images, thumbnails, tasks, agentConversations, auditLogs }
+  return { db: { query } as unknown as Db, users, settings, images, thumbnails, tasks, agentConversations, auditLogs }
 }
 
 function createMemoryS3() {
@@ -762,6 +774,123 @@ describe('云端多用户隔离', () => {
 	      defaultFavoriteCollectionId: 'collection-avatar',
 	    })
 	  })
+
+  it('云端 Agent 对话使用独立的文本模型配置', async () => {
+    agentApiMocks.callAgentResponsesApi.mockReset()
+    const { app, settings } = await createTestApp()
+    const textProfile = createDefaultOpenAIProfile({
+      id: 'agent-text-profile',
+      name: 'Agent 文本',
+      baseUrl: 'test-text-api',
+      apiKey: 'text-key',
+      apiMode: 'responses',
+      model: 'gpt-text-model',
+    })
+    const imageProfile = createDefaultOpenAIProfile({
+      id: 'agent-image-profile',
+      name: 'Agent 图像',
+      baseUrl: 'test-image-api',
+      apiKey: 'image-key',
+      apiMode: 'images',
+      model: 'gpt-image-model',
+    })
+    settings.set(USER_A.id, {
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        profiles: [textProfile, imageProfile],
+        activeProfileId: imageProfile.id,
+        agentApiConfigMode: 'hybrid',
+        agentTextProfileId: textProfile.id,
+        agentImageProfileId: imageProfile.id,
+      }),
+      params: DEFAULT_PARAMS,
+      workspace: {},
+    })
+    agentApiMocks.callAgentResponsesApi.mockResolvedValueOnce({
+      responseId: 'agent-response',
+      text: '完成',
+      images: [],
+      outputItems: [],
+    })
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/agent/responses/stream',
+      headers: { cookie: 'gip_session=token-a' },
+      payload: { params: DEFAULT_PARAMS, input: '生成一张图' },
+    })
+    await app.close()
+
+    expect(response.statusCode, response.body).toBe(200)
+    expect(agentApiMocks.callAgentResponsesApi).toHaveBeenCalledTimes(1)
+    expect(agentApiMocks.callAgentResponsesApi.mock.calls[0][0]).toMatchObject({
+      profile: { id: textProfile.id, model: 'gpt-text-model' },
+      settings: {
+        agentApiConfigMode: 'hybrid',
+        agentTextProfileId: textProfile.id,
+        agentImageProfileId: imageProfile.id,
+      },
+    })
+  })
+
+  it('云端 hybrid 批量图片使用独立的图像模型配置', async () => {
+    imageApiMocks.callImageApi.mockReset()
+    const { app, settings } = await createTestApp()
+    const textProfile = createDefaultOpenAIProfile({
+      id: 'agent-text-profile',
+      baseUrl: 'test-text-api',
+      apiKey: 'text-key',
+      apiMode: 'responses',
+      model: 'gpt-text-model',
+    })
+    const imageProfile = createDefaultOpenAIProfile({
+      id: 'agent-image-profile',
+      baseUrl: 'test-image-api',
+      apiKey: 'image-key',
+      apiMode: 'images',
+      model: 'gpt-image-model',
+    })
+    settings.set(USER_A.id, {
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        profiles: [textProfile, imageProfile],
+        activeProfileId: textProfile.id,
+        agentApiConfigMode: 'hybrid',
+        agentTextProfileId: textProfile.id,
+        agentImageProfileId: imageProfile.id,
+      }),
+      params: DEFAULT_PARAMS,
+      workspace: {},
+    })
+    imageApiMocks.callImageApi.mockResolvedValueOnce({
+      images: ['data:image/png;base64,aHlicmlk'],
+      actualParams: { size: '1024x1024' },
+      actualParamsList: [{ size: '1024x1024' }],
+      revisedPrompts: ['hybrid prompt'],
+    })
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/agent/batch-image/stream',
+      headers: { cookie: 'gip_session=token-a' },
+      payload: {
+        params: DEFAULT_PARAMS,
+        batchItemId: 'image-1',
+        prompt: '生成 hybrid 图片',
+        referenceImageDataUrls: [],
+      },
+    })
+    await app.close()
+
+    expect(response.statusCode, response.body).toBe(200)
+    expect(imageApiMocks.callImageApi).toHaveBeenCalledTimes(1)
+    expect(imageApiMocks.callImageApi.mock.calls[0][0]).toMatchObject({
+      settings: { activeProfileId: imageProfile.id, model: 'gpt-image-model' },
+      prompt: '生成 hybrid 图片',
+    })
+    expect(response.body).toContain('batch_image_completed')
+    expect(response.body).toContain('"batchItemId":"image-1"')
+  })
 
 	  it('用户不能读取其他用户的图片对象', async () => {
     const { app, s3 } = await createTestApp()

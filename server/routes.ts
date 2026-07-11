@@ -3,10 +3,11 @@ import type { S3Client } from '@aws-sdk/client-s3'
 import net from 'node:net'
 import type { AgentConversation, AgentMessage, AgentRound, ApiProfile, AppSettings, PlatformSettings, ResponsesApiResponse, ResponsesOutputItem, TaskRecord, TaskParams } from '../src/types'
 import { DEFAULT_PARAMS } from '../src/types'
-import { getActiveApiProfile, normalizeSettings } from '../src/lib/apiProfiles'
+import { getActiveApiProfile, getAgentImageApiProfile, getAgentTextApiProfile, normalizeSettings } from '../src/lib/apiProfiles'
 import { applyPlatformSettingsToAppSettings, getPlatformManagedTaskParams, normalizePlatformSettings, sanitizePlatformSettingsForClient } from '../src/lib/platformSettings'
 import { callImageApi } from '../src/lib/api'
 import { normalizeParamsForSettings } from '../src/lib/paramCompatibility'
+import { replaceImageMentionsForApi } from '../src/lib/promptImageMentions'
 import { applyPromptStylePreset, normalizePromptStylePresetId } from '../src/lib/promptStyles'
 import {
   collectAgentRoundOutputImageSlots,
@@ -652,12 +653,33 @@ async function writeAuditLog(
   )
 }
 
-async function loadActiveGenerationProfile(db: Db, config: ServerConfig, userId: string) {
+async function loadAgentGenerationProfiles(db: Db, config: ServerConfig, userId: string) {
   const settings = await loadGenerationSettings(db, config, userId)
   if (!settings) throw new Error('缺少云端 API 配置')
-  const profile = getActiveApiProfile(settings)
-  if (!profile.apiKey.trim()) throw new Error('缺少云端 API Key，请在设置中保存 API Key')
-  return { settings, profile }
+  const textProfile = getAgentTextApiProfile(settings)
+  const imageProfile = getAgentImageApiProfile(settings)
+  if (!textProfile || textProfile.provider !== 'openai' || textProfile.apiMode !== 'responses') {
+    throw new Error('Agent 文本模型必须使用支持 Responses API 的 OpenAI 配置')
+  }
+  if (!imageProfile) throw new Error('缺少 Agent 图像模型 API 配置')
+  if (!textProfile.apiKey.trim()) throw new Error('缺少 Agent 文本模型 API Key，请在设置中保存 API Key')
+  if (!imageProfile.apiKey.trim()) throw new Error('缺少 Agent 图像模型 API Key，请在设置中保存 API Key')
+  return { settings, textProfile, imageProfile }
+}
+
+function createSettingsForApiProfile(settings: AppSettings, profile: ApiProfile) {
+  return normalizeSettings({
+    ...settings,
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: profile.model,
+    timeout: profile.timeout,
+    apiMode: profile.apiMode,
+    codexCli: profile.codexCli,
+    apiProxy: profile.apiProxy,
+    profiles: settings.profiles.map((item) => item.id === profile.id ? profile : item),
+    activeProfileId: profile.id,
+  })
 }
 
 async function loadManagedGenerationParams(db: Db, config: ServerConfig): Promise<TaskParams | null> {
@@ -864,11 +886,12 @@ async function loadSettings(db: Db, userId: string) {
 
 async function loadGenerationSettings(db: Db, config: ServerConfig, userId: string): Promise<AppSettings | null> {
   const platform = await loadPlatformSettings(db, config, { includeApiKeys: true })
+  const saved = await loadSettings(db, userId)
   if (platform.api.managed) {
-    return applyPlatformSettingsToAppSettings(normalizeSettings({}), platform)
+    // 平台接管 API 时仍保留用户选择的 Agent 文本/图像配置 ID，实际配置和 Key 只取后台数据。
+    return applyPlatformSettingsToAppSettings(normalizeSettings(saved?.settings ?? {}), platform)
   }
 
-  const saved = await loadSettings(db, userId)
   if (!saved) return null
   const profiles = await db.query<{ id: string; encrypted_api_key: string | null }>(
     'SELECT id, encrypted_api_key FROM api_profiles WHERE user_id = $1',
@@ -2929,14 +2952,14 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
     const user = await requireAuth(db, request, reply)
     if (!user) return
     const body = request.body as { prompt?: string; inputImageIds?: string[] }
-    const { settings, profile } = await loadActiveGenerationProfile(db, config, user.id)
-    await assertUpstreamTcpReachable(profile)
+    const { settings, textProfile } = await loadAgentGenerationProfiles(db, config, user.id)
+    await assertUpstreamTcpReachable(textProfile)
     const imageDataUrls = await Promise.all((body.inputImageIds ?? []).map((id) =>
       readImageDataUrl(db, s3, config, user.id, id),
     ))
     const title = await callAgentConversationTitleApi({
       settings,
-      profile,
+      profile: textProfile,
       prompt: body.prompt ?? '',
       imageDataUrls,
     })
@@ -2955,21 +2978,22 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
     }
     openSse(reply)
     try {
-      const { settings, profile } = await loadActiveGenerationProfile(db, config, user.id)
-      activeProfile = profile
-      await assertUpstreamTcpReachable(profile)
+      const { settings, textProfile, imageProfile } = await loadAgentGenerationProfiles(db, config, user.id)
+      activeProfile = textProfile
+      await assertUpstreamTcpReachable(textProfile)
       const maskDataUrl = body.maskImageId
         ? await readImageDataUrl(db, s3, config, user.id, body.maskImageId)
         : body.maskDataUrl
       const managedParams = await loadManagedGenerationParams(db, config)
+      const imageSettings = createSettingsForApiProfile(settings, imageProfile)
       const requestParams = normalizeGenerationParams(
         managedParams ?? body.params ?? DEFAULT_PARAMS,
-        settings,
+        imageSettings,
         Boolean(maskDataUrl),
       )
       const result = await callAgentResponsesApi({
         settings,
-        profile,
+        profile: textProfile,
         params: { ...requestParams, n: 1, transparent_output: false },
         input: body.input,
         maskDataUrl,
@@ -3004,26 +3028,70 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
     }
     openSse(reply)
     try {
-      const { settings, profile } = await loadActiveGenerationProfile(db, config, user.id)
-      activeProfile = profile
-      await assertUpstreamTcpReachable(profile)
+      const { settings, imageProfile } = await loadAgentGenerationProfiles(db, config, user.id)
+      activeProfile = imageProfile
+      await assertUpstreamTcpReachable(imageProfile)
+      const imageSettings = createSettingsForApiProfile(settings, imageProfile)
       const managedParams = await loadManagedGenerationParams(db, config)
       const requestParams = normalizeGenerationParams(
         managedParams ?? body.params ?? DEFAULT_PARAMS,
-        settings,
+        imageSettings,
         Boolean(body.referenceImageDataUrls?.length || body.referenceIds?.length),
       )
-      const result = await callBatchImageSingle({
-        profile,
-        params: { ...requestParams, n: 1, transparent_output: false },
-        batchItemId: body.batchItemId ?? '',
-        prompt: body.prompt ?? '',
-        referenceImageDataUrls: body.referenceImageDataUrls ?? [],
-        referenceIds: body.referenceIds,
-        onImageToolStarted: () => writeSse(reply, { type: 'batch_image_started' }),
-        onPartialImage: (event) => writeSse(reply, { type: 'batch_partial_image', event }),
-        onImageToolCompleted: (image) => writeSse(reply, { type: 'batch_image_completed', image }),
-      })
+      const params = { ...requestParams, n: 1, transparent_output: false }
+      const batchItemId = body.batchItemId ?? ''
+      const prompt = body.prompt ?? ''
+      const referenceImageDataUrls = body.referenceImageDataUrls ?? []
+      let result: BatchImageCallResult
+
+      if (settings.agentApiConfigMode === 'hybrid') {
+        writeSse(reply, { type: 'batch_image_started' })
+        const apiResult = await callImageApi({
+          settings: imageSettings,
+          prompt: replaceImageMentionsForApi(prompt, referenceImageDataUrls.length),
+          params,
+          inputImageDataUrls: referenceImageDataUrls,
+          onPartialImage: (partial) => writeSse(reply, {
+            type: 'batch_partial_image',
+            event: { image: partial.image, partialImageIndex: partial.partialImageIndex ?? partial.requestIndex },
+          }),
+        })
+        const dataUrl = apiResult.images[0]
+        const image = dataUrl
+          ? {
+              dataUrl,
+              actualParams: apiResult.actualParamsList?.[0] ?? apiResult.actualParams,
+              revisedPrompt: apiResult.revisedPrompts?.[0] ?? prompt,
+            }
+          : null
+        result = {
+          batchItemId,
+          image,
+          error: apiResult.failedRequests?.[0]?.error ?? (image ? null : '接口未返回图片数据'),
+          rawResponsePayload: JSON.stringify({
+            imageCount: apiResult.images.length,
+            actualParams: apiResult.actualParams,
+            actualParamsList: apiResult.actualParamsList,
+            revisedPrompts: apiResult.revisedPrompts,
+            rawImageUrls: apiResult.rawImageUrls,
+            failedRequests: apiResult.failedRequests,
+          }, null, 2),
+        }
+        if (image) writeSse(reply, { type: 'batch_image_completed', image })
+      } else {
+        result = await callBatchImageSingle({
+          profile: imageProfile,
+          params,
+          batchItemId,
+          prompt,
+          referenceImageDataUrls,
+          referenceIds: body.referenceIds,
+          allowPromptRewrite: settings.allowPromptRewrite,
+          onImageToolStarted: () => writeSse(reply, { type: 'batch_image_started' }),
+          onPartialImage: (event) => writeSse(reply, { type: 'batch_partial_image', event }),
+          onImageToolCompleted: (image) => writeSse(reply, { type: 'batch_image_completed', image }),
+        })
+      }
       writeSse(reply, { type: 'done', result })
     } catch (error) {
       request.log.error({ err: error, baseUrl: activeProfile?.baseUrl, model: activeProfile?.model }, 'cloud batch image failed')

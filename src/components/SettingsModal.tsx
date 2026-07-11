@@ -17,6 +17,7 @@ import {
   getActiveApiProfile,
   importCustomProviderSettingsFromJson,
   isDefaultConfigOnlyEnabled,
+  isAgentTextApiProfile,
   isOpenAICompatibleProvider,
   mergeImportedSettings,
   normalizeAgentMaxToolRounds,
@@ -27,7 +28,7 @@ import {
 } from '../lib/apiProfiles'
 import { copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
 import { requestBrowserNotificationPermission, type BrowserNotificationPermissionResult } from '../lib/browserNotification'
-import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, type ApiProfile, type AppSettings, type CustomProviderDefinition } from '../types'
+import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, type AgentApiConfigMode, type ApiProfile, type AppSettings, type CustomProviderDefinition, type ZipDownloadRoute } from '../types'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
 import { DEFAULT_DROPDOWN_MAX_HEIGHT, getDropdownMaxHeight } from '../lib/dropdown'
@@ -51,6 +52,15 @@ const DEFAULT_COPY_IMPORT_URL_OPTIONS = {
 }
 
 type CopyImportUrlOptions = typeof DEFAULT_COPY_IMPORT_URL_OPTIONS
+
+const ZIP_DOWNLOAD_ROUTE_OPTIONS: Array<{ route: ZipDownloadRoute; label: string; description: string }> = [
+  { route: 'task-selection', label: '任务列表 > 多选', description: '主页或收藏夹详情中框选、Ctrl/⌘ 点选或移动端滑动选中任务后的“下载选中”。' },
+  { route: 'favorite-collection-selection', label: '收藏夹列表 > 多选', description: '收藏夹概览页选中一个或多个收藏夹后的“下载选中”。' },
+  { route: 'image-context-menu-all', label: '图片右键菜单 > 下载全部', description: '右键图片时下载同一组输出图片。' },
+  { route: 'task-detail-all', label: '任务详情 > 下载全部', description: '任务详情弹窗中下载当前任务的所有输出图。' },
+  { route: 'task-detail-partial', label: '任务详情 > 下载中间步骤图', description: '任务详情弹窗中下载流式生成保留的中间步骤图。' },
+  { route: 'agent-round-all', label: 'Agent 对话轮次 > 下载所有图片', description: 'Agent 对话中下载某轮回复关联的全部图片。' },
+]
 
 function readCopyImportUrlOptions(): CopyImportUrlOptions {
   if (typeof window === 'undefined') return DEFAULT_COPY_IMPORT_URL_OPTIONS
@@ -326,6 +336,7 @@ export default function SettingsModal() {
   const llmPromptTooltipTimerRef = useRef<number | null>(null)
   const settingsScrollBoundaryRef = useRef<HTMLDivElement>(null)
   const customProviderScrollBoundaryRef = useRef<HTMLDivElement>(null)
+  const zipDownloadRouteScrollBoundaryRef = useRef<HTMLDivElement>(null)
   
   const [draft, setDraft] = useState<AppSettings>(normalizeSettings(settings))
   const [timeoutInput, setTimeoutInput] = useState(String(getActiveApiProfile(settings).timeout))
@@ -334,6 +345,7 @@ export default function SettingsModal() {
   const [showProfileMenu, setShowProfileMenu] = useState(false)
   const [profileMenuMaxHeight, setProfileMenuMaxHeight] = useState(DEFAULT_DROPDOWN_MAX_HEIGHT)
   const [showCustomProviderImport, setShowCustomProviderImport] = useState(false)
+  const [showZipDownloadRouteManager, setShowZipDownloadRouteManager] = useState(false)
   const [editingCustomProviderId, setEditingCustomProviderId] = useState<string | null>(null)
   const [customProviderForm, setCustomProviderForm] = useState<CustomProviderForm>(createDefaultCustomProviderForm())
   const [customProviderImportError, setCustomProviderImportError] = useState<string | null>(null)
@@ -347,6 +359,7 @@ export default function SettingsModal() {
   const [importTasks, setImportTasks] = useState(true)
   const [clearConfig, setClearConfig] = useState(true)
   const [clearTasks, setClearTasks] = useState(true)
+  const [isExportingData, setIsExportingData] = useState(false)
   const [isImportingData, setIsImportingData] = useState(false)
   const [isImportingJson, setIsImportingJson] = useState(false)
   const [draggedProfileId, setDraggedProfileId] = useState<string | null>(null)
@@ -413,6 +426,29 @@ export default function SettingsModal() {
 
   const getDefaultModelForMode = (apiMode: AppSettings['apiMode']) =>
     apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL
+
+  const enabledZipDownloadRouteCount = ZIP_DOWNLOAD_ROUTE_OPTIONS
+    .filter((option) => draft.zipDownloadRoutes.includes(option.route))
+    .length
+
+  const zipDownloadRouteSummary = enabledZipDownloadRouteCount
+    ? `已开启 ${enabledZipDownloadRouteCount} 项使用压缩包进行批量下载的途径`
+    : '未开启任何使用压缩包进行批量下载的途径'
+
+  const agentTextProfiles = draft.profiles.filter(isAgentTextApiProfile)
+  const selectedAgentTextProfile = agentTextProfiles.find((profile) => profile.id === draft.agentTextProfileId)
+    ?? (isAgentTextApiProfile(activeProfile) ? activeProfile : agentTextProfiles[0])
+    ?? null
+  const selectedAgentImageProfile = draft.profiles.find((profile) => profile.id === draft.agentImageProfileId)
+    ?? activeProfile
+  const agentTextProfileOptions = agentTextProfiles.map((profile) => ({
+    label: `${profile.name} · ${profile.model || DEFAULT_RESPONSES_MODEL}`,
+    value: profile.id,
+  }))
+  const agentImageProfileOptions = draft.profiles.map((profile) => ({
+    label: `${profile.name} · ${getApiProviderLabel(draft, profile.provider)} · ${profile.model}`,
+    value: profile.id,
+  }))
 
   const wasSettingsOpenRef = useRef(false)
 
@@ -560,6 +596,15 @@ export default function SettingsModal() {
     setSettings(normalizedDraft)
   }
 
+  const setZipDownloadRouteEnabled = (route: ZipDownloadRoute, enabled: boolean) => {
+    // 云端部署的下载入口由后台统一下发，前台不能覆盖平台策略。
+    if (platformSettings) return
+    const nextRoutes = enabled
+      ? Array.from(new Set([...draft.zipDownloadRoutes, route]))
+      : draft.zipDownloadRoutes.filter((item) => item !== route)
+    commitSettings({ ...draft, zipDownloadRoutes: nextRoutes })
+  }
+
   const updateCopyImportUrlOptions = (patch: Partial<CopyImportUrlOptions>) => {
     setCopyImportUrlOptions((previous) => {
       const next = { ...previous, ...patch, includeApiKey: false }
@@ -656,6 +701,10 @@ export default function SettingsModal() {
   }
 
   const handleClose = () => {
+    if (showZipDownloadRouteManager) {
+      setShowZipDownloadRouteManager(false)
+      return
+    }
     const nextTimeout = Number(timeoutInput)
     const normalizedTimeout =
       timeoutInput.trim() === '' || Number.isNaN(nextTimeout)
@@ -723,9 +772,18 @@ export default function SettingsModal() {
   }
 
   useCloseOnEscape(showSettings, handleClose)
-  usePreventBackgroundScroll(showSettings, showCustomProviderImport ? customProviderScrollBoundaryRef : settingsScrollBoundaryRef)
+  usePreventBackgroundScroll(showSettings, showZipDownloadRouteManager ? zipDownloadRouteScrollBoundaryRef : showCustomProviderImport ? customProviderScrollBoundaryRef : settingsScrollBoundaryRef)
 
   if (!showSettings) return null
+
+  const handleExport = async () => {
+    setIsExportingData(true)
+    try {
+      await exportData({ exportConfig, exportTasks })
+    } finally {
+      setIsExportingData(false)
+    }
+  }
 
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -783,6 +841,15 @@ export default function SettingsModal() {
     })
     commitSettings(nextDraft)
     setShowProfileMenu(false)
+  }
+
+  const updateAgentApiConfigMode = (mode: AgentApiConfigMode) => {
+    commitSettings({
+      ...draft,
+      agentApiConfigMode: mode,
+      agentTextProfileId: mode !== 'off' ? selectedAgentTextProfile?.id ?? draft.agentTextProfileId : draft.agentTextProfileId,
+      agentImageProfileId: mode === 'hybrid' ? selectedAgentImageProfile?.id ?? draft.agentImageProfileId : draft.agentImageProfileId,
+    })
   }
 
   const duplicateActiveProfile = () => {
@@ -1298,6 +1365,27 @@ export default function SettingsModal() {
                   </div>
                 </div>
                 <div className="block">
+                  <div className="mb-1 flex items-center justify-between gap-3">
+                    <span className="block text-sm text-gray-600 dark:text-gray-300">使用压缩包进行的批量下载途径</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (platformSettings) {
+                          showToast('批量下载策略由后台统一管理', 'info')
+                          return
+                        }
+                        setShowZipDownloadRouteManager(true)
+                      }}
+                      className="shrink-0 rounded-xl border border-gray-200/80 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 shadow-sm transition hover:bg-gray-50 hover:text-gray-900 dark:border-white/[0.08] dark:bg-white/[0.05] dark:text-gray-300 dark:hover:bg-white/[0.08] dark:hover:text-white"
+                    >
+                      {platformSettings ? '后台管理' : '管理'}
+                    </button>
+                  </div>
+                  <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
+                    {zipDownloadRouteSummary}
+                  </div>
+                </div>
+                <div className="block">
                   <div className="mb-1 flex items-center justify-between">
                     <span className="block text-sm text-gray-600 dark:text-gray-300">重启后加载上次的输入框</span>
                     <button
@@ -1349,6 +1437,24 @@ export default function SettingsModal() {
                   </div>
                   <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
                     开启后，即使任务成功生成，也会在任务卡片和详情页显示重试按钮。
+                  </div>
+                </div>
+                <div className="block">
+                  <div className="mb-1 flex items-center justify-between">
+                    <span className="block text-sm text-gray-600 dark:text-gray-300">允许模型改写优化提示词</span>
+                    <button
+                      type="button"
+                      onClick={() => commitSettings({ ...draft, allowPromptRewrite: !draft.allowPromptRewrite })}
+                      className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${draft.allowPromptRewrite ? 'bg-blue-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                      role="switch"
+                      aria-checked={draft.allowPromptRewrite}
+                      aria-label="允许模型改写优化提示词"
+                    >
+                      <span className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${draft.allowPromptRewrite ? 'translate-x-[14px]' : 'translate-x-[2px]'}`} />
+                    </button>
+                  </div>
+                  <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
+                    开启后，Codex CLI 兼容模式下的 Image API 请求和所有 Responses API 请求都不再附加防改写提示词，允许模型按服务商策略优化提示词。
                   </div>
                 </div>
                 <div className="block">
@@ -1422,6 +1528,74 @@ export default function SettingsModal() {
                   </>
                 ) : (
                   <>
+                    <div className="block">
+                      <div className="mb-1 flex items-center justify-between gap-3">
+                        <span className="block text-sm text-gray-600 dark:text-gray-300">使用独立的 API 配置</span>
+                        <div className="w-20 shrink-0">
+                          <Select
+                            value={draft.agentApiConfigMode}
+                            onChange={(value) => updateAgentApiConfigMode(value as AgentApiConfigMode)}
+                            options={[
+                              { label: '关闭', value: 'off' },
+                              { label: '原生', value: 'native' },
+                              { label: '混合', value: 'hybrid' },
+                            ]}
+                            className="w-full px-3 py-1.5 rounded-xl border border-gray-200/60 dark:border-white/[0.08] bg-white/50 dark:bg-white/[0.03] hover:bg-white dark:hover:bg-white/[0.06] text-xs transition-all duration-200 shadow-sm text-gray-700 dark:text-gray-200 outline-none"
+                          />
+                        </div>
+                      </div>
+                      <div data-selectable-text className="space-y-1 text-xs text-gray-500 dark:text-gray-500">
+                        <div>原生：文本模型通过 Responses API 的内置 <code className="rounded bg-gray-100 px-1 py-0.5 font-mono text-[10px] dark:bg-white/[0.06]">image_generation</code> 工具生成图片。</div>
+                        <div>混合：文本模型调用应用自定义工具，再由独立图像 API 生成图片，兼容不支持内置图片工具的服务商。</div>
+                      </div>
+                    </div>
+
+                    {draft.agentApiConfigMode !== 'off' && (
+                      <>
+                        <div className="block">
+                          <div className="mb-1 flex items-center justify-between gap-3">
+                            <span className="block text-sm text-gray-600 dark:text-gray-300">文本模型 API 配置</span>
+                            <div className="w-40 shrink-0">
+                              {agentTextProfileOptions.length > 0 ? (
+                                <Select
+                                  value={selectedAgentTextProfile?.id ?? ''}
+                                  onChange={(value) => commitSettings({ ...draft, agentTextProfileId: String(value) })}
+                                  options={agentTextProfileOptions}
+                                  className="w-full px-3 py-1.5 rounded-xl border border-gray-200/60 dark:border-white/[0.08] bg-white/50 dark:bg-white/[0.03] hover:bg-white dark:hover:bg-white/[0.06] text-xs transition-all duration-200 shadow-sm text-gray-700 dark:text-gray-200 outline-none"
+                                />
+                              ) : (
+                                <div className="w-full rounded-xl border border-gray-200/60 bg-white/50 px-3 py-1.5 text-center text-xs text-gray-700 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200">
+                                  没有可用配置
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
+                            用于对话和调用工具，仅支持 Responses API 配置。
+                          </div>
+                        </div>
+
+                        {draft.agentApiConfigMode === 'hybrid' && (
+                          <div className="block">
+                            <div className="mb-1 flex items-center justify-between gap-3">
+                              <span className="block text-sm text-gray-600 dark:text-gray-300">图像模型 API 配置</span>
+                              <div className="w-40 shrink-0">
+                                <Select
+                                  value={selectedAgentImageProfile?.id ?? ''}
+                                  onChange={(value) => commitSettings({ ...draft, agentImageProfileId: String(value) })}
+                                  options={agentImageProfileOptions}
+                                  className="w-full px-3 py-1.5 rounded-xl border border-gray-200/60 dark:border-white/[0.08] bg-white/50 dark:bg-white/[0.03] hover:bg-white dark:hover:bg-white/[0.06] text-xs transition-all duration-200 shadow-sm text-gray-700 dark:text-gray-200 outline-none"
+                                />
+                              </div>
+                            </div>
+                            <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
+                              用于生成图像，支持所有类型的 API 配置。
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+
                     <label className="block">
                       <span className="mb-1.5 block text-sm text-gray-600 dark:text-gray-300">最大工具调用轮数</span>
                       <input
@@ -1877,24 +2051,28 @@ export default function SettingsModal() {
                       开启后请求以流式传输，并非所有服务商和网关都支持此功能。官方接口在流式模式下不发送心跳，需要配合请求中间步骤图像来维持连接，避免超时断开。官方接口仅支持单图流式传输，因此数量大于 1 时会将多图生成拆分为并发单图。
                     </div>
                   </div>
-                  <label className={`block ${activeProfile.streamImages ? '' : 'opacity-60'}`}>
-                    <span className="mb-1.5 block text-sm text-gray-600 dark:text-gray-300">请求中间步骤图像数</span>
-                    <Select
-                      value={normalizeStreamPartialImages(activeProfile.streamPartialImages)}
-                      onChange={(value) => updateActiveProfile({ streamPartialImages: normalizeStreamPartialImages(value) }, true)}
-                      disabled={!activeProfile.streamImages}
-                      options={[
-                        { label: '0，不请求', value: 0 },
-                        { label: '1 张', value: 1 },
-                        { label: '2 张', value: 2 },
-                        { label: '3 张', value: 3 },
-                      ]}
-                      className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
-                    />
-                    <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
+                  <div className={`block ${activeProfile.streamImages ? '' : 'opacity-60'}`}>
+                    <div className="mb-1.5 flex items-center justify-between gap-3">
+                      <span className="block text-sm text-gray-600 dark:text-gray-300">请求中间步骤图像数</span>
+                      <div className="w-28 shrink-0">
+                        <Select
+                          value={normalizeStreamPartialImages(activeProfile.streamPartialImages)}
+                          onChange={(value) => updateActiveProfile({ streamPartialImages: normalizeStreamPartialImages(value) }, true)}
+                          disabled={!activeProfile.streamImages}
+                          options={[
+                            { label: '0，不请求', value: 0 },
+                            { label: '1 张', value: 1 },
+                            { label: '2 张', value: 2 },
+                            { label: '3 张', value: 3 },
+                          ]}
+                          className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-1.5 text-xs text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
+                        />
+                      </div>
+                    </div>
+                    <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
                       对应 <code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">partial_images</code> 参数（0-3）。建议设为 2 或 3 以避免长时间生成时连接超时断开。实际返回的每张中间图像会产生少量额外计费。设为 0 时不请求中间步骤图像，连接可能因无数据传输而被断开。
                     </div>
-                  </label>
+                  </div>
                 </div>
               )}
 
@@ -2023,11 +2201,21 @@ export default function SettingsModal() {
                     />
                   </div>
                   <button
-                    onClick={() => exportData({ exportConfig, exportTasks })}
-                    disabled={!exportConfig && !exportTasks}
+                    onClick={handleExport}
+                    disabled={(!exportConfig && !exportTasks) || isExportingData}
                     className="w-full rounded-xl bg-gray-100/80 px-4 py-2.5 text-sm font-medium text-gray-700 transition-all hover:bg-gray-200 hover:text-gray-900 disabled:opacity-50 disabled:hover:bg-gray-100/80 disabled:hover:text-gray-700 dark:bg-white/[0.06] dark:text-gray-300 dark:hover:bg-white/[0.1] dark:hover:text-white dark:disabled:hover:bg-white/[0.06] dark:disabled:hover:text-gray-300 flex items-center justify-center gap-2"
                   >
-                    导出所选数据
+                    {isExportingData ? (
+                      <>
+                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        导出中...
+                      </>
+                    ) : (
+                      '导出所选数据'
+                    )}
                   </button>
                 </div>
 
@@ -2114,6 +2302,80 @@ export default function SettingsModal() {
         </div>
       </div>
       </div>
+
+        {showZipDownloadRouteManager && createPortal(
+          <div
+            data-no-drag-select
+            className="fixed inset-0 z-[110] flex items-center justify-center p-4"
+            onClick={() => setShowZipDownloadRouteManager(false)}
+          >
+            <div className="absolute inset-0 bg-black/20 backdrop-blur-md animate-overlay-in dark:bg-black/40" />
+            <div
+              className="relative z-10 flex max-h-[85vh] w-full max-w-md flex-col rounded-3xl border border-white/50 bg-white/90 shadow-[0_8px_40px_rgb(0,0,0,0.12)] ring-1 ring-black/5 backdrop-blur-xl animate-confirm-in dark:border-white/[0.08] dark:bg-gray-900/90 dark:shadow-[0_8px_40px_rgb(0,0,0,0.4)] dark:ring-white/10 sm:max-h-[90vh]"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="shrink-0 p-6 pb-2">
+                <div className="mb-3 flex items-center justify-between gap-4">
+                  <h3 className="text-base font-bold text-gray-800 dark:text-gray-100">使用压缩包进行批量下载</h3>
+                  <button
+                    type="button"
+                    onClick={() => setShowZipDownloadRouteManager(false)}
+                    className="shrink-0 rounded-full p-1 text-gray-400 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-white/[0.06] dark:hover:text-gray-200"
+                    aria-label="关闭"
+                  >
+                    <CloseIcon className="h-5 w-5" />
+                  </button>
+                </div>
+                <div data-selectable-text className="text-sm leading-relaxed text-gray-500 dark:text-gray-400">
+                  开启后，在对应途径进行批量下载时会将结果下载为一个 ZIP，而不是多个图片文件。
+                </div>
+              </div>
+
+              <div ref={zipDownloadRouteScrollBoundaryRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-6 py-2 custom-scrollbar">
+                {ZIP_DOWNLOAD_ROUTE_OPTIONS.map((option) => {
+                  const isChecked = draft.zipDownloadRoutes.includes(option.route)
+                  return (
+                    <div
+                      key={option.route}
+                      role="checkbox"
+                      aria-checked={isChecked}
+                      tabIndex={0}
+                      onClick={() => setZipDownloadRouteEnabled(option.route, !isChecked)}
+                      onKeyDown={(event) => {
+                        if (event.key !== 'Enter' && event.key !== ' ') return
+                        event.preventDefault()
+                        setZipDownloadRouteEnabled(option.route, !isChecked)
+                      }}
+                      className={`cursor-pointer rounded-2xl border p-3.5 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/20 ${isChecked ? 'border-blue-500/30 bg-blue-50/50 dark:border-blue-400/30 dark:bg-blue-500/[0.05]' : 'border-gray-100 bg-gray-50/70 hover:bg-gray-100/70 dark:border-white/[0.06] dark:bg-white/[0.03] dark:hover:bg-white/[0.05]'}`}
+                    >
+                      <div onClick={(event) => event.stopPropagation()}>
+                        <Checkbox
+                          checked={isChecked}
+                          onChange={(checked) => setZipDownloadRouteEnabled(option.route, checked)}
+                          label={<span className="text-sm font-medium text-gray-700 dark:text-gray-200">{option.label}</span>}
+                        />
+                      </div>
+                      <div data-selectable-text className="mt-1.5 pl-6 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
+                        {option.description}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              <div className="flex shrink-0 gap-2 p-6 pt-4">
+                <button
+                  type="button"
+                  onClick={() => setShowZipDownloadRouteManager(false)}
+                  className="flex-1 rounded-lg bg-blue-500 py-2 text-sm font-medium text-white transition hover:bg-blue-600"
+                >
+                  完成
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
 
         {showCustomProviderImport && createPortal(
           <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
