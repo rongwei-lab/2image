@@ -68,6 +68,8 @@ function buildServerBundle() {
     '--format=esm',
     '--target=node22',
     '--packages=external',
+    // Vite 会在前端构建时注入该对象；Node 服务端运行时没有 import.meta.env。
+    '--define:import.meta.env={}',
     '--outfile=server-dist/index.js',
   ])
 }

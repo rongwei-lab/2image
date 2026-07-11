@@ -21,10 +21,10 @@ import { readRuntimeEnv } from './runtimeEnv'
 import { isImportableConfigUrl } from './customProviderConfigUrl'
 
 const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1'
-const RAW_DEFAULT_API_URL = readRuntimeEnv(import.meta.env.VITE_DEFAULT_API_URL)
-const DEFAULT_OPENAI_API_PROXY = readRuntimeEnv(import.meta.env.VITE_API_PROXY_AVAILABLE) === 'true'
-const DOCKER_DEPLOYMENT = readRuntimeEnv(import.meta.env.VITE_DOCKER_DEPLOYMENT) === 'true'
-const SHOW_DEFAULT_CONFIG_ONLY = readRuntimeEnv(import.meta.env.VITE_SHOW_DEFAULT_CONFIG_ONLY) === 'true'
+const RAW_DEFAULT_API_URL = readRuntimeEnv(import.meta.env?.VITE_DEFAULT_API_URL)
+const DEFAULT_OPENAI_API_PROXY = readRuntimeEnv(import.meta.env?.VITE_API_PROXY_AVAILABLE) === 'true'
+const DOCKER_DEPLOYMENT = readRuntimeEnv(import.meta.env?.VITE_DOCKER_DEPLOYMENT) === 'true'
+const SHOW_DEFAULT_CONFIG_ONLY = readRuntimeEnv(import.meta.env?.VITE_SHOW_DEFAULT_CONFIG_ONLY) === 'true'
 const DEFAULT_API_URL_PATCH = isImportableConfigUrl(RAW_DEFAULT_API_URL)
   ? null
   : parseDefaultApiUrl(RAW_DEFAULT_API_URL || (DOCKER_DEPLOYMENT && DEFAULT_OPENAI_API_PROXY ? '' : OPENAI_DEFAULT_BASE_URL))
