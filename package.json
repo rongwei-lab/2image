@@ -1,7 +1,7 @@
 {
   "name": "gpt-image-playground",
   "private": true,
-  "version": "0.6.12",
+  "version": "0.7.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -24,7 +24,7 @@
     "@streamdown/math": "^1.0.2",
     "core-js": "^3.49.0",
     "fastify": "^5.8.5",
-    "fflate": "^0.8.2",
+    "fflate": "^0.8.3",
     "katex": "^0.16.47",
     "pg": "^8.21.0",
     "pngjs": "^7.0.0",
