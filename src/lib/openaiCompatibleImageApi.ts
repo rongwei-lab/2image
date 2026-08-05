@@ -12,15 +12,17 @@ import {
   getApiErrorMessage,
   getDataUrlDecodedByteSize,
   getDataUrlEncodedByteSize,
+  getResponsesImageResultBase64,
   isDataUrl,
   isHttpUrl,
   mergeActualParams,
   MIME_MAP,
   normalizeBase64Image,
   pickActualParams,
+  PROMPT_REWRITE_GUARD_PREFIX,
 } from './imageApiShared'
-
-const PROMPT_REWRITE_GUARD_PREFIX = 'Use the following text as the complete prompt. Do not rewrite it:'
+import { isEventStreamResponse, readJsonServerSentEvents } from './serverSentEvents'
+import { prependCodexCliSizePrompt } from './size'
 
 function getStreamPartialImages(profile: ApiProfile): number {
   return profile.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES
@@ -88,10 +90,6 @@ function createRequestHeaders(profile: ApiProfile): Record<string, string> {
   }
 }
 
-function isEventStreamResponse(response: Response): boolean {
-  return response.headers.get('Content-Type')?.toLowerCase().includes('text/event-stream') ?? false
-}
-
 function isRecordValue(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
@@ -125,66 +123,6 @@ function getStreamEventErrorMessage(event: Record<string, unknown>): string | nu
   return null
 }
 
-function parseServerSentEventBlock(block: string): string | null {
-  const dataLines: string[] = []
-  for (const line of block.split(/\r?\n/)) {
-    if (!line || line.startsWith(':')) continue
-    if (!line.startsWith('data:')) continue
-    dataLines.push(line.slice(5).replace(/^ /, ''))
-  }
-
-  const data = dataLines.join('\n').trim()
-  if (!data || data === '[DONE]') return null
-  return data
-}
-
-async function readJsonServerSentEvents(response: Response, onEvent: (event: Record<string, unknown>) => void | Promise<void>): Promise<void> {
-  if (!response.body) throw new Error('接口未返回可读取的流式响应')
-
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  let hasDataLine = false
-
-  const processBlock = async (block: string) => {
-    if (block.split(/\r?\n/).some((line) => line.startsWith('data:'))) hasDataLine = true
-    const data = parseServerSentEventBlock(block)
-    if (!data) return
-
-    let event: unknown
-    try {
-      event = JSON.parse(data)
-    } catch {
-      throw new Error(appendStreamingFormatHint(data))
-    }
-    if (!isRecordValue(event)) return
-
-    const errorMessage = getStreamEventErrorMessage(event)
-    if (errorMessage) throw new Error(errorMessage)
-
-    await onEvent(event)
-  }
-
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-
-    let separatorIndex = buffer.search(/\r?\n\r?\n/)
-    while (separatorIndex >= 0) {
-      const block = buffer.slice(0, separatorIndex)
-      const separator = buffer.match(/\r?\n\r?\n/)?.[0] ?? '\n\n'
-      buffer = buffer.slice(separatorIndex + separator.length)
-      await processBlock(block)
-      separatorIndex = buffer.search(/\r?\n\r?\n/)
-    }
-  }
-
-  buffer += decoder.decode()
-  if (buffer.trim()) await processBlock(buffer)
-  if (!hasDataLine) throw new Error(appendStreamingFormatHint('未从流式响应中解析到有效的 data 事件'))
-}
-
 function createResponsesImageTool(
   params: TaskParams,
   isEdit: boolean,
@@ -194,9 +132,12 @@ function createResponsesImageTool(
   const tool: Record<string, unknown> = {
     type: 'image_generation',
     action: isEdit ? 'edit' : 'generate',
-    size: params.size,
     output_format: params.output_format,
     moderation: params.moderation,
+  }
+
+  if (!profile.codexCli) {
+    tool.size = params.size
   }
 
   if (profile.streamImages) {
@@ -272,24 +213,6 @@ function parseResponsesImageResults(payload: ResponsesApiResponse, fallbackMime:
   }
 
   return results
-}
-
-function getResponsesImageResultBase64(result: ResponsesOutputItem['result']): string | undefined {
-  const b64 = typeof result === 'string'
-    ? result
-    : result && typeof result === 'object'
-    ? typeof result.b64_json === 'string'
-      ? result.b64_json
-      : typeof result.base64 === 'string'
-      ? result.base64
-      : typeof result.image === 'string'
-      ? result.image
-      : typeof result.data === 'string'
-      ? result.data
-      : ''
-    : ''
-
-  return b64.trim() ? b64 : undefined
 }
 
 async function parseImagesApiResponse(payload: ImageApiResponse, mime: string, signal?: AbortSignal): Promise<CallApiResult> {
@@ -384,6 +307,9 @@ async function parseImagesApiStreamResponse(
     if (type === 'image_generation.completed' || type === 'image_edit.completed') {
       completedItems.push(eventToImageResponseItem(event))
     }
+  }, {
+    formatErrorMessage: appendStreamingFormatHint,
+    getEventErrorMessage: getStreamEventErrorMessage,
   })
 
   if (resultPayload) {
@@ -455,6 +381,9 @@ async function parseResponsesApiStreamResponse(
     }
 
     completedPayload = payload
+  }, {
+    formatErrorMessage: appendStreamingFormatHint,
+    getEventErrorMessage: getStreamEventErrorMessage,
   })
 
   const payload = completedPayload ?? (outputItems.length ? { output: outputItems } : null)
@@ -552,9 +481,12 @@ async function callImagesApiConcurrent(opts: CallApiOptions, profile: ApiProfile
 
 async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): Promise<CallApiResult> {
   const { prompt: originalPrompt, params, inputImageDataUrls } = opts
-  const prompt = profile.codexCli && !opts.settings.allowPromptRewrite
-    ? `${PROMPT_REWRITE_GUARD_PREFIX}\n${originalPrompt}`
+  const sizePrompt = profile.codexCli && !opts.skipCodexCliSizePrompt
+    ? prependCodexCliSizePrompt(originalPrompt, params.size)
     : originalPrompt
+  const prompt = profile.codexCli && !opts.settings.allowPromptRewrite
+    ? `${PROMPT_REWRITE_GUARD_PREFIX}\n${sizePrompt}`
+    : sizePrompt
   const isEdit = inputImageDataUrls.length > 0
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
@@ -572,7 +504,9 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
       const formData = new FormData()
       formData.append('model', profile.model)
       formData.append('prompt', prompt)
-      formData.append('size', params.size)
+      if (!profile.codexCli) {
+        formData.append('size', params.size)
+      }
       formData.append('output_format', params.output_format)
       formData.append('moderation', params.moderation)
 
@@ -633,9 +567,12 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
       const body: Record<string, unknown> = {
         model: profile.model,
         prompt,
-        size: params.size,
         output_format: params.output_format,
         moderation: params.moderation,
+      }
+
+      if (!profile.codexCli) {
+        body.size = params.size
       }
 
       if (!profile.codexCli) {
@@ -1037,6 +974,9 @@ async function callResponsesImageApi(opts: CallApiOptions, profile: ApiProfile):
 
 async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiProfile): Promise<CallApiResult> {
   const { prompt, params, inputImageDataUrls } = opts
+  const requestPrompt = profile.codexCli && !opts.skipCodexCliSizePrompt
+    ? prependCodexCliSizePrompt(prompt, params.size)
+    : prompt
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
@@ -1056,10 +996,11 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
 
     const body: Record<string, unknown> = {
       model: profile.model,
-      input: createResponsesInput(prompt, inputImageDataUrls, opts.settings.allowPromptRewrite),
+      input: createResponsesInput(requestPrompt, inputImageDataUrls, opts.settings.allowPromptRewrite),
       tools: [createResponsesImageTool(params, inputImageDataUrls.length > 0, profile, opts.maskDataUrl)],
       tool_choice: 'required',
     }
+    if (profile.reasoningEffort) body.reasoning = { effort: profile.reasoningEffort }
     if (profile.streamImages) {
       body.stream = true
     }

@@ -1,5 +1,7 @@
-const CACHE_NAME = 'gpt-image-playground-v0.5.4-admin-regenerate-1'
+const CACHE_NAME = 'gpt-image-playground-v0.7.3-custom-1'
 const APP_SHELL = ['./', './index.html', './manifest.webmanifest', './pwa-icon.svg']
+const APP_SHELL_URLS = new Set(APP_SHELL.map((path) => new URL(path, self.registration.scope).href))
+const ASSETS_PATH = new URL('./assets/', self.registration.scope).pathname
 
 async function refreshWindowClients() {
   const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
@@ -39,7 +41,12 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
-  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/api-proxy/')) return
+  const isApiRequest =
+    url.pathname === '/api' ||
+    url.pathname.startsWith('/api/') ||
+    url.pathname === '/api-proxy' ||
+    url.pathname.startsWith('/api-proxy/')
+  if (isApiRequest) return
 
   if (request.mode === 'navigate') {
     event.respondWith(
@@ -53,6 +60,8 @@ self.addEventListener('fetch', (event) => {
     )
     return
   }
+
+  if (!APP_SHELL_URLS.has(url.href) && !url.pathname.startsWith(ASSETS_PATH)) return
 
   event.respondWith(
     caches.match(request).then((cached) => {

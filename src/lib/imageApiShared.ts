@@ -1,4 +1,4 @@
-import type { AppSettings, TaskParams } from '../types'
+import type { AppSettings, ResponsesOutputItem, TaskParams } from '../types'
 import { blobToDataUrl } from './dataUrl'
 
 export const MIME_MAP: Record<string, string> = {
@@ -9,6 +9,7 @@ export const MIME_MAP: Record<string, string> = {
 
 export const MAX_MASK_EDIT_FILE_BYTES = 50 * 1024 * 1024
 export const MAX_IMAGE_INPUT_PAYLOAD_BYTES = 512 * 1024 * 1024
+export const PROMPT_REWRITE_GUARD_PREFIX = 'Treat everything after this line as one complete image-generation prompt, including the resolution instruction. Follow it exactly without rewriting or omitting anything:'
 
 export interface CallApiOptions {
   settings: AppSettings
@@ -17,6 +18,7 @@ export interface CallApiOptions {
   /** 输入图片的 data URL 列表 */
   inputImageDataUrls: string[]
   maskDataUrl?: string
+  skipCodexCliSizePrompt?: boolean
   onFalRequestEnqueued?: (request: { requestId: string; endpoint: string }) => void
   onCustomTaskEnqueued?: (task: { taskId: string }) => void
   onPartialImage?: (partial: { image: string; partialImageIndex?: number; requestIndex?: number }) => void
@@ -47,6 +49,24 @@ export function isDataUrl(value: unknown): value is string {
 
 export function normalizeBase64Image(value: string, fallbackMime: string): string {
   return value.startsWith('data:') ? value : `data:${fallbackMime};base64,${value}`
+}
+
+export function getResponsesImageResultBase64(result: ResponsesOutputItem['result']): string | undefined {
+  const b64 = typeof result === 'string'
+    ? result
+    : result && typeof result === 'object'
+    ? typeof result.b64_json === 'string'
+      ? result.b64_json
+      : typeof result.base64 === 'string'
+      ? result.base64
+      : typeof result.image === 'string'
+      ? result.image
+      : typeof result.data === 'string'
+      ? result.data
+      : ''
+    : ''
+
+  return b64.trim() ? b64 : undefined
 }
 
 function formatMiB(bytes: number): string {

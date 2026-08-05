@@ -1,9 +1,10 @@
 // ===== 设置 =====
 
 export type ApiMode = 'images' | 'responses'
+export const REASONING_EFFORT_VALUES = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+export type ReasoningEffort = typeof REASONING_EFFORT_VALUES[number]
 export type AppMode = 'gallery' | 'agent'
 export type AgentApiConfigMode = 'off' | 'native' | 'hybrid'
-export type ReferenceImageEditAction = 'ask' | 'replace-reference' | 'add-mask'
 export const ZIP_DOWNLOAD_ROUTE_VALUES = [
   'task-selection',
   'favorite-collection-selection',
@@ -76,13 +77,14 @@ export interface ApiProfile {
   model: string
   timeout: number
   apiMode: ApiMode
+  reasoningEffort?: ReasoningEffort
   codexCli: boolean
   apiProxy: boolean
   hasStoredApiKey?: boolean
   responseFormatB64Json?: boolean
   streamImages?: boolean
   streamPartialImages?: number
-  providerDrafts?: Partial<Record<ApiProvider, Partial<Pick<ApiProfile, 'baseUrl' | 'model' | 'apiMode' | 'codexCli' | 'apiProxy' | 'responseFormatB64Json' | 'streamImages' | 'streamPartialImages'>>>>
+  providerDrafts?: Partial<Record<ApiProvider, Partial<Pick<ApiProfile, 'baseUrl' | 'model' | 'apiMode' | 'reasoningEffort' | 'codexCli' | 'apiProxy' | 'responseFormatB64Json' | 'streamImages' | 'streamPartialImages'>>>>
 }
 
 export interface AppSettings {
@@ -105,7 +107,6 @@ export interface AppSettings {
   allowPromptRewrite: boolean
   taskCompletionNotification: boolean
   enterSubmit: boolean
-  referenceImageEditAction: ReferenceImageEditAction
   zipDownloadRoutes: ZipDownloadRoute[]
   agentScrollToBottomAfterSubmit: boolean
   agentMaxToolRounds: number
@@ -196,6 +197,14 @@ export interface MaskDraft {
   maskImageId?: string
 }
 
+export interface AgentInputDraft {
+  prompt: string
+  inputImages: InputImage[]
+  maskDraft: MaskDraft | null
+  maskEditorImageId: string | null
+  updatedAt?: number
+}
+
 // ===== 任务记录 =====
 
 export type TaskStatus = 'running' | 'done' | 'error'
@@ -274,6 +283,8 @@ export interface TaskRecord {
   agentToolCallId?: string
   /** Agent 批量图像工具调用 ID */
   agentBatchCallId?: string
+  /** Agent 批量图像工具中的稳定条目 ID */
+  agentBatchItemId?: string
   /** Agent 图像工具实际动作 */
   agentToolAction?: 'generate' | 'edit' | 'auto' | string
 }
@@ -381,6 +392,17 @@ export interface ImageApiResponse {
   n?: number
 }
 
+export interface ResponsesInputContentItem {
+  type?: string
+  text?: string
+  image_url?: string
+  file_id?: string
+  file_url?: string
+  file_data?: string
+  filename?: string
+  detail?: string
+}
+
 export interface ResponsesOutputItem {
   id?: string
   type?: string
@@ -392,8 +414,8 @@ export interface ResponsesOutputItem {
   name?: string
   /** function_call: JSON-encoded arguments string */
   arguments?: string
-  /** function_call_output: JSON/text output string */
-  output?: string
+  /** function_call_output: JSON/text string or Responses input content */
+  output?: string | ResponsesInputContentItem[]
   annotations?: Array<{
     type?: string
     start_index?: number
@@ -404,6 +426,7 @@ export interface ResponsesOutputItem {
   content?: Array<{
     type?: string
     text?: string
+    refusal?: string
     annotations?: Array<{
       type?: string
       start_index?: number
@@ -412,7 +435,7 @@ export interface ResponsesOutputItem {
       title?: string
     }>
   }>
-  result?: string | {
+  result?: string | null | {
     b64_json?: string
     base64?: string
     image?: string

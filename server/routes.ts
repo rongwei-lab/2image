@@ -2994,6 +2994,7 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
       const result = await callAgentResponsesApi({
         settings,
         profile: textProfile,
+        imageProfile,
         params: { ...requestParams, n: 1, transparent_output: false },
         input: body.input,
         maskDataUrl,

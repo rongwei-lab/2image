@@ -1,6 +1,6 @@
 import { DEFAULT_PARAMS, type AppSettings, type TaskParams } from '../types'
 import { getActiveApiProfile } from './apiProfiles'
-import { normalizeImageSize } from './size'
+import { normalizeCodexCliImageSize, normalizeImageSize } from './size'
 
 export const DEFAULT_FAL_IMAGE_SIZE = '1360x1024'
 export const MAX_FAL_OUTPUT_IMAGES = 4
@@ -25,6 +25,7 @@ export function normalizeParamsForSettings(
   }
 
   if (activeProfile.provider === 'openai' && activeProfile.codexCli) {
+    nextParams.size = normalizeCodexCliImageSize(nextParams.size)
     nextParams.quality = DEFAULT_PARAMS.quality
   }
 
@@ -33,7 +34,6 @@ export function normalizeParamsForSettings(
     if (nextParams.quality === 'auto') nextParams.quality = 'high'
     nextParams.moderation = DEFAULT_PARAMS.moderation
     nextParams.output_compression = DEFAULT_PARAMS.output_compression
-    nextParams.transparent_output = DEFAULT_PARAMS.transparent_output
   }
 
   if (nextParams.output_format === 'png') {
