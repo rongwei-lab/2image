@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { normalizeBaseUrl } from '../lib/api'
+import { customProviderSupportsNativeTransparentBackground } from '../lib/customProviderCapabilities'
 import { hasActiveDataOperations } from '../lib/dataOperations'
 import { isApiProxyAvailable, isApiProxyLocked, readClientDevProxyConfig } from '../lib/devProxy'
 import { changeCloudPassword } from '../lib/cloudApi'
@@ -10,14 +11,14 @@ import {
   DEFAULT_FAL_BASE_URL,
   DEFAULT_FAL_MODEL,
   DEFAULT_IMAGES_MODEL,
-  DEFAULT_OPENAI_PROFILE_ID,
   DEFAULT_RESPONSES_MODEL,
   DEFAULT_SETTINGS,
   findEquivalentApiProfile,
   getApiProviderLabel,
   getActiveApiProfile,
+  getCustomProviderDefinition,
   importCustomProviderSettingsFromJson,
-  isDefaultConfigOnlyEnabled,
+  getDefaultApiProfileId,
   isAgentTextApiProfile,
   isOpenAICompatibleProvider,
   mergeImportedSettings,
@@ -27,7 +28,20 @@ import {
   normalizeStreamPartialImages,
   switchApiProfileProvider,
 } from '../lib/apiProfiles'
+import {
+  getDefaultPresetBaseUrl,
+  getDefaultPresetProfileId,
+  getPresetProfileDescription,
+  getPresetProfileIds,
+  isPresetConfigDeletionPrevented,
+  isPresetConfigOnlyEnabled,
+  isPresetProvider,
+  isPresetProviderDeletionPrevented,
+  isPresetProfileLocked,
+  isPresetProviderLocked,
+} from '../lib/presetConfig'
 import { copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
+import { createCustomProfileImportUrl } from '../lib/profileImportUrl'
 import { requestBrowserNotificationPermission, type BrowserNotificationPermissionResult } from '../lib/browserNotification'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, REASONING_EFFORT_VALUES, type AgentApiConfigMode, type ApiProfile, type AppSettings, type CustomProviderDefinition, type ReasoningEffort, type ZipDownloadRoute } from '../types'
 import {
@@ -40,10 +54,14 @@ import { DEFAULT_DROPDOWN_MAX_HEIGHT, getDropdownMaxHeight } from '../lib/dropdo
 import Select from './Select'
 import { Checkbox } from './Checkbox'
 import ViewportTooltip from './ViewportTooltip'
-import { ChevronDownIcon, CloseIcon, CopyIcon, PlusIcon, TrashIcon, ExportIcon, ImportIcon, DragHandleIcon, LinkIcon } from './icons'
+import { ChevronDownIcon, CloseIcon, CopyIcon, PlusIcon, TrashIcon, GithubIcon, ExportIcon, ImportIcon, DragHandleIcon, LinkIcon } from './icons'
+import { TooltipButton } from './TooltipButton'
+import GeneralSettingsTab from './settings/GeneralSettingsTab'
+import AgentSettingsTab from './settings/AgentSettingsTab'
 import CustomProviderModal from './settings/CustomProviderModal'
 import ProfileImportUrlModal, { type CopyImportUrlOptions } from './settings/ProfileImportUrlModal'
-import { ZIP_DOWNLOAD_ROUTE_OPTIONS } from './settings/ZipDownloadRouteModal'
+import ZipDownloadRouteModal, { ZIP_DOWNLOAD_ROUTE_OPTIONS } from './settings/ZipDownloadRouteModal'
+import MarkdownRenderer from './MarkdownRenderer'
 
 function newId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
@@ -120,7 +138,8 @@ function isPristineNewOpenAIProfile(profile: ApiProfile) {
     profile.codexCli === false &&
     profile.apiProxy === defaultProfile.apiProxy &&
     profile.streamImages === defaultProfile.streamImages &&
-    profile.streamPartialImages === defaultProfile.streamPartialImages
+    profile.streamPartialImages === defaultProfile.streamPartialImages &&
+    profile.transparentBackgroundMethod === defaultProfile.transparentBackgroundMethod
 }
 
 function getImportedProfileFromMergedSettings(
@@ -142,15 +161,15 @@ function isAsyncCustomProvider(provider: CustomProviderDefinition | null | undef
 
 function isProfileApiProxyEligible(settings: AppSettings, profile: ApiProfile) {
   if (!isOpenAICompatibleProvider(settings, profile.provider)) return false
-  const customProvider = settings.customProviders.find((provider) => provider.id === profile.provider)
+  const customProvider = getCustomProviderDefinition(settings, profile.provider)
   return !isAsyncCustomProvider(customProvider)
 }
 
 function getVisibleProviderOrder(settings: AppSettings) {
-  const visibleProviderIds = ['openai', ...settings.customProviders.map((provider) => provider.id)]
+  const visibleProviderIds = ['openai', 'sb2api-async', ...settings.customProviders.map((provider) => provider.id)]
   const visibleProviderSet = new Set(visibleProviderIds)
   const savedOrder = settings.providerOrder?.filter((provider) => visibleProviderSet.has(provider)) ?? []
-  // fal.ai 已从新配置入口移除；这里只保留 OpenAI 兼容接口和自定义服务商的排序。
+  // 保留二开策略：fal.ai 不出现在新配置入口；同时纳入上游新增的异步服务商。
   return [...savedOrder, ...visibleProviderIds.filter((provider) => !savedOrder.includes(provider))]
 }
 
@@ -161,6 +180,9 @@ export default function SettingsModal() {
   const settings = useStore((s) => s.settings)
   const platformSettings = useStore((s) => s.platformSettings)
   const setSettings = useStore((s) => s.setSettings)
+  const dismissPresetProfile = useStore((s) => s.dismissPresetProfile)
+  const dismissPresetProvider = useStore((s) => s.dismissPresetProvider)
+  const restorePresetProvider = useStore((s) => s.restorePresetProvider)
   const reusedTaskApiProfileId = useStore((s) => s.reusedTaskApiProfileId)
   const setReusedTaskApiProfile = useStore((s) => s.setReusedTaskApiProfile)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
@@ -222,11 +244,21 @@ export default function SettingsModal() {
   const apiProxyConfig = readClientDevProxyConfig()
   const apiProxyAvailable = isApiProxyAvailable(apiProxyConfig)
   const apiProxyLocked = isApiProxyLocked(apiProxyConfig)
-  const defaultConfigOnly = isDefaultConfigOnlyEnabled()
+  const presetConfigOnly = isPresetConfigOnlyEnabled()
+  const presetDeletionPrevented = isPresetConfigDeletionPrevented()
+  const presetProfileIds = getPresetProfileIds()
+  const visibleProfiles = presetConfigOnly
+    ? draft.profiles.filter((profile) => presetProfileIds.has(profile.id))
+    : draft.profiles
+  const profileMenuDisabled = presetConfigOnly && visibleProfiles.length <= 1
+  const defaultProfileId = getDefaultPresetProfileId() ?? getDefaultApiProfileId(draft)
   const activeProfile = draft.profiles.find((profile) => profile.id === draft.activeProfileId) ?? draft.profiles[0] ?? getActiveApiProfile(draft)
+  const activePresetDescription = getPresetProfileDescription(activeProfile.id)
+  const activeProfileLocked = isPresetProfileLocked(activeProfile.id)
   const activeProviderIsOpenAICompatible = isOpenAICompatibleProvider(draft, activeProfile.provider)
   const activeProviderUsesApiUrl = activeProviderIsOpenAICompatible || activeProfile.provider === 'fal'
-  const activeCustomProvider = draft.customProviders.find((provider) => provider.id === activeProfile.provider)
+  const activeCustomProvider = getCustomProviderDefinition(draft, activeProfile.provider)
+  const activeCustomProviderSupportsNativeTransparentBackground = !activeCustomProvider || customProviderSupportsNativeTransparentBackground(activeCustomProvider)
   const activeProfileApiProxyEligible = isProfileApiProxyEligible(draft, activeProfile)
   const activeCustomProviderAsync = isAsyncCustomProvider(activeCustomProvider)
   const apiProxyChecked = activeProfileApiProxyEligible && (apiProxyLocked || activeProfile.apiProxy)
@@ -237,23 +269,29 @@ export default function SettingsModal() {
 
   const unorderedProviderOptions = [
     { label: 'OpenAI 兼容接口', value: 'openai', draggable: true },
-    ...draft.customProviders.map((provider) => ({
-      label: provider.name,
-      value: provider.id,
-      draggable: true,
-      actions: [
-        { label: '编辑', onClick: () => openEditCustomProvider(provider) },
-        {
+    { label: 'sub2api（异步）', value: 'sb2api-async', draggable: true },
+    ...draft.customProviders.map((provider) => {
+      const actions = [
+        ...(!presetConfigOnly && !isPresetProviderLocked(provider.id) ? [{ label: '编辑', onClick: () => openEditCustomProvider(provider) }] : []),
+        ...(!presetConfigOnly && !isPresetProviderDeletionPrevented(provider.id, draft.profiles) ? [{
           label: '删除',
           variant: 'danger' as const,
           onClick: () => confirmDeleteCustomProvider(provider),
-        },
-      ],
-    })),
+        }] : []),
+      ]
+      return {
+        label: provider.name,
+        value: provider.id,
+        draggable: true,
+        actions: actions.length ? actions : undefined,
+      }
+    }),
   ]
 
   const providerOptions = [
-    { label: '创建自定义服务商', value: ADD_CUSTOM_PROVIDER_VALUE, variant: 'action' as const },
+    ...(!presetConfigOnly && !activeProfileLocked
+      ? [{ label: '创建自定义服务商', value: ADD_CUSTOM_PROVIDER_VALUE, variant: 'action' as const }]
+      : []),
     ...unorderedProviderOptions.sort((a, b) => {
       const aIndex = providerOrder.indexOf(String(a.value))
       const bIndex = providerOrder.indexOf(String(b.value))
@@ -274,17 +312,22 @@ export default function SettingsModal() {
     ? `已开启 ${enabledZipDownloadRouteCount} 项使用压缩包进行批量下载的途径`
     : '未开启任何使用压缩包进行批量下载的途径'
 
-  const agentTextProfiles = draft.profiles.filter(isAgentTextApiProfile)
+  const agentProfiles = (presetConfigOnly ? visibleProfiles : draft.profiles)
+    .filter((profile) => {
+      if (!profile.apiKey.trim()) return false
+      if (profile.baseUrl.trim() || profile.provider === 'fal') return true
+      return apiProxyAvailable && isProfileApiProxyEligible(draft, profile) && (apiProxyLocked || profile.apiProxy)
+    })
+  const agentTextProfiles = agentProfiles.filter(isAgentTextApiProfile)
   const selectedAgentTextProfile = agentTextProfiles.find((profile) => profile.id === draft.agentTextProfileId)
-    ?? (isAgentTextApiProfile(activeProfile) ? activeProfile : agentTextProfiles[0])
     ?? null
-  const selectedAgentImageProfile = draft.profiles.find((profile) => profile.id === draft.agentImageProfileId)
-    ?? activeProfile
+  const selectedAgentImageProfile = agentProfiles.find((profile) => profile.id === draft.agentImageProfileId)
+    ?? null
   const agentTextProfileOptions = agentTextProfiles.map((profile) => ({
     label: `${profile.name} · ${profile.model || DEFAULT_RESPONSES_MODEL}`,
     value: profile.id,
   }))
-  const agentImageProfileOptions = draft.profiles.map((profile) => ({
+  const agentImageProfileOptions = agentProfiles.map((profile) => ({
     label: `${profile.name} · ${getApiProviderLabel(draft, profile.provider)} · ${profile.model}`,
     value: profile.id,
   }))
@@ -349,10 +392,6 @@ export default function SettingsModal() {
     }
   }, [showProfileMenu, updateProfileMenuMaxHeight])
 
-  useEffect(() => {
-    if (defaultConfigOnly) setShowProfileMenu(false)
-  }, [defaultConfigOnly])
-
   useEffect(() => () => {
     if (profileImportUrlTooltipTimerRef.current != null) window.clearTimeout(profileImportUrlTooltipTimerRef.current)
     if (duplicateProfileTooltipTimerRef.current != null) window.clearTimeout(duplicateProfileTooltipTimerRef.current)
@@ -397,20 +436,23 @@ export default function SettingsModal() {
     const normalizedProfiles = nextDraft.profiles.map((profile) => {
       const nextApiProxy = isProfileApiProxyEligible(nextDraft, profile) && apiProxyAvailable ? (apiProxyLocked || profile.apiProxy) : false
       const shouldKeepEmptyBaseUrl = profile.provider !== 'fal' && nextApiProxy && !profile.baseUrl.trim()
+      const emptyBaseUrlFallback = profile.id === defaultProfileId
+        ? getDefaultPresetBaseUrl()
+        : DEFAULT_SETTINGS.baseUrl
       const normalizedBaseUrl = profile.provider === 'fal'
-        ? profile.baseUrl.trim().replace(/\/+$/, '') || DEFAULT_FAL_BASE_URL
-        : shouldKeepEmptyBaseUrl ? '' : normalizeBaseUrl(profile.baseUrl.trim() || DEFAULT_SETTINGS.baseUrl)
+        ? profile.baseUrl.trim().replace(/\/+$/, '') || (profile.id === defaultProfileId ? '' : DEFAULT_FAL_BASE_URL)
+        : shouldKeepEmptyBaseUrl ? '' : normalizeBaseUrl(profile.baseUrl.trim() || emptyBaseUrlFallback)
       const defaultModel = profile.provider === 'fal' ? DEFAULT_FAL_MODEL : getDefaultModelForMode(profile.apiMode)
       return {
         ...profile,
-        name: profile.name.trim() || (profile.id === DEFAULT_OPENAI_PROFILE_ID ? '默认' : '新配置'),
+        name: profile.name.trim() || (profile.id === defaultProfileId ? '默认' : '新配置'),
         baseUrl: normalizedBaseUrl,
         apiKey: profile.apiKey.trim(),
         hasStoredApiKey: profile.apiKey.trim() ? undefined : profile.hasStoredApiKey,
         model: profile.model.trim() || defaultModel,
         timeout: Number(profile.timeout) || DEFAULT_SETTINGS.timeout,
         apiProxy: nextApiProxy,
-        codexCli: profile.provider === 'openai' ? profile.codexCli : false,
+        codexCli: isOpenAICompatibleProvider(nextDraft, profile.provider) ? profile.codexCli : false,
         streamImages: profile.provider === 'openai' ? profile.streamImages : false,
         streamPartialImages: profile.provider === 'openai' ? normalizeStreamPartialImages(profile.streamPartialImages) : DEFAULT_STREAM_PARTIAL_IMAGES,
       }
@@ -465,6 +507,7 @@ export default function SettingsModal() {
       if (profile.codexCli) url.searchParams.set('codexCli', 'true')
       if (profile.streamImages !== DEFAULT_SETTINGS.streamImages) url.searchParams.set('streamImages', String(Boolean(profile.streamImages)))
       if (profile.streamPartialImages !== DEFAULT_STREAM_PARTIAL_IMAGES) url.searchParams.set('streamPartialImages', String(normalizeStreamPartialImages(profile.streamPartialImages)))
+      if (profile.transparentBackgroundMethod !== 'api') url.searchParams.set('transparentBackgroundMethod', profile.transparentBackgroundMethod)
 
       let result = url.toString()
       if (!options.includeApiKey) {
@@ -475,28 +518,12 @@ export default function SettingsModal() {
       return result
     }
 
-    const provider = draft.customProviders.find((item) => item.id === profile.provider)
-    const importProfile: ApiProfile = {
-      ...profile,
-      apiKey: options.includeApiKey ? profile.apiKey : '',
-    }
-    if (!options.includeApiKey) {
-      if (options.useNewApiAddress) importProfile.baseUrl = '{address}'
-      if (options.useNewApiKey) importProfile.apiKey = '{key}'
-      if (options.useNewApiModel) importProfile.model = '{model}'
-    }
-    url.searchParams.set('settings', JSON.stringify({
-      customProviders: provider ? [provider] : [],
-      profiles: [importProfile],
-    }))
-
-    let result = url.toString()
-    if (!options.includeApiKey) {
-      if (options.useNewApiAddress) result = result.replace(/%7Baddress%7D/g, '{address}')
-      if (options.useNewApiKey) result = result.replace(/%7Bkey%7D/g, '{key}')
-      if (options.useNewApiModel) result = result.replace(/%7Bmodel%7D/g, '{model}')
-    }
-    return result
+    return createCustomProfileImportUrl(
+      window.location.href,
+      profile,
+      draft.customProviders.find((item) => item.id === profile.provider),
+      options,
+    )
   }
 
   const copyProfileImportUrl = async (profile: ApiProfile, options: ProfileImportUrlOptions) => {
@@ -522,12 +549,14 @@ export default function SettingsModal() {
     })
 
   const updateActiveProfile = (patch: Partial<ApiProfile>, commit = false) => {
+    if (activeProfileLocked && (Object.keys(patch).length !== 1 || patch.apiKey === undefined)) return
     const nextDraft = getDraftWithActiveProfilePatch(patch)
     setDraft(nextDraft)
     if (commit) commitSettings(nextDraft)
   }
 
   const commitActiveProfilePatch = (patch: Partial<ApiProfile>) => {
+    if (activeProfileLocked && (Object.keys(patch).length !== 1 || patch.apiKey === undefined)) return
     const nextDraft = getDraftWithActiveProfilePatch(patch)
     commitSettings(nextDraft)
   }
@@ -552,7 +581,7 @@ export default function SettingsModal() {
     const nextDraft = {
       ...draft,
       agentMaxToolRounds: normalizedAgentMaxToolRounds,
-      profiles: activeProviderIsOpenAICompatible
+      profiles: activeProviderIsOpenAICompatible && !activeProfileLocked
         ? draft.profiles.map((profile) =>
             profile.id === activeProfile.id ? { ...profile, timeout: normalizedTimeout } : profile,
           )
@@ -564,13 +593,13 @@ export default function SettingsModal() {
   }
 
   const commitTimeout = useCallback(() => {
-    if (!isOpenAICompatibleProvider(draft, activeProfile.provider)) return
+    if (activeProfileLocked || !isOpenAICompatibleProvider(draft, activeProfile.provider)) return
     const nextTimeout = Number(timeoutInput)
     const normalizedTimeout =
       timeoutInput.trim() === '' ? DEFAULT_SETTINGS.timeout : Number.isNaN(nextTimeout) ? activeProfile.timeout : nextTimeout
     setTimeoutInput(String(normalizedTimeout))
     updateActiveProfile({ timeout: normalizedTimeout }, true)
-  }, [draft, activeProfile.id, activeProfile.provider, activeProfile.timeout, timeoutInput])
+  }, [draft, activeProfile.id, activeProfile.provider, activeProfile.timeout, activeProfileLocked, timeoutInput])
 
   const commitAgentMaxToolRounds = useCallback(() => {
     const value = agentMaxToolRoundsInput.trim() === ''
@@ -669,7 +698,7 @@ export default function SettingsModal() {
       }
       setIsImportingData(true)
       try {
-        const imported = await importData(files, { importConfig, importTasks })
+        const imported = await importData(files, { importConfig: presetConfigOnly ? false : importConfig, importTasks })
         if (imported) {
           const nextDraft = normalizeSettings(useStore.getState().settings)
           setDraft(nextDraft)
@@ -710,7 +739,7 @@ export default function SettingsModal() {
   }
 
   const createNewProfile = () => {
-    if (defaultConfigOnly) return
+    if (presetConfigOnly) return
     setReusedTaskApiProfile(null)
     const profile = createDefaultOpenAIProfile({ id: newId('openai'), name: '新配置' })
     const nextDraft = normalizeSettings({ 
@@ -726,18 +755,29 @@ export default function SettingsModal() {
     commitSettings({
       ...draft,
       agentApiConfigMode: mode,
-      agentTextProfileId: mode !== 'off' ? selectedAgentTextProfile?.id ?? draft.agentTextProfileId : draft.agentTextProfileId,
-      agentImageProfileId: mode === 'hybrid' ? selectedAgentImageProfile?.id ?? draft.agentImageProfileId : draft.agentImageProfileId,
+      agentTextProfileId: mode !== 'off'
+        ? selectedAgentTextProfile?.id
+          ?? agentTextProfiles.find((profile) => profile.id === activeProfile.id)?.id
+          ?? agentTextProfiles[0]?.id
+          ?? draft.agentTextProfileId
+        : draft.agentTextProfileId,
+      agentImageProfileId: mode === 'hybrid'
+        ? selectedAgentImageProfile?.id
+          ?? agentProfiles.find((profile) => profile.id === activeProfile.id)?.id
+          ?? agentProfiles[0]?.id
+          ?? draft.agentImageProfileId
+        : draft.agentImageProfileId,
     })
   }
 
   const duplicateActiveProfile = () => {
-    if (defaultConfigOnly) return
+    if (presetConfigOnly) return
     setReusedTaskApiProfile(null)
     setDuplicateProfileTooltipVisible(false)
     const profile: ApiProfile = {
       ...activeProfile,
       id: newId(activeProfile.provider === 'openai' ? 'openai' : 'profile'),
+      isDefault: undefined,
       name: `${activeProfile.name}（复制）`,
     }
     const nextDraft = normalizeSettings({
@@ -750,7 +790,7 @@ export default function SettingsModal() {
   }
 
   const switchProfile = (id: string) => {
-    if (defaultConfigOnly) return
+    if (presetConfigOnly && !presetProfileIds.has(id)) return
     setReusedTaskApiProfile(null)
     const nextDraft = normalizeSettings({ ...draft, activeProfileId: id })
     commitSettings(nextDraft)
@@ -758,6 +798,7 @@ export default function SettingsModal() {
   }
   
   const handleProfileDragStart = (e: React.DragEvent, id: string) => {
+    if (presetConfigOnly) return
     setDraggedProfileId(id)
     e.dataTransfer.effectAllowed = 'move'
     e.dataTransfer.setData('text/plain', id)
@@ -769,7 +810,7 @@ export default function SettingsModal() {
 
     const targetElement = e.currentTarget as HTMLElement
     const rect = targetElement.getBoundingClientRect()
-    const position = e.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
+    const position = e.clientY >= rect.top + rect.height / 2 ? 'after' : 'before'
 
     if (dragOverProfileId !== targetId || dragDropPosition !== position) {
       setDragOverProfileId(targetId)
@@ -798,7 +839,7 @@ export default function SettingsModal() {
   }
 
   const moveProfileToDropTarget = (sourceId: string, targetId: string, position: 'before' | 'after' | null) => {
-    if (!sourceId || sourceId === targetId) return
+    if (presetConfigOnly || !sourceId || sourceId === targetId) return
 
     const sourceIndex = draft.profiles.findIndex((p) => p.id === sourceId)
     const targetIndex = draft.profiles.findIndex((p) => p.id === targetId)
@@ -824,6 +865,7 @@ export default function SettingsModal() {
   }
 
   const handleProfileTouchStart = (e: React.TouchEvent, profile: ApiProfile) => {
+    if (presetConfigOnly) return
     if (!(e.target as HTMLElement).closest('[data-drag-handle]')) return
     const touch = e.touches[0]
     const rect = e.currentTarget.getBoundingClientRect()
@@ -868,7 +910,7 @@ export default function SettingsModal() {
     if (!targetId) return
 
     const rect = targetElement.getBoundingClientRect()
-    const position = touch.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
+    const position = touch.clientY >= rect.top + rect.height / 2 ? 'after' : 'before'
     setDragOverProfileId(targetId)
     setDragDropPosition(position)
 
@@ -895,8 +937,10 @@ export default function SettingsModal() {
   }
 
   const deleteProfile = (id: string) => {
-    if (draft.profiles.length <= 1) return
+    const preset = presetProfileIds.has(id)
+    if (presetConfigOnly || draft.profiles.length <= 1 || (preset && presetDeletionPrevented) || (!preset && id === defaultProfileId)) return
     if (id === reusedTaskApiProfileId) setReusedTaskApiProfile(null)
+    if (preset) dismissPresetProfile(id)
     const nextProfiles = draft.profiles.filter((item) => item.id !== id)
     const nextDraft = normalizeSettings({
       ...draft,
@@ -926,7 +970,7 @@ export default function SettingsModal() {
   }
 
   const handleProviderTypeChange = (value: string | number) => {
-    if (defaultConfigOnly) return
+    if (presetConfigOnly || activeProfileLocked) return
     if (value === ADD_CUSTOM_PROVIDER_VALUE) {
       setEditingCustomProviderId(null)
       setCustomProviderJson(DEFAULT_CUSTOM_PROVIDER_JSON)
@@ -936,7 +980,7 @@ export default function SettingsModal() {
     }
 
     const provider = String(value) as ApiProfile['provider']
-    const customProvider = draft.customProviders.find((item) => item.id === provider)
+    const customProvider = getCustomProviderDefinition(draft, provider) ?? undefined
     updateActiveProfile(switchApiProfileProvider(activeProfile, provider, customProvider), true)
   }
 
@@ -954,7 +998,10 @@ export default function SettingsModal() {
     )
     const provider = normalizeCustomProviderDefinition(
       editingCustomProviderId && input && typeof input === 'object'
-        ? { ...input, id: editingCustomProviderId }
+        ? {
+            ...input,
+            id: editingCustomProviderId,
+          }
         : input,
       usedIds,
     )
@@ -963,6 +1010,7 @@ export default function SettingsModal() {
   }
 
   function openEditCustomProvider(provider: CustomProviderDefinition) {
+    if (presetConfigOnly || isPresetProviderLocked(provider.id)) return
     setEditingCustomProviderId(provider.id)
     setCustomProviderJson(JSON.stringify({
       name: provider.name,
@@ -975,6 +1023,7 @@ export default function SettingsModal() {
   }
 
   const saveCustomProvider = () => {
+    if (presetConfigOnly || (editingCustomProviderId && isPresetProviderLocked(editingCustomProviderId))) return
     try {
       const customProvider = buildCustomProviderFromJson()
       if (editingCustomProviderId) {
@@ -998,6 +1047,7 @@ export default function SettingsModal() {
         customProviders: [...draft.customProviders, customProvider],
         profiles: draft.profiles.map((profile) => profile.id === activeProfile.id ? nextProfile : profile),
       })
+      restorePresetProvider(customProvider.id)
       commitSettings(nextDraft)
       setShowCustomProviderImport(false)
       setEditingCustomProviderId(null)
@@ -1008,6 +1058,7 @@ export default function SettingsModal() {
   }
 
   function confirmDeleteCustomProvider(provider: CustomProviderDefinition) {
+    if (presetConfigOnly || isPresetProviderDeletionPrevented(provider.id, draft.profiles)) return
     setConfirmDialog({
       title: '删除服务商',
       message: `确定要删除自定义服务商「${provider.name}」吗？正在使用它的配置会切回 OpenAI 兼容接口。`,
@@ -1016,7 +1067,9 @@ export default function SettingsModal() {
   }
 
   function deleteCustomProvider(provider: CustomProviderDefinition) {
+    if (presetConfigOnly || isPresetProviderDeletionPrevented(provider.id, draft.profiles)) return
     const providerId = provider.id
+    if (isPresetProvider(providerId)) dismissPresetProvider(providerId)
     const nextDraft = normalizeSettings({
       ...draft,
       customProviders: draft.customProviders.filter((provider) => provider.id !== providerId),
@@ -1055,15 +1108,14 @@ export default function SettingsModal() {
         const nextDraft = shouldReplaceActiveProfile
           ? normalizeSettings({
               ...mergedDraft,
-              profiles: mergedDraft.profiles
-                .filter((profile) => profile.id === activeProfile.id || profile.id !== importedProfile.id)
-                .map((profile) => profile.id === activeProfile.id ? { ...importedProfile, id: activeProfile.id } : profile),
-              activeProfileId: activeProfile.id,
+              profiles: mergedDraft.profiles.filter((profile) => profile.id !== activeProfile.id),
+              activeProfileId: importedProfile.id,
             })
           : normalizeSettings({
               ...mergedDraft,
               activeProfileId: importedProfile.id,
             })
+        for (const provider of imported.customProviders) restorePresetProvider(provider.id)
         setDraft(nextDraft)
         setSettings(nextDraft)
         setTimeoutInput(String(getActiveApiProfile(nextDraft).timeout))
@@ -1572,7 +1624,7 @@ export default function SettingsModal() {
                         复制导入 URL
                       </ViewportTooltip>
                     </span>
-                    {!defaultConfigOnly && <span className="relative inline-flex">
+                    {!presetConfigOnly && <span className="relative inline-flex">
                       <button
                         type="button"
                         onClick={duplicateActiveProfile}
@@ -1604,12 +1656,12 @@ export default function SettingsModal() {
                       ref={profileMenuTriggerRef}
                       type="button"
                       onClick={() => {
-                        if (defaultConfigOnly) return
+                        if (profileMenuDisabled) return
                         if (!showProfileMenu) updateProfileMenuMaxHeight()
                         setShowProfileMenu(!showProfileMenu)
                       }}
-                      disabled={defaultConfigOnly}
-                      className={`flex w-full min-w-0 items-center justify-between gap-2 rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2 text-sm text-gray-700 outline-none transition dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 ${defaultConfigOnly ? 'cursor-not-allowed opacity-70' : 'hover:bg-gray-50 dark:hover:bg-white/[0.06]'}`}
+                      disabled={profileMenuDisabled}
+                      className={`flex w-full min-w-0 items-center justify-between gap-2 rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2 text-sm text-gray-700 outline-none transition dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 ${profileMenuDisabled ? 'cursor-not-allowed opacity-70' : 'hover:bg-gray-50 dark:hover:bg-white/[0.06]'}`}
                       title={activeProfile.name}
                     >
                       <span className="flex min-w-0 items-center gap-2">
@@ -1621,13 +1673,13 @@ export default function SettingsModal() {
                       <ChevronDownIcon className={`w-3.5 h-3.5 flex-shrink-0 text-gray-400 dark:text-gray-500 transition-transform duration-200 ${showProfileMenu ? 'rotate-180' : ''}`} />
                     </button>
                     
-                    {showProfileMenu && !defaultConfigOnly && (
+                    {showProfileMenu && !profileMenuDisabled && (
                       <>
                         <div
                           className="absolute right-0 top-full z-50 mt-1.5 w-full overflow-hidden overflow-y-auto rounded-xl border border-gray-200/60 bg-white/95 py-1 shadow-[0_8px_30px_rgb(0,0,0,0.12)] ring-1 ring-black/5 backdrop-blur-xl animate-dropdown-down dark:border-white/[0.08] dark:bg-gray-900/95 dark:shadow-[0_8px_30px_rgb(0,0,0,0.3)] dark:ring-white/10 custom-scrollbar"
                           style={{ maxHeight: profileMenuMaxHeight }}
                         >
-                          <button
+                          {!presetConfigOnly && <button
                             type="button"
                             onClick={(e) => {
                               e.preventDefault()
@@ -1639,30 +1691,33 @@ export default function SettingsModal() {
                             <span className="flex h-5 w-5 shrink-0 items-center justify-center">
                               <PlusIcon className="h-4 w-4" />
                             </span>
-                          </button>
+                          </button>}
                           <div>
-                            {draft.profiles.map(profile => (
-                              <div
-                                key={profile.id}
-                                data-profile-id={profile.id}
-                                title={profile.name}
-                                draggable
-                                onDragStart={(e) => handleProfileDragStart(e, profile.id)}
-                                onDragOver={(e) => handleProfileDragOver(e, profile.id)}
-                                onDrop={(e) => handleProfileDrop(e, profile.id)}
-                                onDragEnd={handleProfileDragEnd}
-                                onTouchStart={(e) => handleProfileTouchStart(e, profile)}
-                                onTouchMove={handleProfileTouchMove}
-                                onTouchEnd={handleProfileTouchEnd}
-                                onTouchCancel={handleProfileDragEnd}
-                                onClick={(e) => {
-                                  // Don't switch profile if they are clicking the drag handle
-                                  if ((e.target as HTMLElement).closest('[data-drag-handle]')) return
-                                  e.preventDefault()
-                                  switchProfile(profile.id)
-                                }}
-                                className={`relative group flex w-full cursor-pointer items-center justify-between px-3 py-2 text-left text-xs transition-colors ${draggedProfileId === profile.id ? 'opacity-40 bg-gray-100 dark:bg-white/[0.04]' : profile.id === activeProfile.id ? 'bg-blue-50 font-medium text-blue-600 dark:bg-blue-500/10 dark:text-blue-400' : 'text-gray-700 hover:bg-gray-50 dark:text-gray-300 dark:hover:bg-white/[0.06]'}`}
-                              >
+                            {visibleProfiles.map((profile) => {
+                              const isDefaultProfile = profile.id === defaultProfileId
+                              const isPresetProfile = presetProfileIds.has(profile.id)
+                              return (
+                                <div
+                                  key={profile.id}
+                                  data-profile-id={profile.id}
+                                  title={profile.name}
+                                  draggable={!presetConfigOnly}
+                                  onDragStart={(e) => handleProfileDragStart(e, profile.id)}
+                                  onDragOver={(e) => handleProfileDragOver(e, profile.id)}
+                                  onDrop={(e) => handleProfileDrop(e, profile.id)}
+                                  onDragEnd={handleProfileDragEnd}
+                                  onTouchStart={(e) => handleProfileTouchStart(e, profile)}
+                                  onTouchMove={handleProfileTouchMove}
+                                  onTouchEnd={handleProfileTouchEnd}
+                                  onTouchCancel={handleProfileDragEnd}
+                                  onClick={(e) => {
+                                    // 点击拖拽柄时不切换配置。
+                                    if ((e.target as HTMLElement).closest('[data-drag-handle]')) return
+                                    e.preventDefault()
+                                    switchProfile(profile.id)
+                                  }}
+                                  className={`relative group flex w-full cursor-pointer items-center justify-between px-3 py-2 text-left text-xs transition-colors ${draggedProfileId === profile.id ? 'opacity-40 bg-gray-100 dark:bg-white/[0.04]' : profile.id === activeProfile.id ? 'bg-blue-50 font-medium text-blue-600 dark:bg-blue-500/10 dark:text-blue-400' : 'text-gray-700 hover:bg-gray-50 dark:text-gray-300 dark:hover:bg-white/[0.06]'}`}
+                                >
                                 {dragOverProfileId === profile.id && dragDropPosition === 'before' && draggedProfileId !== profile.id && (
                                   <div className="absolute -top-[1px] left-0 right-0 h-[2px] bg-blue-500 rounded-full z-40 shadow-sm pointer-events-none" />
                                 )}
@@ -1670,14 +1725,16 @@ export default function SettingsModal() {
                                   <div className="absolute -bottom-[1px] left-0 right-0 h-[2px] bg-blue-500 rounded-full z-40 shadow-sm pointer-events-none" />
                                 )}
                                 <div className="flex min-w-0 flex-1 items-center gap-2 pr-2">
-                                  <div
-                                    data-drag-handle
-                                    className="flex cursor-grab active:cursor-grabbing items-center justify-center text-gray-400 opacity-60 transition-opacity hover:opacity-100 dark:text-gray-500"
-                                    style={{ touchAction: 'none' }}
-                                    title="拖拽排序"
-                                  >
-                                    <DragHandleIcon className="h-3.5 w-3.5" />
-                                  </div>
+                                  {!presetConfigOnly && (
+                                    <div
+                                      data-drag-handle
+                                      className="flex cursor-grab active:cursor-grabbing items-center justify-center text-gray-400 opacity-60 transition-opacity hover:opacity-100 dark:text-gray-500"
+                                      style={{ touchAction: 'none' }}
+                                      title="拖拽排序"
+                                    >
+                                      <DragHandleIcon className="h-3.5 w-3.5" />
+                                    </div>
+                                  )}
                                   <span className="min-w-0 truncate">{profile.name}</span>
                                   <span className={`rounded px-1.5 py-0.5 text-[10px] shrink-0 ${profile.id === activeProfile.id ? 'bg-blue-100 text-blue-700 dark:bg-blue-500/20 dark:text-blue-300' : 'bg-gray-100 text-gray-500 dark:bg-white/[0.08] dark:text-gray-400'}`}>
                                     {getApiProviderLabel(draft, profile.provider)}
@@ -1698,32 +1755,43 @@ export default function SettingsModal() {
                                   >
                                     <LinkIcon className="h-3.5 w-3.5" />
                                   </button>
-                                  {draft.profiles.length > 1 && (
-                                    <button
-                                      type="button"
+                                  {!presetConfigOnly && (isDefaultProfile || draft.profiles.length > 1) && (
+                                    <TooltipButton
+                                      tooltip={isPresetProfile && presetDeletionPrevented ? '预置配置不可删除' : '删除配置'}
+                                      disabled={isPresetProfile && presetDeletionPrevented}
+                                      showOnClick={isPresetProfile && presetDeletionPrevented}
+                                      stopPropagation
                                       onClick={(e) => {
                                         e.preventDefault()
-                                        e.stopPropagation()
                                         setConfirmDialog({
                                           title: '删除配置',
                                           message: `确定要删除配置「${profile.name}」吗？`,
                                           action: () => deleteProfile(profile.id)
                                         })
                                       }}
-                                      className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-gray-400 opacity-60 transition-all hover:bg-red-50 hover:text-red-500 hover:opacity-100 dark:hover:bg-red-500/10"
-                                      aria-label="删除配置"
+                                      wrapperClassName="relative flex h-5 w-5 shrink-0"
+                                      className={`flex h-5 w-5 shrink-0 items-center justify-center rounded opacity-60 transition-all ${isPresetProfile && presetDeletionPrevented ? 'cursor-not-allowed text-gray-300 dark:text-gray-600' : 'text-gray-400 hover:bg-red-50 hover:text-red-500 hover:opacity-100 dark:hover:bg-red-500/10'}`}
                                     >
                                       <TrashIcon className="h-3.5 w-3.5" />
-                                    </button>
+                                    </TooltipButton>
                                   )}
                                 </div>
                               </div>
-                            ))}
+                              )
+                            })}
                           </div>
                         </div>
                       </>
                     )}
                   </div>
+                  {activePresetDescription && (
+                    <div data-selectable-text className="mt-2.5 flex items-start gap-3 rounded-xl border border-gray-200/70 bg-gray-50/70 px-3.5 py-3 text-sm leading-6 text-gray-600 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-300">
+                      <svg className="mt-0.5 h-5 w-5 shrink-0 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      <MarkdownRenderer content={activePresetDescription} className="min-w-0 flex-1" />
+                    </div>
+                  )}
                 </div>
 
               {/* 1. 配置名称 */}
@@ -1734,6 +1802,7 @@ export default function SettingsModal() {
                   onChange={(e) => updateActiveProfile({ name: e.target.value })}
                   onBlur={(e) => commitActiveProfilePatch({ name: e.target.value })}
                   type="text"
+                  disabled={activeProfileLocked}
                   className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
                 />
               </label>
@@ -1746,7 +1815,7 @@ export default function SettingsModal() {
                   onChange={handleProviderTypeChange}
                   onReorder={handleProviderReorder}
                   options={providerOptions}
-                  disabled={defaultConfigOnly}
+                  disabled={presetConfigOnly || activeProfileLocked}
                   className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
                 />
               </div>
@@ -1762,7 +1831,7 @@ export default function SettingsModal() {
                     onChange={(e) => updateActiveProfile({ baseUrl: e.target.value })}
                     onBlur={(e) => commitActiveProfilePatch({ baseUrl: e.target.value })}
                     type="text"
-                    disabled={apiProxyEnabled}
+                    disabled={apiProxyEnabled || activeProfileLocked}
                     placeholder={activeProfile.provider === 'fal' ? DEFAULT_FAL_BASE_URL : DEFAULT_SETTINGS.baseUrl}
                     className={`w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50 ${apiProxyEnabled ? 'opacity-50 cursor-not-allowed' : ''}`}
                   />
@@ -1772,7 +1841,7 @@ export default function SettingsModal() {
                     ) : activeProfile.provider === 'fal' ? (
                       <span>默认使用 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">{DEFAULT_FAL_BASE_URL}</code>；填写自定义地址时将作为 fal.ai 代理 URL。</span>
                     ) : (
-                      <span>支持通过查询参数覆盖：<code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">?apiUrl=</code></span>
+                      <span>末尾带 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">/</code> 时直接使用该地址拼接接口，不补 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">/v1</code> 前缀；支持通过查询参数覆盖：<code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">?apiUrl=</code>。</span>
                     )}
                   </div>
                 </label>
@@ -1786,9 +1855,9 @@ export default function SettingsModal() {
                     <button
                       type="button"
                       onClick={() => {
-                        if (!apiProxyLocked) updateActiveProfile({ apiProxy: !activeProfile.apiProxy }, true)
+                        if (!apiProxyLocked && !activeProfileLocked) updateActiveProfile({ apiProxy: !activeProfile.apiProxy }, true)
                       }}
-                      disabled={apiProxyLocked}
+                      disabled={apiProxyLocked || activeProfileLocked}
                       className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${apiProxyChecked ? 'bg-blue-500' : 'bg-gray-300 dark:bg-gray-600'} ${apiProxyLocked ? 'cursor-not-allowed opacity-70' : ''}`}
                       role="switch"
                       aria-checked={apiProxyChecked}
@@ -1868,6 +1937,7 @@ export default function SettingsModal() {
                       { label: 'Images API (/v1/images)', value: 'images' },
                       { label: 'Responses API (/v1/responses)', value: 'responses' },
                     ]}
+                    disabled={activeProfileLocked}
                     className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
                   />
                   <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
@@ -1886,6 +1956,7 @@ export default function SettingsModal() {
                   onChange={(e) => updateActiveProfile({ model: e.target.value })}
                   onBlur={(e) => commitActiveProfilePatch({ model: e.target.value })}
                   type="text"
+                  disabled={activeProfileLocked}
                   placeholder={activeProfile.provider === 'fal' ? DEFAULT_FAL_MODEL : getDefaultModelForMode(activeProfile.apiMode ?? DEFAULT_SETTINGS.apiMode)}
                   className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
                 />
@@ -1917,6 +1988,7 @@ export default function SettingsModal() {
                           { label: '默认', value: '' },
                           ...REASONING_EFFORT_VALUES.map((value) => ({ label: value, value })),
                         ]}
+                        disabled={activeProfileLocked}
                         className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-1.5 text-xs text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
                       />
                     </div>
@@ -1936,6 +2008,7 @@ export default function SettingsModal() {
                       <button
                         type="button"
                         onClick={() => updateActiveProfile({ streamImages: !activeProfile.streamImages }, true)}
+                        disabled={activeProfileLocked}
                         className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${activeProfile.streamImages ? 'bg-blue-500' : 'bg-gray-300 dark:bg-gray-600'}`}
                         role="switch"
                         aria-checked={!!activeProfile.streamImages}
@@ -1955,7 +2028,7 @@ export default function SettingsModal() {
                         <Select
                           value={normalizeStreamPartialImages(activeProfile.streamPartialImages)}
                           onChange={(value) => updateActiveProfile({ streamPartialImages: normalizeStreamPartialImages(value) }, true)}
-                          disabled={!activeProfile.streamImages}
+                          disabled={!activeProfile.streamImages || activeProfileLocked}
                           options={[
                             { label: '0，不请求', value: 0 },
                             { label: '1 张', value: 1 },
@@ -1973,7 +2046,31 @@ export default function SettingsModal() {
                 </div>
               )}
 
-              {/* 9. 返回 Base64 图片数据 */}
+              {/* 9. 透明背景实现方式 */}
+              <div className="block">
+                <div className="mb-1.5 flex items-center justify-between gap-3">
+                  <span className="block text-sm text-gray-600 dark:text-gray-300">透明背景实现方式</span>
+                  <div className="w-28 shrink-0">
+                    <Select
+                      value={activeProfile.transparentBackgroundMethod}
+                      onChange={(value) => updateActiveProfile({ transparentBackgroundMethod: value as ApiProfile['transparentBackgroundMethod'] }, true)}
+                      options={[
+                        { label: 'API 原生', value: 'api' },
+                        { label: '本地后处理', value: 'local' },
+                      ]}
+                      disabled={activeProfileLocked || !activeCustomProviderSupportsNativeTransparentBackground}
+                      className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-1.5 text-xs text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
+                    />
+                  </div>
+                </div>
+                <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
+                  {activeCustomProviderSupportsNativeTransparentBackground
+                    ? 'API 原生会请求接口直接生成透明背景，需当前接口支持；本地后处理会生成纯色背景并在浏览器中去除。'
+                    : <>当前自定义服务商 Manifest 未映射 <code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">$params.background</code>，无法使用 API 原生透明背景。</>}
+                </div>
+              </div>
+
+              {/* 10. 返回 Base64 图片数据 */}
               {activeProviderIsOpenAICompatible && (
                 <div className="block">
                   <div className="mb-1.5 flex items-center justify-between">
@@ -1981,6 +2078,7 @@ export default function SettingsModal() {
                     <button
                       type="button"
                       onClick={() => updateActiveProfile({ responseFormatB64Json: !activeProfile.responseFormatB64Json }, true)}
+                      disabled={activeProfileLocked}
                       className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${activeProfile.responseFormatB64Json ? 'bg-blue-500' : 'bg-gray-300 dark:bg-gray-600'}`}
                       role="switch"
                       aria-checked={!!activeProfile.responseFormatB64Json}
@@ -1995,14 +2093,15 @@ export default function SettingsModal() {
                 </div>
               )}
 
-              {/* 10. Codex CLI 兼容模式 */}
-              {activeProfile.provider === 'openai' && (
+              {/* 11. Codex CLI 兼容模式 */}
+              {activeProviderIsOpenAICompatible && (
                 <div className="block">
                   <div className="mb-1.5 flex items-center justify-between">
                     <span className="block text-sm text-gray-600 dark:text-gray-300">Codex CLI 兼容模式</span>
                     <button
                       type="button"
                       onClick={() => updateActiveProfile({ codexCli: !activeProfile.codexCli }, true)}
+                      disabled={activeProfileLocked}
                       className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${activeProfile.codexCli ? 'bg-blue-500' : 'bg-gray-300 dark:bg-gray-600'}`}
                       role="switch"
                       aria-checked={activeProfile.codexCli}
@@ -2017,7 +2116,7 @@ export default function SettingsModal() {
                 </div>
               )}
 
-              {/* 11. 请求超时 */}
+              {/* 12. 请求超时 */}
               {activeProviderIsOpenAICompatible && (
                 <label className="block">
                   <span className="mb-1.5 block text-sm text-gray-600 dark:text-gray-300">请求超时 (秒)</span>
@@ -2026,6 +2125,7 @@ export default function SettingsModal() {
                     onChange={(e) => setTimeoutInput(e.target.value)}
                     onBlur={commitTimeout}
                     type="number"
+                    disabled={activeProfileLocked}
                     min={10}
                     max={600}
                     className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
@@ -2124,11 +2224,11 @@ export default function SettingsModal() {
                   </div>
                   <p className="text-xs text-gray-500 dark:text-gray-400">支持一次导入多个普通备份；分片备份请一次性选中同一批次的全部分片</p>
                   <div className="flex flex-wrap gap-x-6 gap-y-3">
-                    <Checkbox
+                    {!presetConfigOnly && <Checkbox
                       checked={importConfig}
                       onChange={setImportConfig}
                       label="包含配置"
-                    />
+                    />}
                     <Checkbox
                       checked={importTasks}
                       onChange={setImportTasks}
@@ -2137,7 +2237,7 @@ export default function SettingsModal() {
                   </div>
                   <button
                     onClick={() => importInputRef.current?.click()}
-                    disabled={(!importConfig && !importTasks) || isImportingData}
+                    disabled={(!(presetConfigOnly ? false : importConfig) && !importTasks) || isImportingData}
                     className="w-full rounded-xl bg-gray-100/80 px-4 py-2.5 text-sm font-medium text-gray-700 transition-all hover:bg-gray-200 hover:text-gray-900 disabled:opacity-50 disabled:hover:bg-gray-100/80 disabled:hover:text-gray-700 dark:bg-white/[0.06] dark:text-gray-300 dark:hover:bg-white/[0.1] dark:hover:text-white dark:disabled:hover:bg-white/[0.06] dark:disabled:hover:text-gray-300 flex items-center justify-center gap-2"
                   >
                     {isImportingData ? (

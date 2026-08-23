@@ -9,3 +9,5 @@ dev-proxy.config.json
 !.docker-npm-cache/server/
 .docker-npm-cache/server/*
 !.docker-npm-cache/server/.gitkeep
+.env.local
+.env.*.local

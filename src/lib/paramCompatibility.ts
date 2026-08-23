@@ -1,5 +1,5 @@
 import { DEFAULT_PARAMS, type AppSettings, type TaskParams } from '../types'
-import { getActiveApiProfile } from './apiProfiles'
+import { getActiveApiProfile, isOpenAICompatibleProvider } from './apiProfiles'
 import { normalizeCodexCliImageSize, normalizeImageSize } from './size'
 
 export const DEFAULT_FAL_IMAGE_SIZE = '1360x1024'
@@ -24,7 +24,7 @@ export function normalizeParamsForSettings(
     transparent_output: Boolean(params.transparent_output),
   }
 
-  if (activeProfile.provider === 'openai' && activeProfile.codexCli) {
+  if (isOpenAICompatibleProvider(settings, activeProfile.provider) && activeProfile.codexCli) {
     nextParams.size = normalizeCodexCliImageSize(nextParams.size)
     nextParams.quality = DEFAULT_PARAMS.quality
   }
@@ -38,8 +38,8 @@ export function normalizeParamsForSettings(
 
   if (nextParams.output_format === 'png') {
     nextParams.output_compression = DEFAULT_PARAMS.output_compression
-  } else {
-    // 透明背景后处理需要 PNG 的 alpha 通道，非 PNG 输出统一关闭，避免旧配置跨格式残留。
+  } else if (nextParams.output_format !== 'webp') {
+    // JPEG 不支持透明输出，避免旧配置跨格式残留。
     nextParams.transparent_output = DEFAULT_PARAMS.transparent_output
   }
 

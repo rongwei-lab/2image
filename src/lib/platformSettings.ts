@@ -34,7 +34,7 @@ function normalizePlatformTaskParams(input: unknown): TaskParams {
     output_compression: outputFormat === 'png' ? null : outputCompression,
     moderation: record.moderation === 'low' || record.moderation === 'auto' ? record.moderation : DEFAULT_PARAMS.moderation,
     n: Math.min(10, Math.max(1, Math.trunc(Number(record.n) || DEFAULT_PARAMS.n))),
-    transparent_output: outputFormat === 'png' ? Boolean(record.transparent_output) : false,
+    transparent_output: outputFormat === 'png' || outputFormat === 'webp' ? Boolean(record.transparent_output) : false,
   }
 }
 

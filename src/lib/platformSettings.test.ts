@@ -10,6 +10,35 @@ describe('platform settings', () => {
     expect(platform.download.zipDownloadRoutes).toEqual(DEFAULT_SETTINGS.zipDownloadRoutes)
   })
 
+  it('保留 PNG 和 WebP 的透明背景参数，关闭 JPEG 透明背景', () => {
+    const webp = normalizePlatformSettings({
+      params: {
+        defaults: {
+          ...DEFAULT_PARAMS,
+          output_format: 'webp',
+          output_compression: 25,
+          transparent_output: true,
+        },
+      },
+    })
+    const jpeg = normalizePlatformSettings({
+      params: {
+        defaults: {
+          ...DEFAULT_PARAMS,
+          output_format: 'jpeg',
+          transparent_output: true,
+        },
+      },
+    })
+
+    expect(webp.params.defaults).toMatchObject({
+      output_format: 'webp',
+      output_compression: 25,
+      transparent_output: true,
+    })
+    expect(jpeg.params.defaults.transparent_output).toBe(false)
+  })
+
   it('用后台下载策略覆盖前台个人设置', () => {
     const localSettings = normalizeSettings({
       ...DEFAULT_SETTINGS,
