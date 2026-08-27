@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.7] - 2026-08-27
+
+### 上游同步
+
+- 合并上游 `CookSleep/gpt_image_playground` 至 `v0.7.7`，纳入输入法组字期间 Enter 事件修复，避免重复插入文字或误触发提交、换行。
+- 更新应用及 lockfile 版本至 `0.7.7`，同步上游已下线的 `qiuqiutoken` 预置项移除。
+
+### 二开保留
+
+- 保留 2Image 自定义 README、打码截图、云端多用户、管理员后台、平台 API 托管、Agent 策略、审计、云端密钥和 Docker 自托管能力。
+- 保留 v0.7.6 已接入的透明背景双模式、PNG/WebP 输出、预置配置策略、风格预设及服务端数据隔离。
+
+### 验证
+
+- 当前应用版本为 `0.7.7`；本次仅完成本地合并，尚未推送 GitHub、生成标签或部署服务器。
+- 已通过 `npm test`（39 个测试文件、565 个测试）、`npm run build`、`npm run check:server`、`npm run docker:prepare` 和 Git 差异检查。
+
 ## [0.7.6] - 2026-08-24
 
 ### 上游同步
