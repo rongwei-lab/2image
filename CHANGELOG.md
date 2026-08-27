@@ -7,6 +7,13 @@
 - 合并上游 `CookSleep/gpt_image_playground` 至 `v0.7.7`，纳入输入法组字期间 Enter 事件修复，避免重复插入文字或误触发提交、换行。
 - 更新应用及 lockfile 版本至 `0.7.7`，同步上游已下线的 `qiuqiutoken` 预置项移除。
 
+### 功能增强与修复
+
+- 管理员后台新增多 API 配置管理：支持分别快速新建 Images API 与 Responses API 配置，支持配置复制、删除与切换。
+- 管理员后台新增 Agent API 配置模式：支持“关闭”、“原生”与“混合”模式，支持单独指定 Agent 使用的 Responses 文本模型与 Images 图像模型配置。
+- 管理员配置测试强化：增加对 Images API 配置（`/v1/images/generations`）的真实出图与 SSE 流式事件解析测试。
+- 修复云端托管配置在浏览器端只有 `hasStoredApiKey` 时无法被 Agent 识别选择的问题。
+
 ### 二开保留
 
 - 保留 2Image 自定义 README、打码截图、云端多用户、管理员后台、平台 API 托管、Agent 策略、审计、云端密钥和 Docker 自托管能力。

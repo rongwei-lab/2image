@@ -1,5 +1,6 @@
 import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
+import { createServer } from 'node:http'
 import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_PARAMS, type AgentConversation, type PlatformSettings, type TaskRecord } from '../src/types'
 import { createDefaultOpenAIProfile, DEFAULT_SETTINGS, normalizeSettings } from '../src/lib/apiProfiles'
@@ -1626,6 +1627,162 @@ describe('云端多用户隔离', () => {
       })],
     })
     expect(JSON.stringify(testResponse.json())).not.toContain('platform-secret-key')
+  })
+
+  it('管理员测试 Images API 配置时会执行真实出图请求', async () => {
+    const upstream = createServer((request, response) => {
+      response.setHeader('Content-Type', 'application/json')
+      if (request.url === '/v1/models') {
+        response.end(JSON.stringify({ data: [] }))
+        return
+      }
+      if (request.url === '/v1/images/generations') {
+        response.end(JSON.stringify({ data: [{ b64_json: 'ZmFrZS1pbWFnZQ==' }] }))
+        return
+      }
+      response.statusCode = 404
+      response.end(JSON.stringify({ error: { message: 'not found' } }))
+    })
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+    const address = upstream.address()
+    if (!address || typeof address === 'string') throw new Error('测试上游未分配端口')
+
+    const { app } = await createTestApp()
+    const baseUrl = `http://127.0.0.1:${address.port}/v1`
+    const saveResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/admin/platform-settings',
+      headers: { cookie: 'gip_session=token-admin' },
+      payload: {
+        api: {
+          managed: true,
+          allowUserProfiles: false,
+          settings: {
+            ...DEFAULT_SETTINGS,
+            profiles: [{
+              ...DEFAULT_SETTINGS.profiles[0],
+              apiKey: 'platform-secret-key',
+              baseUrl,
+              apiMode: 'images',
+              model: 'gpt-image-2',
+            }],
+            activeProfileId: DEFAULT_SETTINGS.profiles[0].id,
+          },
+        },
+        agent: {
+          lockSettings: false,
+          maxToolRounds: 7,
+          webSearchEnabled: false,
+        },
+      },
+    })
+    const testResponse = await app.inject({
+      method: 'POST',
+      url: '/api/admin/platform-settings/test',
+      headers: { cookie: 'gip_session=token-admin' },
+      payload: saveResponse.json(),
+    })
+    await app.close()
+    await new Promise<void>((resolve, reject) => upstream.close((error) => error ? reject(error) : resolve()))
+
+    expect(saveResponse.statusCode).toBe(200)
+    expect(testResponse.statusCode).toBe(200)
+    expect(testResponse.json()).toMatchObject({
+      ok: true,
+      profile: { apiMode: 'images', hasApiKey: true },
+      checks: expect.arrayContaining([
+        expect.objectContaining({ id: 'auth', status: 'success' }),
+        expect.objectContaining({
+          id: 'image-generation',
+          status: 'success',
+          detail: '真实出图测试通过：Images API 返回最终图片',
+        }),
+      ]),
+    })
+  })
+
+  it('管理员测试 Images API 配置时能识别流式完成事件中的根级图片', async () => {
+    const upstream = createServer((request, response) => {
+      if (request.url === '/v1/models') {
+        response.setHeader('Content-Type', 'application/json')
+        response.end(JSON.stringify({ data: [] }))
+        return
+      }
+      if (request.url === '/v1/images/generations') {
+        response.setHeader('Content-Type', 'text/event-stream')
+        response.end([
+          'data: {"type":"image_generation.partial_image","b64_json":"cGFydGlhbA=="}',
+          '',
+          'data: {"type":"image_generation.completed","b64_json":"ZmFrZS1pbWFnZQ=="}',
+          '',
+          'data: [DONE]',
+          '',
+        ].join('\n'))
+        return
+      }
+      response.statusCode = 404
+      response.end(JSON.stringify({ error: { message: 'not found' } }))
+    })
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+    const address = upstream.address()
+    if (!address || typeof address === 'string') throw new Error('测试上游未分配端口')
+
+    const { app } = await createTestApp()
+    const profile = {
+      ...DEFAULT_SETTINGS.profiles[0],
+      id: 'stream-image-profile',
+      apiKey: 'platform-secret-key',
+      baseUrl: `http://127.0.0.1:${address.port}/v1`,
+      apiMode: 'images' as const,
+      model: 'gpt-image-2',
+      streamImages: true,
+      streamPartialImages: 1,
+    }
+    const saveResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/admin/platform-settings',
+      headers: { cookie: 'gip_session=token-admin' },
+      payload: {
+        api: {
+          managed: true,
+          allowUserProfiles: false,
+          settings: {
+            ...DEFAULT_SETTINGS,
+            profiles: [profile],
+            activeProfileId: profile.id,
+          },
+        },
+        agent: {
+          lockSettings: false,
+          maxToolRounds: 7,
+          webSearchEnabled: false,
+        },
+      },
+    })
+    const testResponse = await app.inject({
+      method: 'POST',
+      url: '/api/admin/platform-settings/test',
+      headers: { cookie: 'gip_session=token-admin' },
+      payload: saveResponse.json(),
+    })
+    await app.close()
+    await new Promise<void>((resolve, reject) => upstream.close((error) => error ? reject(error) : resolve()))
+
+    expect(saveResponse.statusCode).toBe(200)
+    expect(testResponse.statusCode).toBe(200)
+    expect(testResponse.json()).toMatchObject({
+      ok: true,
+      checks: [
+        expect.objectContaining({ id: 'config', status: 'success' }),
+        expect.objectContaining({ id: 'upstream-tcp', status: 'success' }),
+        expect.objectContaining({ id: 'auth', status: 'success' }),
+        expect.objectContaining({
+          id: 'image-generation',
+          status: 'success',
+          detail: '真实出图测试通过：Images API 流式响应返回图片（2 个事件）',
+        }),
+      ],
+    })
   })
 
   it('管理员可以批量禁用用户并清理孤立对象', async () => {

@@ -60,6 +60,9 @@ describe('platform settings', () => {
         lockSettings: false,
         maxToolRounds: DEFAULT_SETTINGS.agentMaxToolRounds,
         webSearchEnabled: false,
+        agentApiConfigMode: 'off',
+        agentTextProfileId: null,
+        agentImageProfileId: null,
       },
       download: {
         zipDownloadRoutes: ['agent-round-all'],
@@ -67,5 +70,80 @@ describe('platform settings', () => {
     })
 
     expect(applied.zipDownloadRoutes).toEqual(['agent-round-all'])
+  })
+
+  it('归一化并下发后台锁定的 Agent 文本和图像配置', () => {
+    const textProfile = {
+      ...DEFAULT_SETTINGS.profiles[0],
+      id: 'platform-text',
+      name: 'Responses 文本',
+      apiMode: 'responses' as const,
+      model: 'gpt-text',
+    }
+    const imageProfile = {
+      ...DEFAULT_SETTINGS.profiles[0],
+      id: 'platform-image',
+      name: 'Images 图像',
+      model: 'gpt-image-2',
+    }
+    const platform = normalizePlatformSettings({
+      api: {
+        managed: true,
+        settings: {
+          ...DEFAULT_SETTINGS,
+          profiles: [textProfile, imageProfile],
+          activeProfileId: imageProfile.id,
+        },
+      },
+      agent: {
+        lockSettings: true,
+        maxToolRounds: 8,
+        webSearchEnabled: true,
+        agentApiConfigMode: 'hybrid',
+        agentTextProfileId: textProfile.id,
+        agentImageProfileId: imageProfile.id,
+      },
+    })
+    const applied = applyPlatformSettingsToAppSettings(DEFAULT_SETTINGS, platform)
+
+    expect(platform.agent).toMatchObject({
+      agentApiConfigMode: 'hybrid',
+      agentTextProfileId: textProfile.id,
+      agentImageProfileId: imageProfile.id,
+    })
+    expect(applied).toMatchObject({
+      agentApiConfigMode: 'hybrid',
+      agentTextProfileId: textProfile.id,
+      agentImageProfileId: imageProfile.id,
+      agentMaxToolRounds: 8,
+      agentWebSearch: true,
+    })
+  })
+
+  it('后台 Agent 配置 ID 无效时自动回退到可用配置', () => {
+    const textProfile = {
+      ...DEFAULT_SETTINGS.profiles[0],
+      id: 'platform-text',
+      apiMode: 'responses' as const,
+    }
+    const platform = normalizePlatformSettings({
+      api: {
+        managed: true,
+        settings: {
+          ...DEFAULT_SETTINGS,
+          profiles: [textProfile],
+          activeProfileId: textProfile.id,
+        },
+      },
+      agent: {
+        lockSettings: true,
+        agentApiConfigMode: 'native',
+        agentTextProfileId: 'missing-text',
+        agentImageProfileId: 'missing-image',
+      },
+    })
+
+    expect(platform.agent.agentTextProfileId).toBe(textProfile.id)
+    expect(platform.agent.agentImageProfileId).toBe(textProfile.id)
   })
 })

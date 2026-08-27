@@ -30,11 +30,11 @@ import {
   type CloudAdminUser,
   type CloudAdminUserDetail,
 } from '../lib/cloudApi'
-import { DEFAULT_IMAGES_MODEL, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings, normalizeStreamPartialImages } from '../lib/apiProfiles'
-import { applyPlatformSettingsToAppSettings } from '../lib/platformSettings'
-import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_PARAMS, type TaskParams, type ZipDownloadRoute } from '../types'
+import { createDefaultOpenAIProfile, DEFAULT_IMAGES_MODEL, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, isAgentTextApiProfile, normalizeSettings, normalizeStreamPartialImages } from '../lib/apiProfiles'
+import { applyPlatformSettingsToAppSettings, normalizePlatformSettings } from '../lib/platformSettings'
+import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_PARAMS, type AgentApiConfigMode, type ApiMode, type ApiProfile, type TaskParams, type ZipDownloadRoute } from '../types'
 import { useStore } from '../store'
-import { CloseIcon, PlusIcon, RefreshIcon, TrashIcon } from './icons'
+import { CloseIcon, CopyIcon, PlusIcon, RefreshIcon, TrashIcon } from './icons'
 
 type AdminStatusFilter = 'all' | 'pending' | 'enabled' | 'disabled' | 'rejected'
 type AdminRoleFilter = 'all' | 'admin' | 'user'
@@ -59,6 +59,27 @@ type AuditDetailEntry = {
   value: unknown
   displayValue: string
   isComplex: boolean
+}
+
+function createPlatformProfileId() {
+  return `platform-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+}
+
+function createPlatformOpenAIProfile(apiMode: ApiMode, baseProfile: ApiProfile | null, usedIds: Set<string>): ApiProfile {
+  let id = createPlatformProfileId()
+  while (usedIds.has(id)) id = createPlatformProfileId()
+
+  return createDefaultOpenAIProfile({
+    id,
+    name: apiMode === 'responses' ? '新 Responses 配置' : '新 Images 配置',
+    apiMode,
+    model: apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL,
+    baseUrl: baseProfile?.baseUrl || DEFAULT_SETTINGS.baseUrl,
+    apiProxy: baseProfile?.apiProxy ?? DEFAULT_SETTINGS.apiProxy,
+    timeout: baseProfile?.timeout ?? DEFAULT_SETTINGS.timeout,
+    apiKey: '',
+    hasStoredApiKey: undefined,
+  })
 }
 
 const adminTabs: Array<{ value: AdminTab; label: string }> = [
@@ -218,6 +239,9 @@ function createFallbackPlatformSettings(): CloudPlatformSettings {
       lockSettings: false,
       maxToolRounds: DEFAULT_AGENT_MAX_TOOL_ROUNDS,
       webSearchEnabled: false,
+      agentApiConfigMode: 'off',
+      agentTextProfileId: null,
+      agentImageProfileId: null,
     },
     download: {
       zipDownloadRoutes: DEFAULT_SETTINGS.zipDownloadRoutes,
@@ -252,13 +276,13 @@ function removeFalFromPlatformSettings(settings: CloudPlatformSettings): CloudPl
       profile.provider === 'fal' ? migrateFalProfileToOpenAICompatible(profile) : profile,
     ),
   })
-  return {
+  return normalizePlatformSettings({
     ...settings,
     api: {
       ...settings.api,
       settings: nextApiSettings,
     },
-  }
+  })
 }
 
 function syncPlatformSettingsToWorkbench(platformSettings: CloudPlatformSettings) {
@@ -1095,7 +1119,7 @@ export default function AdminPage() {
     if (!canManage) return
     try {
       const next = await getCloudAdminPlatformSettings()
-      const visibleSettings = removeFalFromPlatformSettings(next)
+      const visibleSettings = removeFalFromPlatformSettings(normalizePlatformSettings(next))
       setPlatformSettings(visibleSettings)
       setPlatformDraft(visibleSettings)
       syncPlatformSettingsToWorkbench(visibleSettings)
@@ -1162,6 +1186,14 @@ export default function AdminPage() {
       ...customOptions,
     ]
   }, [platformApiSettings])
+  const platformAgentTextProfiles = useMemo(
+    () => platformApiSettings?.profiles.filter(isAgentTextApiProfile) ?? [],
+    [platformApiSettings],
+  )
+  const platformAgentImageProfiles = useMemo(
+    () => platformApiSettings?.profiles ?? [],
+    [platformApiSettings],
+  )
 
   const runUserAction = async (id: string, action: () => Promise<void>) => {
     setBusyUserIds((current) => ({ ...current, [id]: true }))
@@ -1421,6 +1453,161 @@ export default function AdminPage() {
         },
       }
     })
+  }
+
+  const createPlatformProfile = (apiMode: ApiMode) => {
+    updatePlatformDraft((current) => {
+      const settings = normalizeSettings(current.api.settings)
+      const baseProfile = settings.profiles.find((profile) => profile.id === settings.activeProfileId) ?? null
+      const profile = createPlatformOpenAIProfile(apiMode, baseProfile, new Set(settings.profiles.map((item) => item.id)))
+      const nextSettings = normalizeSettings({
+        ...settings,
+        profiles: [...settings.profiles, profile],
+        activeProfileId: profile.id,
+      })
+      const textProfile = nextSettings.profiles.find(isAgentTextApiProfile)
+      const imageProfile = nextSettings.profiles.find((item) => item.apiMode === 'images') ?? nextSettings.profiles[0]
+      const currentTextProfileId = current.agent.agentTextProfileId
+      const currentImageProfileId = current.agent.agentImageProfileId
+      return {
+        ...current,
+        api: {
+          ...current.api,
+          settings: nextSettings,
+        },
+        agent: {
+          ...current.agent,
+          agentTextProfileId: nextSettings.profiles.some((item) => item.id === currentTextProfileId && isAgentTextApiProfile(item))
+            ? currentTextProfileId
+            : textProfile?.id ?? null,
+          agentImageProfileId: nextSettings.profiles.some((item) => item.id === currentImageProfileId)
+            ? currentImageProfileId
+            : imageProfile?.id ?? null,
+        },
+      }
+    })
+    setPlatformTestResult(null)
+  }
+
+  const duplicatePlatformProfile = () => {
+    if (!platformActiveProfile) return
+    updatePlatformDraft((current) => {
+      const settings = normalizeSettings(current.api.settings)
+      let id = createPlatformProfileId()
+      while (settings.profiles.some((item) => item.id === id)) id = createPlatformProfileId()
+      const nextProfile = {
+        ...platformActiveProfile,
+        id,
+        name: `${platformActiveProfile.name}（复制）`,
+        apiKey: '',
+        hasStoredApiKey: undefined,
+        isDefault: undefined,
+      }
+      return {
+        ...current,
+        api: {
+          ...current.api,
+          settings: normalizeSettings({
+            ...settings,
+            profiles: [...settings.profiles, nextProfile],
+            activeProfileId: nextProfile.id,
+          }),
+        },
+      }
+    })
+    setPlatformTestResult(null)
+  }
+
+  const deletePlatformProfile = (profileId: string) => {
+    updatePlatformDraft((current) => {
+      const settings = normalizeSettings(current.api.settings)
+      if (settings.profiles.length <= 1) return current
+      const profiles = settings.profiles.filter((profile) => profile.id !== profileId)
+      const activeProfileId = settings.activeProfileId === profileId ? profiles[0].id : settings.activeProfileId
+      const textProfile = profiles.find(isAgentTextApiProfile)
+      const imageProfile = profiles.find((profile) => profile.id === activeProfileId) ?? profiles[0]
+      const nextTextProfileId = current.agent.agentTextProfileId === profileId
+        ? textProfile?.id ?? null
+        : profiles.some((profile) => profile.id === current.agent.agentTextProfileId && isAgentTextApiProfile(profile))
+          ? current.agent.agentTextProfileId
+          : textProfile?.id ?? null
+      const nextImageProfileId = current.agent.agentImageProfileId === profileId
+        ? imageProfile?.id ?? null
+        : profiles.some((profile) => profile.id === current.agent.agentImageProfileId)
+          ? current.agent.agentImageProfileId
+          : imageProfile?.id ?? null
+      return {
+        ...current,
+        api: {
+          ...current.api,
+          settings: normalizeSettings({ ...settings, profiles, activeProfileId }),
+        },
+        agent: {
+          ...current.agent,
+          agentTextProfileId: nextTextProfileId,
+          agentImageProfileId: nextImageProfileId,
+        },
+      }
+    })
+    setPlatformTestResult(null)
+  }
+
+  const confirmDeletePlatformProfile = () => {
+    if (!platformActiveProfile || !platformApiSettings) return
+    if (platformApiSettings.profiles.length <= 1) {
+      showToast('至少保留一个 API 配置', 'info')
+      return
+    }
+    const profileId = platformActiveProfile.id
+    setConfirmDialog({
+      title: '删除平台 API 配置',
+      message: `确定删除配置「${platformActiveProfile.name}」吗？已绑定到 Agent 的配置会自动切换到其他可用配置。`,
+      confirmText: '删除配置',
+      tone: 'danger',
+      action: () => deletePlatformProfile(profileId),
+    })
+  }
+
+  const switchPlatformProfile = (profileId: string) => {
+    updatePlatformApiSettings({ activeProfileId: profileId })
+    setPlatformTestResult(null)
+  }
+
+  const updatePlatformAgentMode = (mode: AgentApiConfigMode) => {
+    updatePlatformDraft((current) => {
+      const settings = normalizeSettings(current.api.settings)
+      const textProfile = settings.profiles.find(isAgentTextApiProfile)
+      const imageProfile = settings.profiles.find((profile) => profile.apiMode === 'images') ?? settings.profiles[0]
+      const textProfileId = settings.profiles.some((profile) => profile.id === current.agent.agentTextProfileId && isAgentTextApiProfile(profile))
+        ? current.agent.agentTextProfileId
+        : textProfile?.id ?? null
+      const imageProfileId = settings.profiles.some((profile) => profile.id === current.agent.agentImageProfileId)
+        ? current.agent.agentImageProfileId
+        : imageProfile?.id ?? null
+      return {
+        ...current,
+        agent: {
+          ...current.agent,
+          agentApiConfigMode: mode,
+          agentTextProfileId: textProfileId,
+          agentImageProfileId: imageProfileId,
+        },
+      }
+    })
+  }
+
+  const updatePlatformAgentTextProfile = (profileId: string) => {
+    updatePlatformDraft((current) => ({
+      ...current,
+      agent: { ...current.agent, agentTextProfileId: profileId || null },
+    }))
+  }
+
+  const updatePlatformAgentImageProfile = (profileId: string) => {
+    updatePlatformDraft((current) => ({
+      ...current,
+      agent: { ...current.agent, agentImageProfileId: profileId || null },
+    }))
   }
 
   const setPlatformZipDownloadRouteEnabled = (route: ZipDownloadRoute, enabled: boolean) => {
@@ -2153,6 +2340,82 @@ export default function AdminPage() {
                         <p className="mt-2 text-xs text-gray-500">开启接管后，用户生成任务会使用后台配置；API Key 会加密保存在后端，前端只显示已保存状态。</p>
                       </div>
 
+                      <div className="rounded-lg border border-gray-100 p-4 dark:border-white/[0.06]">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <h3 className="text-xs font-semibold text-gray-500">API 配置列表</h3>
+                            <p className="mt-1 text-xs text-gray-500">为画廊和 Agent 分别准备 Images API、Responses API 配置。复制配置不会复制 API Key。</p>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              disabled={platformSaving || platformTesting}
+                              onClick={() => createPlatformProfile('images')}
+                              className="inline-flex items-center gap-1 rounded-lg border border-blue-200 px-2.5 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-500/30 dark:text-blue-300 dark:hover:bg-blue-500/10"
+                            >
+                              <PlusIcon className="h-3.5 w-3.5" />
+                              新建 Images 配置
+                            </button>
+                            <button
+                              type="button"
+                              disabled={platformSaving || platformTesting}
+                              onClick={() => createPlatformProfile('responses')}
+                              className="inline-flex items-center gap-1 rounded-lg border border-indigo-200 px-2.5 py-1.5 text-xs font-medium text-indigo-700 hover:bg-indigo-50 disabled:opacity-50 dark:border-indigo-500/30 dark:text-indigo-300 dark:hover:bg-indigo-500/10"
+                            >
+                              <PlusIcon className="h-3.5 w-3.5" />
+                              新建 Responses 配置
+                            </button>
+                          </div>
+                        </div>
+                        <div className="mt-4 flex flex-wrap items-end gap-3">
+                          <label className="min-w-0 flex-1 text-xs text-gray-500 sm:min-w-[18rem]">
+                            当前配置
+                            <select
+                              value={platformActiveProfile.id}
+                              onChange={(event) => switchPlatformProfile(event.target.value)}
+                              disabled={platformSaving || platformTesting}
+                              className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 disabled:opacity-60 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
+                            >
+                              {(platformApiSettings?.profiles ?? []).map((profile) => (
+                                <option key={profile.id} value={profile.id}>
+                                  {profile.name} · {profile.provider === 'openai' && profile.apiMode === 'responses' ? 'Responses API' : profile.provider === 'openai' ? 'Images API' : profile.provider}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            type="button"
+                            disabled={platformSaving || platformTesting}
+                            onClick={duplicatePlatformProfile}
+                            title="复制当前配置（不复制 API Key）"
+                            aria-label="复制当前配置"
+                            className="inline-flex h-9 items-center gap-1 rounded-lg border border-gray-200 px-2.5 text-xs text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-white/[0.1] dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                          >
+                            <CopyIcon className="h-3.5 w-3.5" />
+                            复制
+                          </button>
+                          <button
+                            type="button"
+                            disabled={platformSaving || platformTesting || (platformApiSettings?.profiles.length ?? 0) <= 1}
+                            onClick={confirmDeletePlatformProfile}
+                            title={(platformApiSettings?.profiles.length ?? 0) <= 1 ? '至少保留一个 API 配置' : '删除当前配置'}
+                            aria-label="删除当前配置"
+                            className="inline-flex h-9 items-center gap-1 rounded-lg border border-red-200 px-2.5 text-xs text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-500/30 dark:text-red-300 dark:hover:bg-red-500/10"
+                          >
+                            <TrashIcon className="h-3.5 w-3.5" />
+                            删除
+                          </button>
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-gray-500 dark:text-gray-400">
+                          {(platformApiSettings?.profiles ?? []).map((profile) => (
+                            <span key={profile.id} className="rounded-full bg-gray-100 px-2 py-1 dark:bg-white/[0.06]">
+                              {profile.name} · {profile.provider === 'openai' && profile.apiMode === 'responses' ? 'Responses' : profile.provider === 'openai' ? 'Images' : profile.provider}
+                              {profile.hasStoredApiKey ? ' · Key 已保存' : ' · 待配置 Key'}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+
                       <div className="grid gap-3 md:grid-cols-2">
                         <label className="block text-xs text-gray-500">
                           配置名称
@@ -2216,7 +2479,15 @@ export default function AdminPage() {
                             API 接口
                             <select
                               value={platformActiveProfile.apiMode}
-                              onChange={(event) => updatePlatformActiveProfile({ apiMode: event.target.value })}
+                              onChange={(event) => {
+                                const apiMode = event.target.value as ApiMode
+                                updatePlatformActiveProfile({
+                                  apiMode,
+                                  ...(platformActiveProfile.model === DEFAULT_IMAGES_MODEL || platformActiveProfile.model === DEFAULT_RESPONSES_MODEL
+                                    ? { model: apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL }
+                                    : {}),
+                                })
+                              }}
                               className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
                             >
                               <option value="images">Images API</option>
@@ -2472,6 +2743,62 @@ export default function AdminPage() {
                             />
                             允许网络搜索
                           </label>
+                          <label className="block text-xs text-gray-500">
+                            API 配置模式
+                            <select
+                              value={platformDraft.agent.agentApiConfigMode}
+                              onChange={(event) => updatePlatformAgentMode(event.target.value as AgentApiConfigMode)}
+                              className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
+                            >
+                              <option value="off">关闭，使用当前配置</option>
+                              <option value="native">原生，文本模型调用 image_generation</option>
+                              <option value="hybrid">混合，文本与图像使用独立配置</option>
+                            </select>
+                          </label>
+                          <p className="text-xs leading-relaxed text-gray-500">
+                            关闭时 Agent 使用当前配置，必须是 Responses API；原生模式只使用文本配置，混合模式会额外使用图像配置。
+                          </p>
+                          {platformDraft.agent.agentApiConfigMode !== 'off' && (
+                            <>
+                              <label className="block text-xs text-gray-500">
+                                Responses 文本模型配置
+                                <select
+                                  value={platformDraft.agent.agentTextProfileId ?? ''}
+                                  onChange={(event) => updatePlatformAgentTextProfile(event.target.value)}
+                                  className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
+                                >
+                                  {!platformAgentTextProfiles.length && <option value="">没有可用的 Responses 配置</option>}
+                                  {platformAgentTextProfiles.map((profile) => (
+                                    <option key={profile.id} value={profile.id}>
+                                      {profile.name} · {profile.model || DEFAULT_RESPONSES_MODEL}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                              {platformDraft.agent.agentApiConfigMode === 'hybrid' && (
+                                <label className="block text-xs text-gray-500">
+                                  Images 图像模型配置
+                                  <select
+                                    value={platformDraft.agent.agentImageProfileId ?? ''}
+                                    onChange={(event) => updatePlatformAgentImageProfile(event.target.value)}
+                                    className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100"
+                                  >
+                                    {!platformAgentImageProfiles.length && <option value="">没有可用的图像配置</option>}
+                                    {platformAgentImageProfiles.map((profile) => (
+                                      <option key={profile.id} value={profile.id}>
+                                        {profile.name} · {profile.provider === 'openai' && profile.apiMode === 'responses' ? 'Responses' : profile.provider === 'openai' ? 'Images' : profile.provider} · {profile.model}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                              )}
+                            </>
+                          )}
+                          {platformDraft.agent.agentApiConfigMode !== 'off' && !platformAgentTextProfiles.length && (
+                            <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+                              请先新建 Responses 配置并填写 API URL、模型和 API Key，否则 Agent 无法启动。
+                            </p>
+                          )}
                         </div>
                       </div>
 

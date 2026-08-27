@@ -314,7 +314,8 @@ export default function SettingsModal() {
 
   const agentProfiles = (presetConfigOnly ? visibleProfiles : draft.profiles)
     .filter((profile) => {
-      if (!profile.apiKey.trim()) return false
+      // 云端为了安全只返回 hasStoredApiKey，不能要求浏览器重新拿到明文 Key。
+      if (!profile.apiKey.trim() && !profile.hasStoredApiKey) return false
       if (profile.baseUrl.trim() || profile.provider === 'fal') return true
       return apiProxyAvailable && isProfileApiProxyEligible(draft, profile) && (apiProxyLocked || profile.apiProxy)
     })

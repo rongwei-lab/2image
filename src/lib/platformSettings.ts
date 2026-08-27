@@ -1,6 +1,6 @@
-import type { AppSettings, PlatformSettings, TaskParams } from '../types'
+import type { AgentApiConfigMode, AppSettings, PlatformSettings, TaskParams } from '../types'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_PARAMS } from '../types'
-import { DEFAULT_SETTINGS, normalizeAgentMaxToolRounds, normalizeSettings, normalizeZipDownloadRoutes } from './apiProfiles'
+import { DEFAULT_SETTINGS, isAgentTextApiProfile, normalizeAgentMaxToolRounds, normalizeSettings, normalizeZipDownloadRoutes } from './apiProfiles'
 import { normalizeImageSize } from './size'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -38,6 +38,32 @@ function normalizePlatformTaskParams(input: unknown): TaskParams {
   }
 }
 
+function normalizePlatformAgentApiConfigMode(value: unknown, fallback: AgentApiConfigMode = 'off'): AgentApiConfigMode {
+  return value === 'native' || value === 'hybrid' ? value : fallback
+}
+
+function normalizePlatformAgentProfileIds(input: unknown, settings: AppSettings) {
+  const record = isRecord(input) ? input : {}
+  const textProfileId = typeof record.agentTextProfileId === 'string'
+    ? record.agentTextProfileId
+    : settings.agentTextProfileId
+  const imageProfileId = typeof record.agentImageProfileId === 'string'
+    ? record.agentImageProfileId
+    : settings.agentImageProfileId
+  const firstTextProfile = settings.profiles.find(isAgentTextApiProfile)
+  const normalizedTextProfileId: string | null = typeof textProfileId === 'string' && settings.profiles.some((profile) => profile.id === textProfileId && isAgentTextApiProfile(profile))
+    ? textProfileId
+    : firstTextProfile?.id ?? null
+  const normalizedImageProfileId: string | null = typeof imageProfileId === 'string' && settings.profiles.some((profile) => profile.id === imageProfileId)
+    ? imageProfileId
+    : settings.activeProfileId
+
+  return {
+    agentTextProfileId: normalizedTextProfileId,
+    agentImageProfileId: normalizedImageProfileId,
+  }
+}
+
 export function normalizePlatformSettings(input: unknown): PlatformSettings {
   const record = isRecord(input) ? input : {}
   const registrationRecord = isRecord(record.registration) ? record.registration : {}
@@ -45,6 +71,9 @@ export function normalizePlatformSettings(input: unknown): PlatformSettings {
   const apiRecord = isRecord(record.api) ? record.api : {}
   const agentRecord = isRecord(record.agent) ? record.agent : {}
   const downloadRecord = isRecord(record.download) ? record.download : {}
+  const apiSettings = normalizeSettings(apiRecord.settings ?? DEFAULT_SETTINGS)
+  const legacyAgentMode = normalizePlatformAgentApiConfigMode(apiSettings.agentApiConfigMode)
+  const agentProfileIds = normalizePlatformAgentProfileIds(agentRecord, apiSettings)
 
   return {
     registration: {
@@ -57,12 +86,14 @@ export function normalizePlatformSettings(input: unknown): PlatformSettings {
     api: {
       managed: Boolean(apiRecord.managed),
       allowUserProfiles: typeof apiRecord.allowUserProfiles === 'boolean' ? apiRecord.allowUserProfiles : true,
-      settings: normalizeSettings(apiRecord.settings ?? DEFAULT_SETTINGS),
+      settings: apiSettings,
     },
     agent: {
       lockSettings: Boolean(agentRecord.lockSettings),
       maxToolRounds: normalizeAgentMaxToolRounds(agentRecord.maxToolRounds, DEFAULT_AGENT_MAX_TOOL_ROUNDS),
       webSearchEnabled: typeof agentRecord.webSearchEnabled === 'boolean' ? agentRecord.webSearchEnabled : false,
+      agentApiConfigMode: normalizePlatformAgentApiConfigMode(agentRecord.agentApiConfigMode, legacyAgentMode),
+      ...agentProfileIds,
     },
     download: {
       zipDownloadRoutes: normalizeZipDownloadRoutes(downloadRecord.zipDownloadRoutes),
@@ -102,10 +133,21 @@ export function applyPlatformSettingsToAppSettings(settings: AppSettings, platfo
   }
 
   if (platform.agent.lockSettings) {
+    const platformAgentMode = platform.agent.agentApiConfigMode
+    const canUsePlatformAgentProfiles = platform.api.managed
+    const agentTextProfileId = canUsePlatformAgentProfiles || next.profiles.some((profile) => profile.id === platform.agent.agentTextProfileId && isAgentTextApiProfile(profile))
+      ? platform.agent.agentTextProfileId
+      : next.agentTextProfileId
+    const agentImageProfileId = canUsePlatformAgentProfiles || next.profiles.some((profile) => profile.id === platform.agent.agentImageProfileId)
+      ? platform.agent.agentImageProfileId
+      : next.agentImageProfileId
     next = normalizeSettings({
       ...next,
       agentMaxToolRounds: platform.agent.maxToolRounds,
       agentWebSearch: platform.agent.webSearchEnabled,
+      agentApiConfigMode: platformAgentMode,
+      agentTextProfileId,
+      agentImageProfileId,
     })
   } else {
     next = normalizeSettings({

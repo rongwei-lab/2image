@@ -147,6 +147,12 @@ export interface PlatformSettings {
     lockSettings: boolean
     maxToolRounds: number
     webSearchEnabled: boolean
+    /** 后台锁定 Agent 时使用的 API 配置模式 */
+    agentApiConfigMode: AgentApiConfigMode
+    /** 后台锁定 Agent 时使用的文本模型配置 ID */
+    agentTextProfileId: string | null
+    /** 后台锁定 Agent 时使用的图像模型配置 ID */
+    agentImageProfileId: string | null
   }
   download: {
     /** 后台统一控制哪些批量下载入口使用 ZIP，避免多用户环境下前台配置不一致 */

@@ -429,6 +429,98 @@ async function assertPlatformImageGenerationWorks(profile: ApiProfile) {
   return '真实出图测试通过：Responses 返回最终图片'
 }
 
+function getImagesApiResultItems(payload: unknown, depth = 0): Array<Record<string, unknown>> {
+  if (depth > 2) return []
+  if (Array.isArray(payload)) return payload.filter(isRecord)
+  if (!isRecord(payload)) return []
+
+  const items: Array<Record<string, unknown>> = []
+  if (Array.isArray(payload.data)) items.push(...payload.data.filter(isRecord))
+  if (isRecord(payload.data)) items.push(payload.data)
+  if (typeof payload.b64_json === 'string' || typeof payload.url === 'string') items.push(payload)
+
+  for (const key of ['result', 'image', 'response', 'output']) {
+    const nested = payload[key]
+    if (nested !== undefined) items.push(...getImagesApiResultItems(nested, depth + 1))
+  }
+  return items
+}
+
+function hasImagesApiResult(payload: unknown): boolean {
+  return getImagesApiResultItems(payload).some((item) =>
+    (typeof item.b64_json === 'string' && item.b64_json.trim().length > 0) ||
+    (typeof item.url === 'string' && item.url.trim().length > 0),
+  )
+}
+
+function hasFinalImagesApiResult(payload: unknown): boolean {
+  if (!hasImagesApiResult(payload)) return false
+  if (!isRecord(payload)) return true
+  const type = typeof payload.type === 'string' ? payload.type.toLowerCase() : ''
+  const object = typeof payload.object === 'string' ? payload.object.toLowerCase() : ''
+  return !type.includes('partial') && !object.includes('partial')
+}
+
+async function assertPlatformImagesApiGenerationWorks(profile: ApiProfile) {
+  const endpoint = buildOpenAiCompatibleEndpoint(profile.baseUrl, 'images/generations')
+  const body: Record<string, unknown> = {
+    model: profile.model,
+    prompt: 'Generate a tiny simple red square icon on a white background.',
+    output_format: 'jpeg',
+    moderation: 'low',
+    n: 1,
+  }
+  if (!profile.codexCli) {
+    body.size = '1024x1024'
+    body.quality = 'low'
+  }
+  if (profile.responseFormatB64Json) body.response_format = 'b64_json'
+  if (profile.streamImages) {
+    body.stream = true
+    body.partial_images = Math.max(1, profile.streamPartialImages ?? 1)
+  }
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${profile.apiKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(PLATFORM_IMAGE_TEST_TIMEOUT_MS),
+  })
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '')
+    throw new Error(`真实出图测试失败（HTTP ${response.status}）：${errorText.slice(0, 500) || response.statusText}`)
+  }
+
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+  if (contentType.includes('text/event-stream')) {
+    const streamText = await response.text()
+    const events = streamText
+      .split(/\r?\n\r?\n/)
+      .flatMap((block) => block.split(/\r?\n/).filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()))
+      .filter((data) => data && data !== '[DONE]')
+      .flatMap((data) => {
+        try {
+          return [JSON.parse(data) as unknown]
+        } catch {
+          return []
+        }
+      })
+    if (!events.some(hasFinalImagesApiResult)) throw new Error('真实出图测试的 Images API 流式响应未返回最终图片')
+    return `真实出图测试通过：Images API 流式响应返回图片（${events.length} 个事件）`
+  }
+
+  const payload = await response.json().catch(() => null) as unknown
+  if (!hasImagesApiResult(payload)) {
+    const text = JSON.stringify(payload ?? {}).slice(0, 500)
+    throw new Error(`真实出图测试未返回图片数据：${text || '空响应'}`)
+  }
+  return '真实出图测试通过：Images API 返回最终图片'
+}
+
 function getProfileForPlatformTest(saved: PlatformSettings, draftInput: unknown) {
   const draft = normalizePlatformSettings(draftInput ?? saved)
   const savedSettings = normalizeSettings(saved.api.settings)
@@ -571,8 +663,15 @@ async function testPlatformSettings(db: Db, config: ServerConfig, draftInput: un
     } catch (error) {
       checks.push(createPlatformTestCheck('image-generation', '真实出图', 'error', formatGenerationError(error, profile)))
     }
+  } else if (profile.provider === 'openai') {
+    try {
+      const measured = await measureCheck(() => assertPlatformImagesApiGenerationWorks(profile))
+      checks.push(createPlatformTestCheck('image-generation', '真实出图', 'success', measured.detail, measured.elapsedMs))
+    } catch (error) {
+      checks.push(createPlatformTestCheck('image-generation', '真实出图', 'error', formatGenerationError(error, profile)))
+    }
   } else {
-    checks.push(createPlatformTestCheck('image-generation', '真实出图', 'skipped', '当前配置不是 Responses API，暂不执行 image_generation 工具测试。'))
+    checks.push(createPlatformTestCheck('image-generation', '真实出图', 'skipped', '当前服务商未配置内置 Images API 测试，暂只检查网络连通性。'))
   }
 
   return {
