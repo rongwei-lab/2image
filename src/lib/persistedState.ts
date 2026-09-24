@@ -1,5 +1,5 @@
-import type { AgentConversation, AgentInputDraft, AppMode, AppSettings, FavoriteCollection, InputImage, MaskDraft, TaskParams } from '../types'
-import { normalizeSettings } from './apiProfiles'
+import type { AgentConversation, AgentInputDraft, AppMode, AppSettings, FavoriteCollection, InputImage, MaskDraft, PresetConfig, TaskParams } from '../types'
+import { normalizePresetAgent, normalizeSettings } from './apiProfiles'
 import { normalizeAgentConversations } from './agentConversationState'
 import { ensureDefaultFavoriteCollection, normalizeFavoriteCollections, resolveDefaultFavoriteCollectionId } from './favoriteState'
 import { cleanStaleAgentInputDrafts, getPersistableAgentInputDrafts, isEmptyAgentInputDraft, normalizeAgentInputDraft, normalizeAgentInputDrafts, normalizeAgentInputDraftsByKey, saveGalleryInputDraft } from './inputDraftState'
@@ -8,7 +8,7 @@ import { normalizePromptStylePresetId, type PromptStylePresetId } from './prompt
 
 export interface PersistedAppState {
   settings: AppSettings
-  previousPresetConfig?: Pick<AppSettings, 'customProviders' | 'profiles'> | null
+  previousPresetConfig?: PresetConfig | null
   dismissedPresetProfileIds?: string[]
   dismissedPresetProviderIds?: string[]
   params: TaskParams
@@ -41,13 +41,14 @@ type PersistedStateSource = Omit<PersistedAppState, 'prompt' | 'inputImages' | '
 
 type PersistedStateFallback = Pick<
   PersistedAppState,
-  'settings' | 'params' | 'promptStylePresetId' | 'dismissedPresetProfileIds' | 'dismissedPresetProviderIds' | 'dismissedCodexCliPrompts' | 'favoriteCollections' | 'defaultFavoriteCollectionId'
+  'settings' | 'params' | 'dismissedPresetProfileIds' | 'dismissedPresetProviderIds' | 'dismissedCodexCliPrompts' | 'favoriteCollections' | 'defaultFavoriteCollectionId'
 > & {
+  promptStylePresetId?: PromptStylePresetId
   agentConversations: AgentConversation[]
 }
 
 export type NormalizedPersistedAppState = PersistedAppState & {
-  previousPresetConfig: Pick<AppSettings, 'customProviders' | 'profiles'> | null
+  previousPresetConfig: PresetConfig | null
   dismissedPresetProfileIds: string[]
   dismissedPresetProviderIds: string[]
   prompt: string
@@ -78,7 +79,9 @@ function normalizeParams(value: unknown, fallback: TaskParams): TaskParams {
   if (!isRecord(value)) return fallback
   return {
     size: typeof value.size === 'string' ? value.size : fallback.size,
-    quality: value.quality === 'auto' || value.quality === 'low' || value.quality === 'medium' || value.quality === 'high' ? value.quality : fallback.quality,
+    quality: value.quality === 'auto' || value.quality === 'low' || value.quality === 'medium' || value.quality === 'high' || value.quality === 'xhigh' || value.quality === 'max'
+      ? value.quality
+      : fallback.quality,
     output_format: value.output_format === 'png' || value.output_format === 'jpeg' || value.output_format === 'webp' ? value.output_format : fallback.output_format,
     output_compression: value.output_compression === null || (typeof value.output_compression === 'number' && Number.isFinite(value.output_compression))
       ? value.output_compression
@@ -145,9 +148,11 @@ export function normalizePersistedState(
   const previousPresetConfig = isRecord(persistedState.previousPresetConfig) && Array.isArray(persistedState.previousPresetConfig.profiles)
     ? (() => {
         const normalized = normalizeSettings(persistedState.previousPresetConfig)
+        const agent = normalizePresetAgent(persistedState.previousPresetConfig.agent, normalized.profiles)
         return {
           customProviders: normalized.customProviders,
           profiles: persistedState.previousPresetConfig.profiles.length ? normalized.profiles : [],
+          ...(agent ? { agent } : {}),
         }
       })()
     : null

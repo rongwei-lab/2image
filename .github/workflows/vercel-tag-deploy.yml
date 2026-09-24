@@ -1,4 +1,4 @@
-name: Trigger Vercel Release Deploy
+name: Deploy to Vercel
 
 on:
   push:
@@ -8,6 +8,7 @@ on:
       - 'v*'
     paths:
       - package.json
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -25,7 +26,7 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch || "$GITHUB_REF" == refs/tags/v* ]]; then
             echo "deploy=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -41,7 +42,7 @@ jobs:
           if gh api --silent "repos/CookSleep/gpt_image_playground/releases/tags/v$version"; then
             echo "deploy=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Upstream release v$version does not exist. Skipping Vercel deployment."
+            echo "Release v$version does not exist. Skipping Vercel deployment."
             echo "deploy=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Call Vercel Deploy Hook

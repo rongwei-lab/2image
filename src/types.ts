@@ -79,6 +79,7 @@ export interface ApiProfile {
   baseUrl: string
   apiKey: string
   model: string
+  imageGenerationModel?: string
   timeout: number
   apiMode: ApiMode
   reasoningEffort?: ReasoningEffort
@@ -89,7 +90,19 @@ export interface ApiProfile {
   streamImages?: boolean
   streamPartialImages?: number
   transparentBackgroundMethod: 'api' | 'local'
-  providerDrafts?: Partial<Record<ApiProvider, Partial<Pick<ApiProfile, 'baseUrl' | 'model' | 'apiMode' | 'reasoningEffort' | 'codexCli' | 'apiProxy' | 'responseFormatB64Json' | 'streamImages' | 'streamPartialImages' | 'transparentBackgroundMethod'>>>>
+  providerDrafts?: Partial<Record<ApiProvider, Partial<Pick<ApiProfile, 'baseUrl' | 'model' | 'imageGenerationModel' | 'apiMode' | 'reasoningEffort' | 'codexCli' | 'apiProxy' | 'responseFormatB64Json' | 'streamImages' | 'streamPartialImages' | 'transparentBackgroundMethod'>>>>
+}
+
+export interface PresetAgentConfig {
+  apiConfigMode?: AgentApiConfigMode
+  textProfileId?: string
+  imageProfileId?: string
+}
+
+export interface PresetConfig {
+  customProviders: CustomProviderDefinition[]
+  profiles: ApiProfile[]
+  agent?: PresetAgentConfig
 }
 
 export interface AppSettings {
@@ -165,7 +178,7 @@ export interface PlatformSettings {
 
 export interface TaskParams {
   size: string
-  quality: 'auto' | 'low' | 'medium' | 'high'
+  quality: 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   output_format: 'png' | 'jpeg' | 'webp'
   output_compression: number | null
   moderation: 'auto' | 'low'
@@ -503,7 +516,7 @@ export interface ExportData {
     index: number
     total: number
   }
-  settings?: AppSettings
+  settings?: Omit<AppSettings, 'customProviders'> & { customProviders?: CustomProviderDefinition[] }
   tasks?: TaskRecord[]
   favoriteCollections?: FavoriteCollection[]
   defaultFavoriteCollectionId?: string | null

@@ -3,6 +3,8 @@ import type {
   ApiProfile,
   ApiProvider,
   AppSettings,
+  PresetAgentConfig,
+  PresetConfig,
   AgentApiConfigMode,
   CustomProviderContentType,
   CustomProviderDefinition,
@@ -19,6 +21,7 @@ import { shouldUseApiProxy } from './devProxy'
 import { normalizeReasoningEffort, normalizeStreamPartialImages, parseDefaultApiUrl } from './defaultApiUrl'
 import { readRuntimeEnv } from './runtimeEnv'
 import { isImportableConfigUrl } from './importableConfigUrl'
+import { DEFAULT_IMAGES_MODEL } from './imageModels'
 
 const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1'
 const RAW_DEFAULT_API_URL = readRuntimeEnv(import.meta.env?.VITE_DEFAULT_API_URL)
@@ -29,7 +32,7 @@ const DEFAULT_API_URL_PATCH = isImportableConfigUrl(RAW_DEFAULT_API_URL)
   ? null
   : parseDefaultApiUrl(RAW_DEFAULT_API_URL || (DOCKER_DEPLOYMENT && DEFAULT_OPENAI_API_PROXY ? '' : OPENAI_DEFAULT_BASE_URL))
 const DEFAULT_BASE_URL = DEFAULT_API_URL_PATCH?.baseUrl ?? ''
-export const DEFAULT_IMAGES_MODEL = 'gpt-image-2'
+export { DEFAULT_IMAGES_MODEL } from './imageModels'
 export const DEFAULT_RESPONSES_MODEL = 'gpt-5.6-sol'
 export const DEFAULT_FAL_BASE_URL = 'https://fal.run'
 export const DEFAULT_FAL_MODEL = 'openai/gpt-image-2'
@@ -364,7 +367,8 @@ export function createDefaultOpenAIProfile(overrides: Partial<ApiProfile> = {}):
     provider: 'openai',
     baseUrl: DEFAULT_BASE_URL,
     apiKey: DEFAULT_API_URL_PATCH?.apiKey ?? '',
-    model: DEFAULT_API_URL_PATCH?.model ?? DEFAULT_IMAGES_MODEL,
+    model: DEFAULT_API_URL_PATCH?.model ?? (apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL),
+    imageGenerationModel: DEFAULT_API_URL_PATCH?.imageGenerationModel ?? DEFAULT_IMAGES_MODEL,
     timeout: DEFAULT_API_TIMEOUT,
     reasoningEffort: DEFAULT_API_URL_PATCH?.reasoningEffort,
     codexCli: DEFAULT_API_URL_PATCH?.codexCli ?? false,
@@ -385,13 +389,14 @@ export function createDefaultFalProfile(overrides: Partial<ApiProfile> = {}): Ap
     baseUrl: DEFAULT_FAL_BASE_URL,
     apiKey: '',
     model: DEFAULT_FAL_MODEL,
+    imageGenerationModel: DEFAULT_IMAGES_MODEL,
     timeout: DEFAULT_API_TIMEOUT,
     apiMode: 'images',
     codexCli: false,
     apiProxy: false,
     streamImages: false,
     streamPartialImages: DEFAULT_STREAM_PARTIAL_IMAGES,
-    transparentBackgroundMethod: 'local',
+    transparentBackgroundMethod: 'api',
     ...overrides,
   }
 }
@@ -402,6 +407,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
     [profile.provider]: {
       baseUrl: profile.baseUrl,
       model: profile.model,
+      imageGenerationModel: profile.imageGenerationModel,
       apiMode: profile.apiMode,
       reasoningEffort: profile.reasoningEffort,
       codexCli: profile.codexCli,
@@ -420,6 +426,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
       provider,
       baseUrl: savedDraft?.baseUrl ?? DEFAULT_FAL_BASE_URL,
       model: savedDraft?.model ?? DEFAULT_FAL_MODEL,
+      imageGenerationModel: savedDraft?.imageGenerationModel ?? profile.imageGenerationModel,
       apiMode: 'images',
       reasoningEffort: savedDraft?.reasoningEffort,
       codexCli: false,
@@ -427,7 +434,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
       responseFormatB64Json: savedDraft?.responseFormatB64Json,
       streamImages: false,
       streamPartialImages: savedDraft?.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES,
-      transparentBackgroundMethod: 'local',
+      transparentBackgroundMethod: savedDraft?.transparentBackgroundMethod ?? 'api',
       providerDrafts,
     }
   }
@@ -440,6 +447,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
       provider: customProvider.id,
       baseUrl: savedDraft?.baseUrl ?? (shouldUseOpenAIDefaults ? DEFAULT_BASE_URL : profile.baseUrl || DEFAULT_BASE_URL),
       model: savedDraft?.model ?? (shouldUseOpenAIDefaults ? DEFAULT_IMAGES_MODEL : profile.model || DEFAULT_IMAGES_MODEL),
+      imageGenerationModel: savedDraft?.imageGenerationModel ?? profile.imageGenerationModel,
       apiMode: 'images',
       reasoningEffort: savedDraft?.reasoningEffort,
       codexCli: savedDraft?.codexCli ?? false,
@@ -465,6 +473,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
     provider,
     baseUrl: savedDraft?.baseUrl ?? DEFAULT_BASE_URL,
     model: savedDraft?.model ?? DEFAULT_IMAGES_MODEL,
+    imageGenerationModel: savedDraft?.imageGenerationModel ?? profile.imageGenerationModel,
     apiMode: nextApiMode,
     reasoningEffort: savedDraft?.reasoningEffort ?? profile.reasoningEffort,
     codexCli: savedDraft?.codexCli ?? profile.codexCli,
@@ -491,6 +500,7 @@ function normalizeProviderDraft(
     : createDefaultOpenAIProfile({ transparentBackgroundMethod })
   const baseUrl = typeof input.baseUrl === 'string' ? input.baseUrl : undefined
   const model = typeof input.model === 'string' && input.model.trim() ? input.model : undefined
+  const imageGenerationModel = typeof input.imageGenerationModel === 'string' ? input.imageGenerationModel.trim() : ''
   const apiMode = input.apiMode === 'responses' ? 'responses' : input.apiMode === 'images' ? 'images' : undefined
   const knownProvider = BUILT_IN_PROVIDER_IDS.has(provider) || customProviderIds.has(provider)
   if (!knownProvider) return undefined
@@ -500,6 +510,7 @@ function normalizeProviderDraft(
       ? baseUrl?.trim().replace(/\/+$/, '') || DEFAULT_FAL_BASE_URL
       : baseUrl,
     model,
+    imageGenerationModel,
     apiMode,
     reasoningEffort: normalizeReasoningEffort(input.reasoningEffort),
     codexCli: typeof input.codexCli === 'boolean' ? input.codexCli : fallback.codexCli,
@@ -558,6 +569,9 @@ export function normalizeApiProfile(
     baseUrl: provider === 'fal' ? rawBaseUrl.trim().replace(/\/+$/, '') : rawBaseUrl,
     apiKey: typeof record.apiKey === 'string' ? record.apiKey : defaults.apiKey,
     model: typeof record.model === 'string' && record.model.trim() ? record.model : defaults.model,
+    imageGenerationModel: typeof record.imageGenerationModel === 'string'
+      ? record.imageGenerationModel.trim()
+      : '',
     timeout: typeof record.timeout === 'number' && Number.isFinite(record.timeout) ? record.timeout : defaults.timeout,
     apiMode,
     reasoningEffort: normalizeReasoningEffort(record.reasoningEffort, defaults.reasoningEffort),
@@ -656,10 +670,11 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
   const customProviderIds = new Set(customProviders.map((provider) => provider.id))
   const nativeTransparentProviderIds = new Set(customProviders.filter(customProviderSupportsNativeTransparentBackground).map((provider) => provider.id))
   const legacyApiMode: ApiMode = record.apiMode === 'responses' ? 'responses' : 'images'
-  const legacyProfile = createDefaultOpenAIProfile({
+  const legacyProfile = normalizeApiProfile({
     baseUrl: typeof record.baseUrl === 'string' ? record.baseUrl : DEFAULT_BASE_URL,
     apiKey: typeof record.apiKey === 'string' ? record.apiKey : '',
-    model: typeof record.model === 'string' && record.model.trim() ? record.model : DEFAULT_IMAGES_MODEL,
+    model: record.model,
+    imageGenerationModel: record.imageGenerationModel,
     timeout: typeof record.timeout === 'number' && Number.isFinite(record.timeout) ? record.timeout : DEFAULT_API_TIMEOUT,
     apiMode: legacyApiMode,
     codexCli: Boolean(record.codexCli),
@@ -754,10 +769,32 @@ export function isOpenAICompatibleProvider(settings: Partial<AppSettings> | unkn
   return provider === 'openai' || Boolean(getCustomProviderDefinition(settings, provider))
 }
 
-export interface ImportedProviderSettings {
-  customProviders: CustomProviderDefinition[]
-  profiles: ApiProfile[]
+export interface ImportedProviderSettings extends PresetConfig {
   presetProfileFields?: Record<string, string[]>
+}
+
+export function normalizePresetAgent(value: unknown, profiles: ApiProfile[]): PresetAgentConfig | undefined {
+  if (value === undefined) return undefined
+  if (!isRecord(value)
+    || (value.apiConfigMode !== undefined && value.apiConfigMode !== 'off' && value.apiConfigMode !== 'native' && value.apiConfigMode !== 'hybrid')
+    || (value.textProfileId !== undefined && !profiles.some((profile) => profile.id === value.textProfileId && isAgentTextApiProfile(profile)))
+    || (value.imageProfileId !== undefined && !profiles.some((profile) => profile.id === value.imageProfileId))) {
+    console.warn('忽略无效的 Agent 预置配置：请检查模式及引用的配置 ID（文本配置必须使用 Responses API）')
+    return undefined
+  }
+  return {
+    ...(value.apiConfigMode !== undefined ? { apiConfigMode: value.apiConfigMode as AgentApiConfigMode } : {}),
+    ...(value.textProfileId !== undefined ? { textProfileId: value.textProfileId as string } : {}),
+    ...(value.imageProfileId !== undefined ? { imageProfileId: value.imageProfileId as string } : {}),
+  }
+}
+
+export function getPresetAgentSettings(agent: PresetAgentConfig | undefined): Partial<AppSettings> {
+  return {
+    ...(agent?.apiConfigMode !== undefined ? { agentApiConfigMode: agent.apiConfigMode } : {}),
+    ...(agent?.textProfileId !== undefined ? { agentTextProfileId: agent.textProfileId } : {}),
+    ...(agent?.imageProfileId !== undefined ? { agentImageProfileId: agent.imageProfileId } : {}),
+  }
 }
 
 function validateCustomProviderTaskMappings(providers: CustomProviderDefinition[]) {
@@ -791,12 +828,12 @@ export function importCustomProviderSettingsFromJson(
 
   const record = parsed as Record<string, unknown>
 
-  // 包裹结构：{customProviders: [...], profiles: [...]}
-  if (Array.isArray(record.customProviders)) {
+  // 包裹结构：profiles 可独立于自定义服务商配置导入。
+  if (Array.isArray(record.profiles) || Array.isArray(record.customProviders)) {
     if (options.deploymentConfig) validateDeploymentProviderIds(record.customProviders)
     const customProviders = normalizeCustomProviderDefinitions(record.customProviders)
-    if (customProviders.length === 0) {
-      if (!options.deploymentConfig) throw new Error('customProviders 数组中没有有效的服务商配置')
+    if (!options.deploymentConfig && Array.isArray(record.customProviders) && record.customProviders.length > 0 && !customProviders.length) {
+      throw new Error('customProviders 数组中没有有效的服务商配置')
     }
     validateCustomProviderTaskMappings(customProviders)
     const customProviderIds = new Set(customProviders.map((provider) => provider.id))
@@ -805,9 +842,11 @@ export function importCustomProviderSettingsFromJson(
     const profiles = profileEntries.map((entry) => entry.profile)
     if (!options.deploymentConfig) return { customProviders, profiles }
 
+    const agent = normalizePresetAgent(record.agent, profiles)
     return {
       customProviders,
       profiles,
+      ...(agent ? { agent } : {}),
       ...(profileEntries.length
         ? { presetProfileFields: Object.fromEntries(profileEntries.map((entry) => [entry.profile.id, Object.keys(entry.source)])) }
         : {}),
@@ -868,6 +907,7 @@ function isDefaultOpenAIProfile(profile: ApiProfile): boolean {
     profile.baseUrl === DEFAULT_BASE_URL &&
     profile.apiKey === '' &&
     profile.model === DEFAULT_IMAGES_MODEL &&
+    profile.imageGenerationModel === DEFAULT_IMAGES_MODEL &&
     profile.timeout === DEFAULT_API_TIMEOUT &&
     profile.apiMode === 'images' &&
     profile.reasoningEffort === undefined &&
@@ -919,6 +959,7 @@ function getApiProfileDedupKey(profile: ApiProfile): string {
     profile.baseUrl.trim().toLowerCase(),
     profile.apiKey.trim(),
     profile.model.trim(),
+    profile.imageGenerationModel?.trim(),
     profile.apiMode,
     profile.reasoningEffort,
   ])
@@ -929,6 +970,7 @@ function getApiProfileConnectionKey(profile: ApiProfile): string {
     profile.provider,
     profile.baseUrl.trim().toLowerCase(),
     profile.model.trim(),
+    profile.imageGenerationModel?.trim(),
     profile.apiMode,
     profile.reasoningEffort,
   ])
@@ -1058,6 +1100,7 @@ const PRESET_PROFILE_DEPLOYMENT_KEYS = [
   'provider',
   'baseUrl',
   'model',
+  'imageGenerationModel',
   'timeout',
   'apiMode',
   'reasoningEffort',
@@ -1092,10 +1135,10 @@ export function mergePresetImportedSettings(
     lockPresetParams?: boolean
     dismissedPresetProfileIds?: string[]
     dismissedPresetProviderIds?: string[]
-    previousPresetConfig?: Pick<AppSettings, 'customProviders' | 'profiles'> | null
+    previousPresetConfig?: PresetConfig | null
     usedPresetProfileIds?: string[]
   } = {},
-): { settings: AppSettings; presetConfig: Pick<AppSettings, 'customProviders' | 'profiles'> } {
+): { settings: AppSettings; presetConfig: PresetConfig } {
   const importedRecord = isRecord(importedSettings) ? importedSettings : {}
   validateDeploymentProviderIds(importedRecord.customProviders)
   const normalizedImported = normalizeSettings(importedSettings)
@@ -1201,9 +1244,15 @@ export function mergePresetImportedSettings(
     if (!sourceProfileIds.has(profile.id) && profiles.some((item) => item.id === profile.id)) presetProfiles.push(profile)
   }
 
+  const agent = normalizePresetAgent(importedRecord.agent, allSourceProfileEntries.map((entry) => entry.profile))
+  const previousAgentSettings = getPresetAgentSettings(options.previousPresetConfig?.agent)
+  const agentSettings = Object.fromEntries(Object.entries(getPresetAgentSettings(agent))
+    .filter(([key, value]) => options.lockPresetParams || value !== previousAgentSettings[key as keyof AppSettings]))
+
   return {
     settings: normalizeSettings({
       ...current,
+      ...agentSettings,
       customProviders,
       profiles,
       activeProfileId: replacingPristineDefault ? sourceDefaultProfileId ?? nextProfiles[0].id : current.activeProfileId,
@@ -1211,14 +1260,16 @@ export function mergePresetImportedSettings(
     presetConfig: {
       customProviders: presetProviders,
       profiles: presetProfiles,
+      ...(agent ? { agent } : {}),
     },
   }
 }
 
 export const DEFAULT_SETTINGS: AppSettings = normalizeSettings({
+  profiles: [createDefaultOpenAIProfile()],
   baseUrl: DEFAULT_BASE_URL,
   apiKey: DEFAULT_API_URL_PATCH?.apiKey ?? '',
-  model: DEFAULT_API_URL_PATCH?.model ?? DEFAULT_IMAGES_MODEL,
+  model: DEFAULT_API_URL_PATCH?.model ?? (DEFAULT_API_URL_PATCH?.apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL),
   timeout: DEFAULT_API_TIMEOUT,
   apiMode: DEFAULT_API_URL_PATCH?.apiMode ?? 'images',
   codexCli: DEFAULT_API_URL_PATCH?.codexCli ?? false,

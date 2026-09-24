@@ -17,11 +17,13 @@ import {
   isHttpUrl,
   mergeActualParams,
   maybeAppendTransparentBackgroundHint,
+  maybeAppendImageToolDroppedHint,
   MIME_MAP,
   normalizeBase64Image,
   pickActualParams,
   PROMPT_REWRITE_GUARD_PREFIX,
 } from './imageApiShared'
+import { getImageGenerationModel } from './imageModels'
 import { isEventStreamResponse, readJsonServerSentEvents } from './serverSentEvents'
 import { prependCodexCliSizePrompt } from './size'
 
@@ -137,6 +139,8 @@ function createResponsesImageTool(
     output_format: params.output_format,
     moderation: params.moderation,
   }
+  const imageModel = getImageGenerationModel(profile)
+  if (imageModel) tool.model = imageModel
 
   if (!profile.codexCli) {
     tool.size = params.size
@@ -1048,7 +1052,7 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
 
     if (!response.ok) {
       const errorMessage = await getApiErrorMessage(response)
-      throw new Error(maybeAppendStreamingHint(errorMessage, response.status, profile.streamImages))
+      throw new Error(maybeAppendStreamingHint(maybeAppendImageToolDroppedHint(errorMessage), response.status, profile.streamImages))
     }
 
     if (profile.streamImages && isEventStreamResponse(response)) {

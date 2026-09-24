@@ -1,6 +1,7 @@
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, type ApiProfile, type AppSettings, type ResponsesApiResponse, type ResponsesOutputItem, type TaskParams } from '../types'
 import { buildApiUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devProxy'
-import { appendStreamingFormatHint, getApiErrorMessage, getResponsesImageResultBase64, maybeAppendStreamingHint, MIME_MAP, normalizeBase64Image, pickActualParams, PROMPT_REWRITE_GUARD_PREFIX } from './imageApiShared'
+import { appendStreamingFormatHint, getApiErrorMessage, getResponsesImageResultBase64, maybeAppendImageToolDroppedHint, maybeAppendStreamingHint, MIME_MAP, normalizeBase64Image, pickActualParams, PROMPT_REWRITE_GUARD_PREFIX } from './imageApiShared'
+import { getImageGenerationModel } from './imageModels'
 import { normalizeResponsesOutputItems } from './responsesOutputState'
 import { isEventStreamResponse, readJsonServerSentEvents, throwIfAborted } from './serverSentEvents'
 
@@ -113,6 +114,8 @@ function createImageTool(params: TaskParams, profile: ApiProfile, maskDataUrl?: 
     output_format: params.output_format,
     moderation: params.moderation,
   }
+  const imageModel = getImageGenerationModel(profile)
+  if (imageModel) tool.model = imageModel
 
   if (!profile.codexCli) {
     tool.size = params.size
@@ -633,7 +636,7 @@ export async function callAgentResponsesApi(opts: {
 
   try {
     const body: Record<string, unknown> = {
-      model: profile.model || settings.model,
+      model: profile.model,
       instructions: createAgentInstructions(settings, (imageProfile ?? profile).codexCli ? params.size : undefined),
       input,
       tools: createAgentTools(params, profile, settings, maskDataUrl, { imageOnly }),
@@ -702,7 +705,7 @@ export async function callAgentConversationTitleApi(opts: {
     }
 
     const body: Record<string, unknown> = {
-      model: profile.model || settings.model,
+      model: profile.model,
       instructions: AGENT_TITLE_INSTRUCTIONS,
       input: [{ role: 'user', content }],
     }
@@ -799,6 +802,8 @@ export async function callBatchImageSingle(opts: {
       moderation: params.moderation,
       quality: params.quality,
     }
+    const imageModel = getImageGenerationModel(profile)
+    if (imageModel) tool.model = imageModel
     if (!profile.codexCli) {
       tool.size = params.size
     }
@@ -830,7 +835,7 @@ export async function callBatchImageSingle(opts: {
 
     if (!response.ok) {
       const errorMsg = await getApiErrorMessage(response)
-      return { batchItemId, image: null, error: maybeAppendStreamingHint(errorMsg, response.status, profile.streamImages) }
+      return { batchItemId, image: null, error: maybeAppendStreamingHint(maybeAppendImageToolDroppedHint(errorMsg), response.status, profile.streamImages) }
     }
 
     // Handle streaming
