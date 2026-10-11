@@ -3,7 +3,7 @@ import type { S3Client } from '@aws-sdk/client-s3'
 import net from 'node:net'
 import type { AgentConversation, AgentMessage, AgentRound, ApiProfile, AppSettings, PlatformSettings, ResponsesApiResponse, ResponsesOutputItem, TaskRecord, TaskParams } from '../src/types'
 import { DEFAULT_PARAMS } from '../src/types'
-import { getActiveApiProfile, getAgentImageApiProfile, getAgentTextApiProfile, normalizeSettings } from '../src/lib/apiProfiles'
+import { getActiveApiProfile, getAgentImageApiProfile, getAgentTextApiProfile, normalizeSettings, resolveApiProfileModel } from '../src/lib/apiProfiles'
 import { applyPlatformSettingsToAppSettings, getPlatformManagedTaskParams, normalizePlatformSettings, sanitizePlatformSettingsForClient } from '../src/lib/platformSettings'
 import { callImageApi } from '../src/lib/api'
 import { normalizeParamsForSettings } from '../src/lib/paramCompatibility'
@@ -39,6 +39,7 @@ type TaskEvent =
   | { type: 'error'; task: TaskRecord }
 
 const taskSubscribers = new Map<string, Set<FastifyReply>>()
+const runningCloudTaskIds = new Set<string>()
 const PLATFORM_SETTINGS_KEY = 'platform'
 const UPSTREAM_CONNECT_TIMEOUT_MS = 8_000
 const PLATFORM_TEST_TIMEOUT_MS = 10_000
@@ -1824,7 +1825,7 @@ function selectTaskApiProfile(settings: AppSettings, task: TaskRecord) {
   const byId = task.apiProfileId
     ? normalized.profiles.find((profile) => profile.id === task.apiProfileId)
     : null
-  return byId ?? getActiveApiProfile(normalized)
+  return byId ? resolveApiProfileModel(byId, task.apiModel) : getActiveApiProfile(normalized)
 }
 
 async function getAdminTargetUser(db: Db, userId: string): Promise<AuthUser | null> {
@@ -2296,8 +2297,9 @@ async function runTask(
   if (!task || task.status !== 'running') return
 
   try {
-    const settings = await loadGenerationSettings(db, config, user.id)
-    if (!settings) throw new Error('缺少云端 API 配置')
+    const savedSettings = await loadGenerationSettings(db, config, user.id)
+    if (!savedSettings) throw new Error('缺少云端 API 配置')
+    const settings = createSettingsForApiProfile(savedSettings, selectTaskApiProfile(savedSettings, task))
 
     const inputImageDataUrls = await Promise.all(task.inputImageIds.map((id) =>
       readImageDataUrl(db, s3, config, user.id, id),
@@ -2312,8 +2314,9 @@ async function runTask(
 
     const result = await callImageApi({
       settings,
-      prompt: requestPrompt,
+      prompt: replaceImageMentionsForApi(requestPrompt, task.inputImageIds.length),
       params: task.params,
+      nativeTransparentBackground: task.params.transparent_output && !task.transparentOutput,
       inputImageDataUrls,
       maskDataUrl,
       onPartialImage: (partial) => {
@@ -2350,19 +2353,19 @@ async function runTask(
       status: 'done',
       error: null,
       finishedAt: now,
-      elapsed: now - latestBeforeSave.createdAt,
+      elapsed: now - (latestBeforeSave.startedAt ?? latestBeforeSave.createdAt),
     })
     await putTaskRecord(db, user.id, doneTask)
     publishTaskEvent(user.id, taskId, { type: 'done', task: doneTask })
   } catch (error) {
     const latestTask = await getTask(db, user.id, taskId)
-    if (!latestTask) return
+    if (!latestTask || latestTask.status !== 'running') return
     const now = Date.now()
     const failedTask = applyTaskPatch(latestTask, {
       status: 'error',
       error: error instanceof Error ? error.message : String(error),
       finishedAt: now,
-      elapsed: now - latestTask.createdAt,
+      elapsed: now - (latestTask.startedAt ?? latestTask.createdAt),
     })
     await putTaskRecord(db, user.id, failedTask)
     publishTaskEvent(user.id, taskId, { type: 'error', task: failedTask })
@@ -2928,15 +2931,39 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
     const user = await requireAuth(db, request, reply)
     if (!user) return
     const incomingTask = request.body as TaskRecord
-    const settings = await loadGenerationSettings(db, config, user.id)
-    if (!settings) return reply.code(400).send({ error: '缺少云端 API 配置' })
-    const task = await applyManagedTaskParams(db, config, incomingTask, settings)
-    await assertTaskImagesBelongToUser(db, user.id, task)
-    await assertUserLimits(db, user.id, { creatingTask: true })
-    await putTaskRecord(db, user.id, task)
-    publishTaskEvent(user.id, task.id, { type: 'task', task })
-    void runTask(db, s3, config, user, task.id)
-    return { task }
+    const key = taskEventKey(user.id, incomingTask.id)
+    if (runningCloudTaskIds.has(key)) return reply.code(409).send({ error: '任务正在运行，请勿重复重试' })
+    runningCloudTaskIds.add(key)
+    try {
+      const current = await getTask(db, user.id, incomingTask.id)
+      if (current && (current.status === 'running' || current.falRecoverable || current.customRecoverable)) {
+        throw Object.assign(new Error('任务正在运行或等待恢复，请勿重复重试'), { statusCode: 409 })
+      }
+      if (current && (current.sourceMode === 'agent' || current.agentConversationId || current.agentRoundId)) {
+        throw createBadRequestError('Agent 图片任务请新建任务重试')
+      }
+      const savedSettings = await loadGenerationSettings(db, config, user.id)
+      if (!savedSettings) throw createBadRequestError('缺少云端 API 配置')
+      const settings = createSettingsForApiProfile(savedSettings, selectTaskApiProfile(savedSettings, incomingTask))
+      const task = await applyManagedTaskParams(db, config, {
+        ...incomingTask,
+        ...(current ? {
+          createdAt: current.createdAt,
+          startedAt: Date.now(),
+          isFavorite: current.isFavorite,
+          favoriteCollectionIds: current.favoriteCollectionIds,
+        } : {}),
+      }, settings)
+      await assertTaskImagesBelongToUser(db, user.id, task)
+      await assertUserLimits(db, user.id, { creatingTask: !current })
+      await putTaskRecord(db, user.id, task)
+      publishTaskEvent(user.id, task.id, { type: 'task', task })
+      void runTask(db, s3, config, user, task.id).finally(() => runningCloudTaskIds.delete(key))
+      return { task }
+    } catch (error) {
+      runningCloudTaskIds.delete(key)
+      throw error
+    }
   })
 
   app.patch('/api/tasks/:id', async (request, reply) => {

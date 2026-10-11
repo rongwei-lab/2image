@@ -37,7 +37,7 @@ function renderMessage(message: string) {
 
 function getActionButtonClass(tone: 'primary' | 'secondary' | 'danger' | 'warning' = 'primary') {
   if (tone === 'secondary') {
-    return 'border border-gray-200 text-gray-600 hover:bg-gray-50 dark:border-white/[0.08] dark:text-gray-400 dark:hover:bg-white/[0.06]'
+    return 'border border-transparent text-gray-600 hover:bg-black/[0.07] dark:bg-white/[0.06] dark:text-gray-400 dark:hover:bg-white/[0.1]'
   }
   if (tone === 'warning') return 'bg-orange-500 text-white hover:bg-orange-600'
   if (tone === 'danger') return 'bg-red-500 text-white hover:bg-red-600'
@@ -148,7 +148,7 @@ export default function ConfirmDialog() {
               <button
                 onClick={handleCancel}
                 disabled={isSubmitting}
-                className="flex-1 py-2 rounded-xl border border-gray-200 dark:border-white/[0.08] text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-white/[0.06] transition disabled:cursor-not-allowed disabled:opacity-60"
+                className="flex-1 py-2 rounded-xl border border-transparent dark:bg-white/[0.06] text-sm text-gray-600 dark:text-gray-400 hover:bg-black/[0.07] dark:hover:bg-white/[0.1] transition disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {cancelText}
               </button>

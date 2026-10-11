@@ -8,12 +8,14 @@ import type {
   ApiMode,
   ApiProfile,
   AppSettings,
+  BatchProgress,
   PresetConfig,
   AppMode,
   PlatformSettings,
   TaskParams,
   InputImage,
   MaskDraft,
+  SketchBoardRequest,
   TaskRecord,
   FavoriteCollection,
   ResponsesOutputItem,
@@ -21,10 +23,10 @@ import type {
   StoredImageThumbnail,
 } from './types'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_PARAMS } from './types'
-import { DEFAULT_SETTINGS, getActiveApiProfile, getAgentImageApiProfile, getAgentTextApiProfile, getCustomProviderDefinition, mergeImportedSettings, mergePresetImportedSettings, normalizeSettings, validateApiProfile } from './lib/apiProfiles'
+import { DEFAULT_SETTINGS, getActiveApiProfile, getAgentImageApiProfile, getAgentTextApiProfile, getCustomProviderDefinition, mergeImportedSettings, mergePresetImportedSettings, normalizeSettings, resolveApiProfileModel, splitModelList, validateApiProfile } from './lib/apiProfiles'
 import { enforcePresetConfigPolicy, getPresetConfig, getPresetProfileIds, getPresetProviderIds, isPresetConfigDeletionPrevented, isPresetConfigOnlyEnabled, isPresetConfigParamsLocked, isPresetProfile, isPresetProviderDeletionPrevented } from './lib/presetConfig'
 import { dismissAllTooltips } from './lib/tooltipDismiss'
-import { remapImageMentionsForOrder, replaceImageMentionsForApi } from './lib/promptImageMentions'
+import { getTaskPromptText, remapImageMentionsForOrder, replaceImageMentionsForApi, stripImageMentionMarkers } from './lib/promptImageMentions'
 import {
   getAllTasks,
   putTask as dbPutTask,
@@ -84,6 +86,7 @@ import { getCustomQueuedImageResult } from './lib/openaiCompatibleImageApi'
 import { validateMaskMatchesImage } from './lib/canvasImage'
 import { orderInputImagesForMask } from './lib/mask'
 import { getChangedParams, normalizeParamsForSettings } from './lib/paramCompatibility'
+import { runWithConcurrency, splitBatchPrompts } from './lib/batchPrompts'
 import { createTransparentOutputMeta, getTransparentRequestParams, removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
 import { applyPromptStylePreset, normalizePromptStylePresetId, type PromptStylePresetId } from './lib/promptStyles'
 import { blobToDataUrl, fileToDataUrl } from './lib/dataUrl'
@@ -112,6 +115,7 @@ const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const cloudImageUploadRunningIds = new Set<string>()
 const cloudTaskSubscriptionCleanups = new Map<string, () => void>()
 const cloudTaskReconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const taskExecutions = new Map<string, symbol>()
 const agentRoundControllers = new Map<string, AbortController>()
 const agentRecoveryContinuations = new Set<string>()
 const deletedActiveAgentTasks = new Map<string, { task: TaskRecord; controller: AbortController }>()
@@ -345,6 +349,12 @@ interface AppState {
   setPrompt: (p: string) => void
   promptStylePresetId: PromptStylePresetId
   setPromptStylePresetId: (id: PromptStylePresetId) => void
+  /**
+   * 输入框最后一次的选区（可见文本偏移），供画板等外部入口插入胶囊并覆盖选中内容；未聚焦过时为 null。
+   * 同时记下当时的提示词，提示词被其他途径替换后选区即失效，使用前需比对。
+   */
+  promptSelection: { start: number; end: number; prompt: string } | null
+  setPromptSelection: (selection: { start: number; end: number }) => void
   inputImages: InputImage[]
   addInputImage: (img: InputImage) => void
   replaceInputImage: (idx: number, img: InputImage) => void
@@ -365,7 +375,13 @@ interface AppState {
   reusedTaskApiProfileId: string | null
   reusedTaskApiProfileName: string | null
   reusedTaskApiProfileMissing: boolean
-  setReusedTaskApiProfile: (profileId: string | null, missing?: boolean, profileName?: string | null) => void
+  /** 临时复用其他配置时使用的模型，只在本次复用中生效，不写入该配置 */
+  reusedTaskApiModel: string | null
+  setReusedTaskApiProfile: (profileId: string | null, missing?: boolean, profileName?: string | null, model?: string | null) => void
+  setReusedTaskApiModel: (model: string) => void
+  /** 正在进行的批量提交进度，仅保存在内存中 */
+  batchProgress: BatchProgress | null
+  setBatchProgress: (progress: BatchProgress | null) => void
 
   // Agent
   agentConversations: AgentConversation[]
@@ -437,7 +453,12 @@ interface AppState {
   setDetailTaskId: (id: string | null) => void
   lightboxImageId: string | null
   lightboxImageList: string[]
-  setLightboxImageId: (id: string | null, list?: string[]) => void
+  /** 预览参考图时对应的提示词，按图片在列表中的位置取其评论；为空时不显示评论 */
+  lightboxCommentPrompt: string | null
+  setLightboxImageId: (id: string | null, list?: string[], commentPrompt?: string | null) => void
+  /** 画板；baseImageSrc 为画布底图，replaceImageId 为完成后要替换的参考图 */
+  sketchBoard: SketchBoardRequest | null
+  setSketchBoard: (board: SketchBoardRequest | null) => void
   showSettings: boolean
   settingsTabRequest: SettingsTab | null
   setShowSettings: (v: boolean, tab?: SettingsTab) => void
@@ -707,7 +728,7 @@ export const useStore = create<AppState>()(
         return {
           settings,
           ...(shouldClearReusedProfile
-            ? { reusedTaskApiProfileId: null, reusedTaskApiProfileName: null, reusedTaskApiProfileMissing: false }
+            ? { reusedTaskApiProfileId: null, reusedTaskApiProfileName: null, reusedTaskApiProfileMissing: false, reusedTaskApiModel: null }
             : {}),
         }
       }),
@@ -745,7 +766,7 @@ export const useStore = create<AppState>()(
             dismissedPresetProviderIds,
             reusedTaskApiProfileId: shouldClearReusedProfile ? null : state.reusedTaskApiProfileId,
             ...(shouldClearReusedProfile
-              ? { reusedTaskApiProfileName: null, reusedTaskApiProfileMissing: false }
+              ? { reusedTaskApiProfileName: null, reusedTaskApiProfileMissing: false, reusedTaskApiModel: null }
               : {}),
           }
         })
@@ -762,6 +783,8 @@ export const useStore = create<AppState>()(
       setPrompt: (prompt) => set((s) => syncActiveInputDraft(s, { prompt })),
       promptStylePresetId: '',
       setPromptStylePresetId: (promptStylePresetId) => set({ promptStylePresetId: normalizePromptStylePresetId(promptStylePresetId) }),
+      promptSelection: null,
+      setPromptSelection: (selection) => set((s) => ({ promptSelection: { ...selection, prompt: s.prompt } })),
       inputImages: [],
       addInputImage: (img) => {
         const nextImage = isCloudMode() && img.dataUrl
@@ -858,11 +881,16 @@ export const useStore = create<AppState>()(
       reusedTaskApiProfileId: null,
       reusedTaskApiProfileName: null,
       reusedTaskApiProfileMissing: false,
-      setReusedTaskApiProfile: (profileId, missing = false, profileName = null) => set({
+      reusedTaskApiModel: null,
+      setReusedTaskApiProfile: (profileId, missing = false, profileName = null, model = null) => set({
         reusedTaskApiProfileId: profileId,
         reusedTaskApiProfileName: profileName,
         reusedTaskApiProfileMissing: missing,
+        reusedTaskApiModel: profileId ? model : null,
       }),
+      setReusedTaskApiModel: (reusedTaskApiModel) => set({ reusedTaskApiModel }),
+      batchProgress: null,
+      setBatchProgress: (batchProgress) => set({ batchProgress }),
 
       // Agent
       agentConversations: [],
@@ -1069,9 +1097,19 @@ export const useStore = create<AppState>()(
       },
       lightboxImageId: null,
       lightboxImageList: [],
-      setLightboxImageId: (lightboxImageId, list) => {
+      lightboxCommentPrompt: null,
+      setLightboxImageId: (lightboxImageId, list, commentPrompt = null) => {
         if (lightboxImageId) dismissAllTooltips()
-        set({ lightboxImageId, lightboxImageList: list ?? (lightboxImageId ? [lightboxImageId] : []) })
+        set({
+          lightboxImageId,
+          lightboxImageList: list ?? (lightboxImageId ? [lightboxImageId] : []),
+          lightboxCommentPrompt: lightboxImageId ? commentPrompt : null,
+        })
+      },
+      sketchBoard: null,
+      setSketchBoard: (sketchBoard) => {
+        if (sketchBoard) dismissAllTooltips()
+        set({ sketchBoard })
       },
       showSettings: false,
       settingsTabRequest: null,
@@ -1539,7 +1577,7 @@ export function markExpiredOpenAIRunningTasks(
 
     const profile = getTaskApiProfile(settings, task) ?? getActiveApiProfile(settings)
     const timeoutSeconds = Math.max(1, profile.timeout)
-    if (now - task.createdAt < timeoutSeconds * 1000) return task
+    if (now - (task.startedAt ?? task.createdAt) < timeoutSeconds * 1000) return task
 
     const updated: TaskRecord = {
       ...task,
@@ -1548,7 +1586,7 @@ export function markExpiredOpenAIRunningTasks(
       falRecoverable: false,
       customRecoverable: false,
       finishedAt: now,
-      elapsed: Math.max(0, now - task.createdAt),
+      elapsed: Math.max(0, now - (task.startedAt ?? task.createdAt)),
     }
     expiredTasks.push(updated)
     return updated
@@ -1570,7 +1608,7 @@ function failOpenAITaskIfStillRunning(taskId: string, error: string, now = Date.
   updateTaskInStore(taskId, {
     ...createTaskErrorPatch(task, error, now),
     falRecoverable: false,
-    elapsed: Math.max(0, now - task.createdAt),
+    elapsed: Math.max(0, now - (task.startedAt ?? task.createdAt)),
   })
   return true
 }
@@ -1581,7 +1619,7 @@ function scheduleOpenAIWatchdog(taskId: string, timeoutSeconds: number, profile?
   if (!task || !isRunningOpenAITask(task)) return
 
   const timeoutMs = Math.max(0, timeoutSeconds * 1000)
-  const remainingMs = Math.max(0, timeoutMs - (Date.now() - task.createdAt))
+  const remainingMs = Math.max(0, timeoutMs - (Date.now() - (task.startedAt ?? task.createdAt)))
   const timer = setTimeout(() => {
     openAIWatchdogTimers.delete(taskId)
     const failed = failOpenAITaskIfStillRunning(taskId, createOpenAITimeoutError(timeoutSeconds, profile))
@@ -1613,7 +1651,7 @@ export function taskMatchesFilterStatus(task: TaskRecord, filterStatus: AppState
 export function taskMatchesSearchQuery(task: TaskRecord, query: string) {
   const q = query.trim().toLowerCase()
   if (!q) return true
-  const prompt = (task.prompt || '').toLowerCase()
+  const prompt = getTaskPromptText(task.prompt || '', task.inputImageIds.length).toLowerCase()
   const paramStr = JSON.stringify(task.params).toLowerCase()
   const errorStr = [task.error, ...(task.outputErrors ?? []).map((item) => item.error)].filter(Boolean).join('\n').toLowerCase()
   return prompt.includes(q) || paramStr.includes(q) || errorStr.includes(q)
@@ -1656,7 +1694,9 @@ function getCustomRecoveryProfile(settings: AppSettings, task: TaskRecord) {
 export function getTaskApiProfile(settings: AppSettings, task: TaskRecord): ApiProfile | null {
   const normalized = normalizeSettings(settings)
   if (!task.apiProfileId) return null
-  return normalized.profiles.find((profile) => profile.id === task.apiProfileId) ?? null
+  const profile = normalized.profiles.find((item) => item.id === task.apiProfileId)
+  // 任务记录的模型仍在配置的模型列表中时，沿用任务提交时的模型
+  return profile ? resolveApiProfileModel(profile, task.apiModel) : null
 }
 
 function createSettingsForApiProfile(settings: AppSettings, profile: ApiProfile): AppSettings {
@@ -1699,9 +1739,10 @@ function getAgentProfileValidationError(settings: AppSettings): { profile: ApiPr
   return null
 }
 
-function getReusedTaskApiProfile(settings: AppSettings, profileId: string | null): ApiProfile | null {
+function getReusedTaskApiProfile(settings: AppSettings, profileId: string | null, model: string | null): ApiProfile | null {
   if (!profileId) return null
-  return normalizeSettings(settings).profiles.find((profile) => profile.id === profileId) ?? null
+  const profile = normalizeSettings(settings).profiles.find((item) => item.id === profileId)
+  return profile ? resolveApiProfileModel(profile, model ?? undefined) : null
 }
 
 function getTaskApiProfileName(task: TaskRecord) {
@@ -2293,14 +2334,14 @@ export async function initStore() {
 
 /** 提交新任务 */
 export async function submitTask(options: { allowFullMask?: boolean; useCurrentApiProfileWhenReusedMissing?: boolean } = {}) {
-  const { settings, prompt, promptStylePresetId, inputImages, maskDraft, params, platformSettings, reusedTaskApiProfileId, reusedTaskApiProfileName, reusedTaskApiProfileMissing, showToast, setConfirmDialog } =
+  const { settings, prompt, promptStylePresetId, inputImages, maskDraft, params, platformSettings, reusedTaskApiProfileId, reusedTaskApiProfileName, reusedTaskApiProfileMissing, reusedTaskApiModel, showToast, setConfirmDialog } =
     useStore.getState()
 
   const normalizedSettings = normalizeSettings(settings)
   let activeProfile = getActiveApiProfile(settings)
   let requestSettings = createSettingsForApiProfile(normalizedSettings, activeProfile)
   if (normalizedSettings.reuseTaskApiProfileTemporarily && (reusedTaskApiProfileId || reusedTaskApiProfileMissing)) {
-    const reusedProfile = getReusedTaskApiProfile(normalizedSettings, reusedTaskApiProfileId)
+    const reusedProfile = getReusedTaskApiProfile(normalizedSettings, reusedTaskApiProfileId, reusedTaskApiModel)
     if (!reusedProfile) {
       if (options.useCurrentApiProfileWhenReusedMissing) {
         useStore.getState().setReusedTaskApiProfile(null)
@@ -2334,6 +2375,14 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     return
   }
 
+  const batchPrompts = normalizedSettings.showBatchPrompt && normalizedSettings.batchPromptEnabled ? splitBatchPrompts(prompt) : []
+  if (useStore.getState().batchProgress) {
+    showToast('批量任务进行中，请等待完成或停止后再提交', 'error')
+    return
+  }
+  // 检查通过后立即占位，避免后续 await 期间重复提交启动第二批
+  const batchId = batchPrompts.length ? beginBatch(batchPrompts.length) : 0
+
   let orderedInputImages = inputImages
   let maskImageId: string | null = null
   let maskTargetImageId: string | null = null
@@ -2352,6 +2401,7 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
             void submitTask({ allowFullMask: true })
           },
         })
+        endBatch(batchId)
         return
       }
       maskImageId = await storeImage(maskDraft.maskDataUrl, 'mask')
@@ -2362,13 +2412,21 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
         useStore.getState().clearMaskDraft()
       }
       showToast(err instanceof Error ? err.message : String(err), 'error')
+      endBatch(batchId)
       return
     }
   }
 
   // 持久化输入图片到 IndexedDB（此前只在内存缓存中）
-  for (const img of orderedInputImages) {
-    await storeImage(img.dataUrl)
+  try {
+    for (const img of orderedInputImages) {
+      await storeImage(img.dataUrl)
+    }
+  } catch (err) {
+    console.error('保存参考图失败', err)
+    endBatch(batchId)
+    showToast(`保存参考图失败：${err instanceof Error ? err.message : String(err)}`, 'error')
+    return
   }
 
   // 后台接管参数时，提交链路直接使用平台默认值；这样旧 UI 状态或手动改请求也不会改变生成参数。
@@ -2378,49 +2436,56 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
   const taskParams = shouldUseTransparentOutput
     ? getTransparentRequestParams(normalizedParams)
     : { ...normalizedParams, transparent_output: false }
-  const styledPrompt = applyPromptStylePreset(prompt.trim(), promptStylePresetId)
-  const transparentMeta = taskParams.transparent_output && activeProfile.transparentBackgroundMethod === 'local'
-    ? createTransparentOutputMeta(styledPrompt)
-    : null
   const normalizedParamPatch = getChangedParams(params, taskParams)
   if (Object.keys(normalizedParamPatch).length) {
     useStore.getState().setParams(normalizedParamPatch)
   }
 
-  const taskId = genId()
-  const task: TaskRecord = {
-    id: taskId,
-    prompt: prompt.trim(),
-    promptStylePresetId,
-    params: taskParams,
-    apiProvider: activeProfile.provider,
-    apiProfileId: activeProfile.id,
-    apiProfileName: activeProfile.name,
-    apiMode: activeProfile.apiMode,
-    apiModel: activeProfile.model,
-    inputImageIds: orderedInputImages.map((i) => i.id),
-    maskTargetImageId,
-    maskImageId,
-    transparentOutput: transparentMeta?.transparentOutput,
-    transparentPrompt: transparentMeta?.effectivePrompt,
-    outputImages: [],
-    status: 'running',
-    error: null,
-    createdAt: Date.now(),
-    finishedAt: null,
-    elapsed: null,
+  const startTask = async (taskPrompt: string) => {
+    const transparentMeta = taskParams.transparent_output && activeProfile.transparentBackgroundMethod === 'local'
+      ? createTransparentOutputMeta(applyPromptStylePreset(taskPrompt, promptStylePresetId))
+      : null
+    const task: TaskRecord = {
+      id: genId(),
+      prompt: taskPrompt,
+      promptStylePresetId,
+      params: taskParams,
+      apiProvider: activeProfile.provider,
+      apiProfileId: activeProfile.id,
+      apiProfileName: activeProfile.name,
+      apiMode: activeProfile.apiMode,
+      apiModel: activeProfile.model,
+      inputImageIds: orderedInputImages.map((i) => i.id),
+      maskTargetImageId,
+      maskImageId,
+      transparentOutput: transparentMeta?.transparentOutput,
+      transparentPrompt: transparentMeta?.effectivePrompt,
+      outputImages: [],
+      status: 'running',
+      error: null,
+      createdAt: Date.now(),
+      finishedAt: null,
+      elapsed: null,
+    }
+
+    useStore.getState().setTasks([task, ...useStore.getState().tasks])
+    if (!batchId) useStore.getState().setTaskScrollTargetId(task.id)
+    if (batchId) batchTaskIds.add(task.id)
+    if (isCloudMode()) {
+      executeCloudTask(task)
+    } else {
+      await putTask(task)
+      executeTask(task.id)
+    }
+    return task.id
   }
 
-  const latestTasks = useStore.getState().tasks
-  useStore.getState().setTasks([task, ...latestTasks])
-  useStore.getState().setTaskScrollTargetId(task.id)
-  if (isCloudMode()) {
-    executeCloudTask(task)
+  if (batchPrompts.length) {
+    useStore.getState().showToast(`已开始批量提交 ${batchPrompts.length} 条提示词`, 'success')
   } else {
-    await putTask(task)
-    executeTask(taskId)
+    await startTask(prompt.trim())
+    useStore.getState().showToast('任务已提交', 'success')
   }
-  useStore.getState().showToast('任务已提交', 'success')
 
   if (settings.clearInputAfterSubmit) {
     useStore.getState().setPrompt('')
@@ -2428,6 +2493,82 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
   }
   useStore.getState().setReusedTaskApiProfile(null)
 
+  if (batchPrompts.length) {
+    const limit = normalizedSettings.batchPromptMode === 'queue'
+      ? 1
+      : normalizedSettings.batchPromptConcurrencyLimited ? normalizedSettings.batchPromptConcurrency : batchPrompts.length
+    await runBatchPrompts(batchId, batchPrompts, limit, startTask)
+  }
+}
+
+// 当前批量的标识，停止或结束时递增使旧批量失效；批量任务不单独弹出完成提示和失败详情
+let activeBatchId = 0
+const batchTaskIds = new Set<string>()
+
+function beginBatch(total: number) {
+  activeBatchId += 1
+  useStore.getState().setBatchProgress({ total, started: 0, finished: 0 })
+  return activeBatchId
+}
+
+function endBatch(batchId: number) {
+  if (!batchId || batchId !== activeBatchId) return
+  activeBatchId += 1
+  // 停止后仍在运行的任务恢复单独的完成提示和失败详情
+  batchTaskIds.clear()
+  useStore.getState().setBatchProgress(null)
+}
+
+/** 等待任务结束（完成、失败或被删除）或批量被停止；断线待恢复的任务也视为结束，避免卡住队列 */
+function waitForTaskSettled(taskId: string, isCancelled: () => boolean) {
+  const isSettled = (tasks: TaskRecord[]) => isCancelled() || tasks.find((item) => item.id === taskId)?.status !== 'running'
+  return new Promise<void>((resolve) => {
+    if (isSettled(useStore.getState().tasks)) {
+      resolve()
+      return
+    }
+    const unsubscribe = useStore.subscribe((state) => {
+      if (!isSettled(state.tasks)) return
+      unsubscribe()
+      resolve()
+    })
+  })
+}
+
+async function runBatchPrompts(batchId: number, prompts: string[], limit: number, startTask: (taskPrompt: string) => Promise<string>) {
+  const isStopped = () => batchId !== activeBatchId
+  const total = prompts.length
+  let started = 0
+  let finished = 0
+  let failed = 0
+  await runWithConcurrency(prompts, limit, async (taskPrompt) => {
+    started += 1
+    useStore.getState().setBatchProgress({ total, started, finished })
+    try {
+      const taskId = await startTask(taskPrompt)
+      await waitForTaskSettled(taskId, isStopped)
+      if (useStore.getState().tasks.find((item) => item.id === taskId)?.status === 'error') failed += 1
+    } catch (err) {
+      failed += 1
+      console.error('批量提交任务失败', err)
+    }
+    finished += 1
+    if (!isStopped()) useStore.getState().setBatchProgress({ total, started, finished })
+  }, isStopped)
+  if (isStopped()) return
+
+  endBatch(batchId)
+  const message = failed > 0 ? `批量生成完成：成功 ${total - failed} 条，失败 ${failed} 条` : `批量生成完成，共 ${total} 条`
+  useStore.getState().showToast(message, failed > 0 ? 'error' : 'success')
+  showTaskCompletionNotification('批量生成完成', `${message}。`)
+}
+
+/** 停止批量提交：立即结束批量状态，不再启动剩余提示词，已开始的任务继续执行 */
+export function stopBatchPrompts() {
+  const progress = useStore.getState().batchProgress
+  if (!progress) return
+  endBatch(activeBatchId)
+  useStore.getState().showToast(`已停止批量提交，共提交 ${progress.started} / ${progress.total} 条，已开始的任务会继续完成`, 'info')
 }
 
 function getActiveAgentConversation(): AgentConversation {
@@ -2508,7 +2649,7 @@ function markAgentRoundTasksStopped(conversationId: string, roundId: string, now
       ...createTaskErrorPatch(task, AGENT_STOPPED_MESSAGE, now),
       falRecoverable: false,
       customRecoverable: false,
-      elapsed: Math.max(0, now - task.createdAt),
+      elapsed: Math.max(0, now - (task.startedAt ?? task.createdAt)),
     })
   }
   return runningTasks.length > 0
@@ -2536,7 +2677,7 @@ function markAgentRoundTasksFailed(
       ...(rawResponsePayload ? { rawResponsePayload } : {}),
       falRecoverable: false,
       customRecoverable: false,
-      elapsed: Math.max(0, now - task.createdAt),
+      elapsed: Math.max(0, now - (task.startedAt ?? task.createdAt)),
     })
   }
   return runningTasks.length > 0
@@ -2626,7 +2767,7 @@ async function generateAgentConversationTitle(
 
     updateAgentConversation(conversationId, (current) => {
       const firstRound = current.rounds[0]
-      if (!firstRound || firstRound.prompt !== prompt || current.title !== fallbackTitle) return current
+      if (!firstRound || stripImageMentionMarkers(firstRound.prompt) !== prompt || current.title !== fallbackTitle) return current
       return { ...current, title, updatedAt: Date.now() }
     })
   } catch {
@@ -2760,13 +2901,13 @@ async function deleteUnreferencedImageIds(imageIds: Iterable<string>) {
   }
 }
 
-async function persistTaskStreamPartialImage(taskId: string, dataUrl: string) {
+async function persistTaskStreamPartialImage(taskId: string, dataUrl: string, execution?: symbol) {
   try {
     const imgId = await storeImage(dataUrl, 'generated')
     cacheImage(imgId, dataUrl)
 
     const latestTask = useStore.getState().tasks.find((task) => task.id === taskId)
-    if (!latestTask || latestTask.status === 'done') {
+    if (!latestTask || latestTask.status === 'done' || (execution && taskExecutions.get(taskId) !== execution)) {
       await deleteUnreferencedImageIds([imgId])
       return
     }
@@ -2985,6 +3126,10 @@ async function continueRecoveredAgentRound(taskId: string) {
 export async function submitAgentMessage() {
   const state = useStore.getState()
   const { settings, prompt, inputImages, maskDraft, params, platformSettings, showToast } = state
+  if (state.batchProgress) {
+    showToast('画廊批量任务进行中，请等待完成或回到画廊停止后再提交', 'error')
+    return
+  }
   const normalizedSettings = normalizeSettings(settings)
 
   const agentValidationError = getAgentProfileValidationError(normalizedSettings)
@@ -3096,7 +3241,7 @@ export async function submitAgentMessage() {
 
   let fallbackTitle: string | null = null
   updateAgentConversation(conversation.id, (current) => {
-    const nextTitle = current.rounds.length === 0 ? createAgentConversationTitle(trimmedPrompt, current.title) : current.title
+    const nextTitle = current.rounds.length === 0 ? createAgentConversationTitle(stripImageMentionMarkers(trimmedPrompt), current.title) : current.title
     if (current.rounds.length === 0) fallbackTitle = nextTitle
     const messages = shouldAppendToEditingRound
       ? current.messages.some((message) => message.id === userMessageId)
@@ -3128,7 +3273,7 @@ export async function submitAgentMessage() {
   state.setAgentEditingRoundId(null)
 
   if (fallbackTitle) {
-    void generateAgentConversationTitle(conversation.id, trimmedPrompt, inputImageIds, requestSettings, activeProfile, fallbackTitle)
+    void generateAgentConversationTitle(conversation.id, stripImageMentionMarkers(trimmedPrompt), inputImageIds, requestSettings, activeProfile, fallbackTitle)
   }
 
   void executeAgentRound(conversation.id, roundId, normalizedParams, requestSettings, activeProfile, imageProfile)
@@ -4325,10 +4470,10 @@ function subscribeToCloudTask(task: TaskRecord, options: { notifyDone?: boolean;
       if (event.task.status !== 'running') useStore.getState().setTaskStreamPreview(task.id)
       const completedNow = previousTask?.status === 'running' && event.task.status === 'done'
       const failedNow = previousTask?.status === 'running' && event.task.status === 'error'
-      if ((event.type === 'done' || completedNow) && options.notifyDone) {
+      if ((event.type === 'done' || completedNow) && options.notifyDone && !batchTaskIds.has(task.id)) {
         useStore.getState().showToast(`生成完成，共 ${event.task.outputImages.length} 张图片`, 'success')
       }
-      if ((event.type === 'error' || failedNow) && options.revealError) {
+      if ((event.type === 'error' || failedNow) && options.revealError && !batchTaskIds.has(task.id)) {
         useStore.getState().setDetailTaskId(task.id)
       }
     },
@@ -4357,32 +4502,44 @@ function resumeCloudRunningTasks(tasks: TaskRecord[]) {
   }
 }
 
-function executeCloudTask(task: TaskRecord) {
+function executeCloudTask(task: TaskRecord, previousTask?: TaskRecord) {
   const handleTaskCreateError = (error: Error) => {
+    console.warn('提交云端任务失败', error)
     const latest = useStore.getState().tasks.find((item) => item.id === task.id) ?? task
     if (latest.status !== 'running') return
+    if (previousTask) {
+      applyRemoteTaskUpdate(previousTask)
+      useStore.getState().showToast(`重试失败：${error.message}`, 'error')
+      return
+    }
     applyRemoteTaskUpdate({
       ...latest,
       status: 'error',
       error: error.message,
       finishedAt: Date.now(),
-      elapsed: Date.now() - latest.createdAt,
+      elapsed: Date.now() - (latest.startedAt ?? latest.createdAt),
     })
-    useStore.getState().setDetailTaskId(task.id)
+    if (!batchTaskIds.has(task.id)) useStore.getState().setDetailTaskId(task.id)
   }
 
-  void createCloudTask(task)
+  return createCloudTask(task)
     .then((createdTask) => {
       applyRemoteTaskUpdate(createdTask)
       subscribeToCloudTask(createdTask, { notifyDone: true, revealError: true })
+      return true
     })
-    .catch(handleTaskCreateError)
+    .catch((error: Error) => {
+      handleTaskCreateError(error)
+      return false
+    })
 }
 
 async function executeTask(taskId: string) {
   const { settings } = useStore.getState()
   const task = useStore.getState().tasks.find((t) => t.id === taskId)
   if (!task) return
+  const execution = Symbol(taskId)
+  taskExecutions.set(taskId, execution)
   const taskProfile = getTaskApiProfile(settings, task)
   if (!taskProfile && task.apiProfileId) {
     updateTaskInStore(taskId, {
@@ -4390,6 +4547,7 @@ async function executeTask(taskId: string) {
       falRecoverable: false,
       customRecoverable: false,
     })
+    taskExecutions.delete(taskId)
     return
   }
   const activeProfile = taskProfile ?? getActiveApiProfile(settings)
@@ -4437,6 +4595,7 @@ async function executeTask(taskId: string) {
       maskDataUrl,
       skipCodexCliSizePrompt: task.sourceMode === 'agent',
       onFalRequestEnqueued: (request) => {
+        if (taskExecutions.get(taskId) !== execution) return
         falRequestInfo = request
         updateTaskInStore(taskId, {
           falRequestId: request.requestId,
@@ -4445,6 +4604,7 @@ async function executeTask(taskId: string) {
         })
       },
       onCustomTaskEnqueued: (request) => {
+        if (taskExecutions.get(taskId) !== execution) return
         customTaskInfo = request
         updateTaskInStore(taskId, {
           customTaskId: request.taskId,
@@ -4452,12 +4612,14 @@ async function executeTask(taskId: string) {
         })
       },
       onPartialImage: (partial) => {
+        if (taskExecutions.get(taskId) !== execution) return
         useStore.getState().setTaskStreamPreview(taskId, partial.image, partial.requestIndex)
-        void persistTaskStreamPartialImage(taskId, partial.image)
+        void persistTaskStreamPartialImage(taskId, partial.image, execution)
       },
     })
 
     const latestBeforeSuccess = useStore.getState().tasks.find((t) => t.id === taskId)
+    if (taskExecutions.get(taskId) !== execution) return
     if (!latestBeforeSuccess || latestBeforeSuccess.status !== 'running') {
       useStore.getState().setTaskStreamPreview(taskId)
       return
@@ -4482,7 +4644,7 @@ async function executeTask(taskId: string) {
       (revisedPrompt) => revisedPrompt?.trim() && revisedPrompt.trim() !== requestPrompt.trim(),
     )
     const hasRevisedPromptValue = shouldStoreRevisedPrompts && revisedPrompts?.some((revisedPrompt) => revisedPrompt?.trim())
-    if (taskProvider === 'openai' && activeProfile.apiMode === 'responses' && !activeProfile.codexCli) {
+    if (taskExecutions.get(taskId) === execution && taskProvider === 'openai' && activeProfile.apiMode === 'responses' && !activeProfile.codexCli) {
       if (promptWasRevised) {
         showCodexCliPrompt()
       } else if (!hasRevisedPromptValue) {
@@ -4492,8 +4654,8 @@ async function executeTask(taskId: string) {
 
     // 更新任务
     const latestBeforeUpdate = useStore.getState().tasks.find((t) => t.id === taskId)
-    if (!latestBeforeUpdate || latestBeforeUpdate.status !== 'running') {
-      useStore.getState().setTaskStreamPreview(taskId)
+    if (taskExecutions.get(taskId) !== execution || !latestBeforeUpdate || latestBeforeUpdate.status !== 'running') {
+      if (taskExecutions.get(taskId) === execution) useStore.getState().setTaskStreamPreview(taskId)
       await deleteUnreferencedImageIds([...outputIds, ...(transparentOriginalImageIds ?? [])])
       return
     }
@@ -4519,8 +4681,11 @@ async function executeTask(taskId: string) {
     const completionMessage = failedCount > 0
       ? `生成完成：成功 ${outputIds.length} 张，失败 ${failedCount} 张`
       : `生成完成，共 ${outputIds.length} 张图片`
-    useStore.getState().showToast(completionMessage, failedCount > 0 ? 'error' : 'success')
-    if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `${completionMessage}。`)
+    // 批量任务只在整批结束时统一提示
+    if (!batchTaskIds.has(taskId)) {
+      useStore.getState().showToast(completionMessage, failedCount > 0 ? 'error' : 'success')
+      if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `${completionMessage}。`)
+    }
     const currentMask = useStore.getState().maskDraft
     if (
       maskDataUrl &&
@@ -4531,6 +4696,7 @@ async function executeTask(taskId: string) {
       useStore.getState().clearMaskDraft()
     }
   } catch (err) {
+    if (taskExecutions.get(taskId) !== execution) return
     clearOpenAIWatchdogTimer(taskId)
     const latestTask = useStore.getState().tasks.find((t) => t.id === taskId)
     if (!latestTask || latestTask.status !== 'running') return
@@ -4566,7 +4732,7 @@ async function executeTask(taskId: string) {
         streamImages: activeProfile.streamImages,
         streamPartialImages: activeProfile.streamPartialImages,
       }
-      const networkErrorHint = getApiRequestNetworkErrorHint(err, latestTask.createdAt, usesApiProxy, hintProfile)
+      const networkErrorHint = getApiRequestNetworkErrorHint(err, latestTask.startedAt ?? latestTask.createdAt, usesApiProxy, hintProfile)
       if (networkErrorHint && !errorMessage.includes(IMAGE_FETCH_CORS_HINT)) {
         errorMessage += `\n${networkErrorHint}`
       }
@@ -4576,12 +4742,14 @@ async function executeTask(taskId: string) {
         falRecoverable: false,
         customRecoverable: false,
       })
-      useStore.getState().setDetailTaskId(taskId)
+      // 批量任务不自动打开失败详情，避免连续弹窗打断
+      if (!batchTaskIds.has(taskId)) useStore.getState().setDetailTaskId(taskId)
     }
   } finally {
+    if (taskExecutions.get(taskId) === execution) taskExecutions.delete(taskId)
     // 释放输入图片的内存缓存（已持久化到 IndexedDB，后续按需从 DB 加载）
-    for (const imgId of task.inputImageIds) {
-      deleteCachedImage(imgId)
+    if (!taskExecutions.has(taskId)) {
+      for (const imgId of task.inputImageIds) deleteCachedImage(imgId)
     }
   }
 }
@@ -4686,50 +4854,90 @@ export async function deleteFavoriteCollection(collectionId: string, deleteTasks
   useStore.getState().showToast(`已删除收藏夹「${collection.name}」`, 'success')
 }
 
-/** 重试失败的任务：创建新任务并执行 */
+/** 按重试方式新建任务或覆盖原任务；Agent 对话中的任务始终新建 */
 export async function retryTask(task: TaskRecord) {
-  const { settings } = useStore.getState()
+  const { settings, tasks } = useStore.getState()
+  const source = tasks.find((item) => item.id === task.id)
+  if (!source || source.status === 'running' || source.falRecoverable || source.customRecoverable) return
   const activeProfile = getActiveApiProfile(settings)
-  const normalizedParams = normalizeParamsForSettings(task.params, settings, { hasInputImages: task.inputImageIds.length > 0 })
+  const normalizedParams = normalizeParamsForSettings(source.params, settings, { hasInputImages: source.inputImageIds.length > 0 })
   const shouldUseTransparentOutput = (normalizedParams.output_format === 'png' || normalizedParams.output_format === 'webp') && normalizedParams.transparent_output
   const taskParams = shouldUseTransparentOutput
     ? getTransparentRequestParams(normalizedParams)
     : { ...normalizedParams, transparent_output: false }
-  const styledPrompt = applyPromptStylePreset(task.prompt.trim(), task.promptStylePresetId)
+  const styledPrompt = applyPromptStylePreset(source.prompt.trim(), source.promptStylePresetId)
   const transparentMeta = taskParams.transparent_output && activeProfile.transparentBackgroundMethod === 'local'
     ? createTransparentOutputMeta(styledPrompt)
     : null
-  const taskId = genId()
+  const overwrite = !isAgentTask(source) && (
+    settings.retryMode === 'overwriteAll' || (settings.retryMode === 'overwriteFailed' && source.status === 'error')
+  )
+  const taskId = overwrite ? source.id : genId()
+  const startedAt = Date.now()
   const newTask: TaskRecord = {
+    ...(overwrite ? source : {}),
     id: taskId,
-    prompt: task.prompt,
-    promptStylePresetId: normalizePromptStylePresetId(task.promptStylePresetId),
+    prompt: source.prompt,
+    promptStylePresetId: normalizePromptStylePresetId(source.promptStylePresetId),
     params: taskParams,
     apiProvider: activeProfile.provider,
     apiProfileId: activeProfile.id,
     apiProfileName: activeProfile.name,
     apiMode: activeProfile.apiMode,
     apiModel: activeProfile.model,
-    inputImageIds: [...task.inputImageIds],
-    maskTargetImageId: task.maskTargetImageId ?? null,
-    maskImageId: task.maskImageId ?? null,
+    inputImageIds: [...source.inputImageIds],
+    maskTargetImageId: source.maskTargetImageId ?? null,
+    maskImageId: source.maskImageId ?? null,
     transparentOutput: transparentMeta?.transparentOutput,
     transparentPrompt: transparentMeta?.effectivePrompt,
     outputImages: [],
+    outputErrors: undefined,
+    transparentOriginalImages: undefined,
+    actualParams: undefined,
+    actualParamsByImage: undefined,
+    revisedPromptByImage: undefined,
+    rawImageUrls: undefined,
+    rawResponsePayload: undefined,
+    streamPartialImageIds: undefined,
+    falRequestId: undefined,
+    falEndpoint: undefined,
+    falRecoverable: false,
+    customTaskId: undefined,
+    customRecoverable: false,
     status: 'running',
     error: null,
-    createdAt: Date.now(),
+    createdAt: overwrite ? source.createdAt : startedAt,
+    startedAt,
     finishedAt: null,
     elapsed: null,
   }
 
-  const latestTasks = useStore.getState().tasks
-  useStore.getState().setTasks([newTask, ...latestTasks])
+  if (overwrite) {
+    taskExecutions.delete(taskId)
+    // 覆盖后不再属于原批量，完成时应正常提示
+    batchTaskIds.delete(taskId)
+    clearOpenAIWatchdogTimer(taskId)
+    clearFalRecoveryTimer(taskId)
+    clearCustomRecoveryTimer(taskId)
+    useStore.getState().setTaskStreamPreview(taskId)
+  }
+  useStore.getState().setTasks(overwrite
+    ? tasks.map((item) => item.id === taskId ? newTask : item)
+    : [newTask, ...tasks])
   if (isCloudMode()) {
-    executeCloudTask(newTask)
+    stopCloudTaskSubscription(taskId)
+    const accepted = await executeCloudTask(newTask, overwrite ? source : undefined)
+    if (!accepted) return
   } else {
     await putTask(newTask)
     executeTask(taskId)
+  }
+  if (overwrite) {
+    void deleteUnreferencedImageIds([
+      ...source.outputImages,
+      ...(source.transparentOriginalImages ?? []),
+      ...(source.streamPartialImageIds ?? []),
+    ])
   }
 }
 
@@ -4743,13 +4951,22 @@ export async function reuseConfig(task: TaskRecord) {
   const shouldTemporarilyReuseProfile = Boolean(matchedProfile && matchedProfile.id !== currentProfile.id)
   const missingReusedProfile = normalizedSettings.reuseTaskApiProfileTemporarily && !matchedProfile
   const taskProfileName = matchedProfile?.name ?? getTaskApiProfileName(task)
-  const paramsSettings = shouldTemporarilyReuseProfile && matchedProfile ? createSettingsForApiProfile(normalizedSettings, matchedProfile) : normalizedSettings
+  // 复用当前配置时，任务所用模型仍在模型列表中则同步切换首页选中的模型；临时复用其他配置时模型只随复用状态生效
+  const currentProfileRecord = normalizedSettings.profiles.find((item) => item.id === currentProfile.id)
+  if (!shouldTemporarilyReuseProfile && task.apiModel && currentProfileRecord && currentProfileRecord.selectedModel !== task.apiModel && splitModelList(currentProfileRecord.model).includes(task.apiModel)) {
+    useStore.getState().setSettings({
+      profiles: normalizedSettings.profiles.map((item) => item.id === currentProfile.id ? { ...item, selectedModel: task.apiModel } : item),
+    })
+  }
+  const reuseSettings = normalizeSettings(useStore.getState().settings)
+  const paramsSettings = shouldTemporarilyReuseProfile && matchedProfile ? createSettingsForApiProfile(reuseSettings, matchedProfile) : reuseSettings
 
   setParams(normalizeParamsForSettings(task.params, paramsSettings, { hasInputImages: task.inputImageIds.length > 0 }))
   setReusedTaskApiProfile(
     shouldTemporarilyReuseProfile && matchedProfile ? matchedProfile.id : null,
     missingReusedProfile,
     taskProfileName,
+    shouldTemporarilyReuseProfile && matchedProfile ? matchedProfile.model : null,
   )
   clearMaskDraft()
 
@@ -4762,7 +4979,8 @@ export async function reuseConfig(task: TaskRecord) {
     }
   }
   setInputImages(imgs)
-  setPrompt(task.prompt)
+  // 部分参考图可能已被删除，按图片 id 重新对齐提示词中的图片序号，避免评论和提及错位到其他图片
+  setPrompt(remapImageMentionsForOrder(task.prompt, task.inputImageIds.map((id) => ({ id, dataUrl: '' })), useStore.getState().inputImages))
   setPromptStylePresetId(normalizePromptStylePresetId(task.promptStylePresetId))
   const maskTargetImageId = task.maskTargetImageId ?? (task.maskImageId ? task.inputImageIds[0] : null)
   if (maskTargetImageId && task.maskImageId && imgs.some((img) => img.id === maskTargetImageId)) {
@@ -4997,6 +5215,7 @@ async function removeTasks(taskIds: string[], updateState?: TaskDeletionStateUpd
     clearFalRecoveryTimer(task.id)
     clearCustomRecoveryTimer(task.id)
     clearOpenAIWatchdogTimer(task.id)
+    taskExecutions.delete(task.id)
   }
 
   const cleanup = scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
@@ -5073,6 +5292,8 @@ export interface ClearOptions {
 /** 清空数据 */
 export async function clearData(options: ClearOptions = { clearConfig: true, clearTasks: true }) {
   const { setTasks, clearInputImages, clearMaskDraft, setSettings, setParams, showToast } = useStore.getState()
+  // 清空后剩余的批量提示词已没有对应的任务、配置或图片，直接结束批量
+  if (useStore.getState().batchProgress) endBatch(activeBatchId)
 
   if (isCloudMode() && (options.clearConfig || options.clearTasks)) {
     try {
@@ -5358,7 +5579,8 @@ export async function importData(input: File | File[], options: ImportOptions = 
       }
 
       for (const task of importedTasks) {
-        await putTask(task)
+        // startedAt 来自导入文件，非法值会让计时和“重试于”显示异常
+        await putTask(Number.isFinite(task.startedAt) || task.startedAt === undefined ? task : { ...task, startedAt: undefined })
       }
 
       const tasks = await getAllTasks()

@@ -27,7 +27,7 @@ function normalizePlatformTaskParams(input: unknown): TaskParams {
 
   return {
     size: typeof record.size === 'string' ? normalizeImageSize(record.size) || DEFAULT_PARAMS.size : DEFAULT_PARAMS.size,
-    quality: record.quality === 'low' || record.quality === 'medium' || record.quality === 'high' || record.quality === 'auto'
+    quality: record.quality === 'low' || record.quality === 'medium' || record.quality === 'high' || record.quality === 'auto' || record.quality === 'xhigh' || record.quality === 'max'
       ? record.quality
       : DEFAULT_PARAMS.quality,
     output_format: outputFormat,
@@ -127,7 +127,10 @@ export function applyPlatformSettingsToAppSettings(settings: AppSettings, platfo
       ...next,
       customProviders: platformApiSettings.customProviders,
       providerOrder: platformApiSettings.providerOrder,
-      profiles: platformApiSettings.profiles,
+      profiles: platformApiSettings.profiles.map((profile) => ({
+        ...profile,
+        selectedModel: next.profiles.find((item) => item.id === profile.id)?.selectedModel ?? profile.selectedModel,
+      })),
       activeProfileId,
     })
   }

@@ -4,6 +4,7 @@ import { createServer } from 'node:http'
 import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_PARAMS, type AgentConversation, type PlatformSettings, type TaskRecord } from '../src/types'
 import { createDefaultOpenAIProfile, DEFAULT_SETTINGS, normalizeSettings } from '../src/lib/apiProfiles'
+import { getImageCommentMention } from '../src/lib/promptImageMentions'
 import { hashToken } from './crypto'
 import type { Db } from './db'
 import { registerCloudRoutes } from './routes'
@@ -564,6 +565,11 @@ function createMemoryDb() {
         if (row) rows.push({ storage_key: row.storage_key })
       }
       return { rows }
+    }
+    if (sql.startsWith('SELECT id FROM images WHERE user_id = $1 AND id = ANY')) {
+      const userId = params[0] as string
+      const ids = [...new Set(params[1] as string[])]
+      return { rows: ids.filter((id) => images.has(rowKey(userId, id))).map((id) => ({ id })) }
     }
     if (sql.startsWith('SELECT storage_key, mime_type FROM images')) {
       const row = images.get(rowKey(params[0] as string, params[1] as string))
@@ -1834,5 +1840,92 @@ describe('云端多用户隔离', () => {
 
     expect(response.statusCode).toBe(400)
     expect(response.json().message || response.json().error).toContain('任务数量配额')
+  })
+
+  it.each([
+    ['model-b', 'model-b'],
+    ['unlisted-model', 'model-a'],
+  ])('云端覆盖重试保留收藏、使用本次计时，并校验模型 %s', async (apiModel, expectedModel) => {
+    imageApiMocks.callImageApi.mockReset()
+    let finish: (() => void) | undefined
+    imageApiMocks.callImageApi.mockImplementation(() => new Promise((resolve) => {
+      finish = () => resolve({ images: [], actualParams: {} })
+    }))
+    const { app, users, tasks, settings } = await createTestApp()
+    const saved = settings.get(USER_A.id)!
+    const profile = { ...saved.settings.profiles[0], model: 'model-a,model-b' }
+    settings.set(USER_A.id, {
+      ...saved,
+      settings: normalizeSettings({ ...saved.settings, model: profile.model, profiles: [profile] }),
+    })
+    const original: TaskRecord = {
+      id: 'task-retry-cloud',
+      prompt: '修改参考图',
+      promptStylePresetId: 'poster',
+      params: DEFAULT_PARAMS,
+      inputImageIds: ['image-owned'],
+      outputImages: [],
+      status: 'error',
+      error: '上次请求失败',
+      createdAt: 1,
+      finishedAt: 2,
+      elapsed: 1,
+      isFavorite: true,
+      favoriteCollectionIds: ['collection-a'],
+    }
+    const key = rowKey(USER_A.id, original.id)
+    tasks.set(key, original)
+    users.get(USER_A.id)!.task_quota_count = 2
+    const payload = {
+      ...original,
+      apiProfileId: profile.id,
+      apiModel,
+      prompt: `${original.prompt} ${getImageCommentMention(0, [{ x: 0.5, y: 0.25, text: '把这里改成红色' }])}`,
+      status: 'running' as const,
+      error: null,
+      isFavorite: false,
+      favoriteCollectionIds: [],
+    }
+    try {
+      const response = await app.inject({ method: 'POST', url: '/api/tasks', headers: { cookie: 'gip_session=token-a' }, payload })
+
+      expect(response.statusCode, response.body).toBe(200)
+      expect(response.json().task).toMatchObject({ createdAt: 1, startedAt: expect.any(Number), isFavorite: true, favoriteCollectionIds: ['collection-a'] })
+      await vi.waitFor(() => expect(imageApiMocks.callImageApi).toHaveBeenCalledOnce())
+      const request = imageApiMocks.callImageApi.mock.calls[0][0]
+      expect(request.settings.model).toBe(expectedModel)
+      expect(request.prompt).toContain('[image 1] notes:\n1. (X=50%, Y=25%) 把这里改成红色')
+      expect(request.prompt).toContain('Style preset:')
+      expect(request.prompt).not.toMatch(/[\u2063-\u2065]/)
+      expect(request.inputImageDataUrls).toHaveLength(1)
+
+      const duplicate = await app.inject({ method: 'POST', url: '/api/tasks', headers: { cookie: 'gip_session=token-a' }, payload })
+      expect(duplicate.statusCode).toBe(409)
+      expect(imageApiMocks.callImageApi).toHaveBeenCalledOnce()
+      finish!()
+      await vi.waitFor(() => expect(tasks.get(key)?.status).toBe('done'))
+      const done = tasks.get(key)!
+      expect(done.elapsed).toBe(done.finishedAt! - done.startedAt!)
+      expect(done.createdAt).toBe(1)
+      expect([...tasks.keys()].filter((key) => key.startsWith(USER_A.id))).toHaveLength(2)
+    } finally {
+      finish?.()
+      await app.close()
+    }
+  })
+
+  it('云端拒绝覆盖 Agent 任务，保留对话关联', async () => {
+    const { app, tasks } = await createTestApp()
+    const original = tasks.get(rowKey(USER_A.id, 'task-owned'))!
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/tasks',
+      headers: { cookie: 'gip_session=token-a' },
+      payload: { ...original, status: 'running', outputImages: [] },
+    })
+    await app.close()
+
+    expect(response.statusCode).toBe(400)
+    expect(tasks.get(rowKey(USER_A.id, original.id))).toEqual(original)
   })
 })

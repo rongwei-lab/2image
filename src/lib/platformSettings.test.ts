@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_SETTINGS, normalizeSettings } from './apiProfiles'
+import { DEFAULT_SETTINGS, getActiveApiProfile, normalizeSettings } from './apiProfiles'
 import { applyPlatformSettingsToAppSettings, normalizePlatformSettings } from './platformSettings'
 import { DEFAULT_PARAMS } from '../types'
 
@@ -8,6 +8,32 @@ describe('platform settings', () => {
     const platform = normalizePlatformSettings({})
 
     expect(platform.download.zipDownloadRoutes).toEqual(DEFAULT_SETTINGS.zipDownloadRoutes)
+  })
+
+  it.each(['xhigh', 'max'] as const)('保留平台配置的 %s 质量档位', (quality) => {
+    const platform = normalizePlatformSettings({ params: { defaults: { ...DEFAULT_PARAMS, quality } } })
+
+    expect(platform.params.defaults.quality).toBe(quality)
+  })
+
+  it.each([
+    ['model-b', 'model-b'],
+    ['unlisted-model', 'model-a'],
+  ])('托管配置保留模型选择 %s，并限制在后台模型列表中', (selectedModel, expectedModel) => {
+    const profile = { ...DEFAULT_SETTINGS.profiles[0], model: 'model-a,model-b', baseUrl: 'https://platform.example/v1' }
+    const platform = normalizePlatformSettings({
+      api: { managed: true, settings: { ...DEFAULT_SETTINGS, profiles: [profile], activeProfileId: profile.id } },
+    })
+    const localSettings = normalizeSettings({
+      ...DEFAULT_SETTINGS,
+      profiles: [{ ...profile, baseUrl: 'https://personal.example/v1', selectedModel }],
+      activeProfileId: profile.id,
+    })
+
+    const applied = applyPlatformSettingsToAppSettings(localSettings, platform)
+
+    expect(getActiveApiProfile(applied)).toMatchObject({ model: expectedModel, baseUrl: profile.baseUrl })
+    expect(applied.profiles[0].model).toBe('model-a, model-b')
   })
 
   it('保留 PNG 和 WebP 的透明背景参数，关闭 JPEG 透明背景', () => {

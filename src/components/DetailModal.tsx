@@ -11,12 +11,13 @@ import { createMaskPreviewDataUrl } from '../lib/canvasImage'
 import { dismissAllTooltips } from '../lib/tooltipDismiss'
 import { downloadImageEntriesAsZip, downloadImageIds, getImageZipEntries } from '../lib/downloadImages'
 import { isAgentTaskPromptPending } from '../lib/taskPromptDisplay'
-import { replaceImageMentionsForApi } from '../lib/promptImageMentions'
+import { getImageComments, getTaskPromptText, replaceImageMentionsForApi } from '../lib/promptImageMentions'
 import { applyPromptStylePreset } from '../lib/promptStyles'
 import { getApiProviderLabel } from '../lib/apiProfiles'
 import { CloseIcon, CodeIcon, CopyIcon, DownloadIcon, EditIcon, LinkIcon, TrashIcon } from './icons'
 
 import ViewportTooltip from './ViewportTooltip'
+import { CommentBadge } from './CommentMarks'
 
 export default function DetailModal() {
   const tasks = useStore((s) => s.tasks)
@@ -53,6 +54,7 @@ export default function DetailModal() {
   const viewRawResponseTooltip = useTooltip()
   const downloadPartialImagesTooltip = useTooltip()
   const retryTooltip = useTooltip()
+  const retriedAtTooltip = useTooltip()
   const downloadImageTooltip = useTooltip()
   const downloadOriginalImageTooltip = useTooltip()
   const downloadAllTooltip = useTooltip()
@@ -281,7 +283,7 @@ export default function DetailModal() {
 
   const formatDuration = () => {
     if (task.status === 'running' || isFalReconnecting || isCustomReconnecting) {
-      const seconds = Math.max(0, Math.floor((now - task.createdAt) / 1000))
+      const seconds = Math.max(0, Math.floor((now - (task.startedAt ?? task.createdAt)) / 1000))
       const mm = String(Math.floor(seconds / 60)).padStart(2, '0')
       const ss = String(seconds % 60).padStart(2, '0')
       return `${mm}:${ss}`
@@ -329,7 +331,7 @@ export default function DetailModal() {
   const handleCopyPrompt = async () => {
     if (!task.prompt) return
     try {
-      await copyTextToClipboard(task.prompt)
+      await copyTextToClipboard(getTaskPromptText(task.prompt, task.inputImageIds.length))
       showToast('提示词已复制', 'success')
     } catch (err) {
       showToast(getClipboardFailureMessage('复制提示词失败', err), 'error')
@@ -737,7 +739,7 @@ export default function DetailModal() {
                       copyErrorTooltip.handlers.onClick()
                       handleCopyError()
                     }}
-                    className="inline-flex items-center justify-center rounded-full border border-red-200/80 bg-white/80 px-3 py-1.5 text-red-500 transition hover:bg-red-50 dark:border-red-400/20 dark:bg-white/[0.04] dark:hover:bg-red-500/10"
+                    className="inline-flex items-center justify-center rounded-full border border-red-200/80 bg-white/80 px-3 py-1.5 text-red-500 transition hover:bg-red-500/[0.1] dark:border-red-400/20 dark:bg-white/[0.04] dark:hover:bg-red-500/[0.16]"
                     aria-label="复制完整报错"
                   >
                     <CopyIcon className="h-4 w-4" />
@@ -813,25 +815,27 @@ export default function DetailModal() {
                     </ViewportTooltip>
                   </div>
                 )}
-                <div className="relative group">
-                  <button
-                    type="button"
-                    {...retryTooltip.handlers}
-                    onClick={() => {
-                      retryTooltip.handlers.onClick()
-                      handleRetry()
-                    }}
-                    className="inline-flex items-center justify-center rounded-full border border-blue-200/80 bg-white/80 px-3 py-1.5 text-blue-500 transition hover:bg-blue-50 dark:border-blue-400/20 dark:bg-white/[0.04] dark:hover:bg-blue-500/10"
-                    aria-label="重试任务"
-                  >
-                    <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                    </svg>
-                  </button>
-                  <ViewportTooltip visible={retryTooltip.visible} className="whitespace-nowrap">
-                    重试任务
-                  </ViewportTooltip>
-                </div>
+                {!isCustomReconnecting && (
+                  <div className="relative group">
+                    <button
+                      type="button"
+                      {...retryTooltip.handlers}
+                      onClick={() => {
+                        retryTooltip.handlers.onClick()
+                        handleRetry()
+                      }}
+                      className="inline-flex items-center justify-center rounded-full border border-blue-200/80 bg-white/80 px-3 py-1.5 text-blue-500 transition hover:bg-blue-50 dark:border-blue-400/20 dark:bg-white/[0.04] dark:hover:bg-blue-500/10"
+                      aria-label="重试任务"
+                    >
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                      </svg>
+                    </button>
+                    <ViewportTooltip visible={retryTooltip.visible} className="whitespace-nowrap">
+                      重试任务
+                    </ViewportTooltip>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -883,7 +887,7 @@ export default function DetailModal() {
               </div>
             ) : (
               <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed whitespace-pre-wrap mb-4">
-                {task.prompt || '(无提示词)'}
+                {getTaskPromptText(task.prompt, task.inputImageIds.length) || '(无提示词)'}
               </p>
             )}
             {showRevisedPrompt && currentRevisedPrompt && (
@@ -914,16 +918,17 @@ export default function DetailModal() {
                 </div>
                 {allInputImageIds.length > 0 && (
                   <div className="flex gap-2 flex-wrap">
-                    {allInputImageIds.map((imgId) => {
+                    {allInputImageIds.map((imgId, idx) => {
                       const isMaskTarget = imgId === maskTargetId
+                      const commentCount = getImageComments(task.prompt, idx).length
                       const displaySrc = (isMaskTarget && maskPreviewSrc) ? maskPreviewSrc : (imageSrcs[imgId] || '')
                       return (
                         <div key={imgId} className="relative group inline-block">
                           <div
                             className={`relative w-16 h-16 rounded-lg overflow-hidden border cursor-pointer hover:opacity-80 transition ${
-                              isMaskTarget ? 'border-blue-500 border-2 shadow-sm' : 'border-gray-200 dark:border-white/[0.08]'
+                              isMaskTarget || commentCount > 0 ? 'border-blue-500 border-2 shadow-sm' : 'border-gray-200 dark:border-white/[0.08]'
                             }`}
-                            onClick={() => setLightboxImageId(imgId, allInputImageIds)}
+                            onClick={() => setLightboxImageId(imgId, allInputImageIds, task.prompt)}
                           >
                             {displaySrc && (
                               <img
@@ -938,6 +943,7 @@ export default function DetailModal() {
                                 MASK
                               </span>
                             )}
+                            {commentCount > 0 && <CommentBadge count={commentCount} className={isMaskTarget ? 'left-1 top-[18px]' : 'left-1 top-1'} />}
                           </div>
                         </div>
                       )
@@ -1032,6 +1038,23 @@ export default function DetailModal() {
             {/* 时间 */}
             <div className="text-xs text-gray-400 dark:text-gray-500 mb-4">
               <span>创建于 {formatTime(task.createdAt)}</span>
+              {task.startedAt != null && task.startedAt > task.createdAt && (
+                <span className="relative ml-1 inline-flex align-middle">
+                  <button
+                    type="button"
+                    {...retriedAtTooltip.handlers}
+                    className="inline-flex text-gray-400 transition hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300"
+                    aria-label="查看重试时间"
+                  >
+                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </button>
+                  <ViewportTooltip visible={retriedAtTooltip.visible} className="whitespace-nowrap">
+                    重试于 {formatTime(task.startedAt)}
+                  </ViewportTooltip>
+                </span>
+              )}
               {formatDuration() && <span> · 耗时 {formatDuration()}</span>}
             </div>
           </div>
