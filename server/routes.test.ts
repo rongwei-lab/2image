@@ -728,6 +728,28 @@ async function createTestApp() {
 }
 
 describe('云端多用户隔离', () => {
+  it('参考图链接按用户保存，并过滤非 HTTP 链接', async () => {
+    const { app, settings } = await createTestApp()
+    const saved = settings.get(USER_A.id)!
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings',
+      headers: { cookie: 'gip_session=token-a' },
+      payload: {
+        settings: saved.settings,
+        params: saved.params,
+        imageSourceUrls: { 'image-owned': 'https://images.example.com/input.png', invalid: 'javascript:alert(1)', malformed: 123 },
+      },
+    })
+    const current = await app.inject({ method: 'GET', url: '/api/settings', headers: { cookie: 'gip_session=token-a' } })
+    const other = await app.inject({ method: 'GET', url: '/api/settings', headers: { cookie: 'gip_session=token-b' } })
+    await app.close()
+
+    expect(response.statusCode).toBe(200)
+    expect(current.json().imageSourceUrls).toEqual({ 'image-owned': 'https://images.example.com/input.png' })
+    expect(other.json().imageSourceUrls).toBeUndefined()
+  })
+
 	  it('只返回当前用户自己的 settings 工作台快照', async () => {
 	    const { app } = await createTestApp()
 	    const response = await app.inject({
@@ -1878,6 +1900,7 @@ describe('云端多用户隔离', () => {
     users.get(USER_A.id)!.task_quota_count = 2
     const payload = {
       ...original,
+      inputImageUrls: ['https://images.example.com/input.png'],
       apiProfileId: profile.id,
       apiModel,
       prompt: `${original.prompt} ${getImageCommentMention(0, [{ x: 0.5, y: 0.25, text: '把这里改成红色' }])}`,
@@ -1898,6 +1921,7 @@ describe('云端多用户隔离', () => {
       expect(request.prompt).toContain('Style preset:')
       expect(request.prompt).not.toMatch(/[\u2063-\u2065]/)
       expect(request.inputImageDataUrls).toHaveLength(1)
+      expect(request.inputImageUrls).toEqual(['https://images.example.com/input.png'])
 
       const duplicate = await app.inject({ method: 'POST', url: '/api/tasks', headers: { cookie: 'gip_session=token-a' }, payload })
       expect(duplicate.statusCode).toBe(409)

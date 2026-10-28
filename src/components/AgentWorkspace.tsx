@@ -6,10 +6,12 @@ import { ensureImageCached, getCachedImage } from '../lib/imageCache'
 import { getImageComments, getPromptMentionParts } from '../lib/promptImageMentions'
 import { replaceAgentPromptImageReferencesForApi } from '../lib/agentImageReferences'
 import { copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
+import { getPageScroller, getPageScrollTop } from '../lib/pageScroll'
 import type { AgentWebSearchStatus } from '../lib/agentWebSearch'
 import { getAgentAssistantBlocks, getAgentAssistantCopyContent, getRoundTaskSlots } from '../lib/agentAssistantBlocks'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
-import { downloadImageEntriesAsZip, downloadImageIds, getImageZipEntries } from '../lib/downloadImages'
+import { downloadImageEntriesAsZip, downloadImageIds, getDownloadErrorMessage, getImageZipEntries, withSaveLocation } from '../lib/downloadImages'
+import { useVisibleAgentConversations } from '../hooks/usePrivacyMode'
 import TaskCard from './TaskCard'
 import { CommentBadge } from './CommentMarks'
 import MarkdownRenderer from './MarkdownRenderer'
@@ -109,12 +111,8 @@ const MOBILE_HEADER_PULL_THRESHOLD = 24
 const MOBILE_HEADER_PULL_MAX_OFFSET = 48
 const MOBILE_HEADER_EDGE_GUARD = 24
 
-function getPageScrollTop() {
-  return window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0
-}
-
 export default function AgentWorkspace() {
-  const conversations = useStore((s) => s.agentConversations)
+  const conversations = useVisibleAgentConversations()
   const conversationsLoaded = useStore((s) => s.agentConversationsLoaded)
   const activeConversationId = useStore((s) => s.activeAgentConversationId)
   const createConversation = useStore((s) => s.createAgentConversation)
@@ -146,6 +144,7 @@ export default function AgentWorkspace() {
   const setActiveAgentRoundId = useStore((s) => s.setActiveAgentRoundId)
   const showToast = useStore((s) => s.showToast)
   const openFavoritePicker = useStore((s) => s.openFavoritePicker)
+  const privacyMode = useStore((s) => Boolean(s.privacyMode))
   const agentGeneratingTitleIds = useStore((s) => s.agentGeneratingTitleIds)
   const conversation = conversations.find((item) => item.id === activeConversationId) ?? null
   const [editingConversationTitle, setEditingConversationTitle] = useState('')
@@ -176,8 +175,8 @@ export default function AgentWorkspace() {
   }, [appMode])
 
   const scrollToAgentBottom = useCallback(() => {
-    const scrollingElement = document.scrollingElement ?? document.documentElement
-    window.scrollTo({ top: scrollingElement.scrollHeight, behavior: 'smooth' })
+    // 超出可滚动范围时浏览器会停在底部
+    getPageScroller().scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior: 'smooth' })
   }, [])
 
   const handleTouchStart = (e: React.TouchEvent) => {
@@ -260,18 +259,36 @@ export default function AgentWorkspace() {
     }
   }, [agentMobileHeaderVisible, appMode, setAgentMobileHeaderVisible])
 
+  // 鼠标没有下拉手势：页面已在顶部时继续向上滚动滚轮展示顶栏，向下滚动收起。
+  // 只认页面上的滚动：弹窗、大图和输入栏不在 [data-page-scroll] 里，窄屏的对话列表抽屉在里面，打开时不处理；Ctrl+滚轮与触控板捏合是缩放
+  useEffect(() => {
+    if (appMode !== 'agent' || !sidebarCollapsed) return
+
+    const handleWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || !(e.target instanceof Element) || !e.target.closest('[data-page-scroll]')) return
+      if (agentMobileHeaderVisible) {
+        if (e.deltaY > 0 && !e.target.closest('header[data-no-drag-select]')) setAgentMobileHeaderVisible(false)
+        return
+      }
+      if (e.deltaY < 0 && getPageScrollTop() <= 0) setAgentMobileHeaderVisible(true)
+    }
+
+    window.addEventListener('wheel', handleWheel, { passive: true })
+    return () => window.removeEventListener('wheel', handleWheel)
+  }, [agentMobileHeaderVisible, appMode, setAgentMobileHeaderVisible, sidebarCollapsed])
+
   useEffect(() => {
     if (appMode !== 'agent') return
 
     setMobileTopBarVisible(true)
-    let lastScrollY = window.scrollY
+    let lastScrollY = getPageScrollTop()
     let ticking = false
 
     const handleScroll = () => {
       if (ticking) return
 
       window.requestAnimationFrame(() => {
-        const currentScrollY = window.scrollY
+        const currentScrollY = getPageScrollTop()
         if (currentScrollY < 20) {
           setMobileTopBarVisible(true)
         } else if (currentScrollY > lastScrollY + 10) {
@@ -290,13 +307,14 @@ export default function AgentWorkspace() {
 
     const initialFrame = window.requestAnimationFrame(updateIsScrolledToBottom)
     const visualViewport = window.visualViewport
-    window.addEventListener('scroll', handleScroll, { passive: true })
+    const scroller = getPageScroller()
+    scroller.addEventListener('scroll', handleScroll, { passive: true })
     window.addEventListener('resize', updateIsScrolledToBottom)
     visualViewport?.addEventListener('resize', updateIsScrolledToBottom)
 
     return () => {
       window.cancelAnimationFrame(initialFrame)
-      window.removeEventListener('scroll', handleScroll)
+      scroller.removeEventListener('scroll', handleScroll)
       window.removeEventListener('resize', updateIsScrolledToBottom)
       visualViewport?.removeEventListener('resize', updateIsScrolledToBottom)
     }
@@ -967,32 +985,36 @@ export default function AgentWorkspace() {
                             }}>
                               <RefreshIcon className="w-4 h-4" />
                             </AgentActionButton>
-                            <AgentActionButton tooltip={allRoundTasksFavorited ? '编辑收藏夹' : '收藏所有图片'} className={`p-1.5 rounded-md transition-colors ${hasRoundFavoriteTasks ? (allRoundTasksFavorited ? 'text-yellow-500 hover:bg-yellow-50 dark:hover:bg-yellow-500/10' : 'text-gray-400 hover:text-yellow-500 hover:bg-yellow-50 dark:hover:bg-yellow-500/10') : 'text-gray-300 dark:text-gray-600 opacity-50 cursor-not-allowed'}`} disabled={!hasRoundFavoriteTasks} onClick={() => {
-                              if (!hasRoundFavoriteTasks) return;
-                              openFavoritePicker(favoriteTasksForRound.map((task) => task.id));
-                            }}>
-                              <FavoriteIcon className="w-4 h-4" filled={allRoundTasksFavorited} />
-                            </AgentActionButton>
+                            {!privacyMode && (
+                              <AgentActionButton tooltip={allRoundTasksFavorited ? '编辑收藏夹' : '收藏所有图片'} className={`p-1.5 rounded-md transition-colors ${hasRoundFavoriteTasks ? (allRoundTasksFavorited ? 'text-yellow-500 hover:bg-yellow-50 dark:hover:bg-yellow-500/10' : 'text-gray-400 hover:text-yellow-500 hover:bg-yellow-50 dark:hover:bg-yellow-500/10') : 'text-gray-300 dark:text-gray-600 opacity-50 cursor-not-allowed'}`} disabled={!hasRoundFavoriteTasks} onClick={() => {
+                                if (!hasRoundFavoriteTasks) return;
+                                openFavoritePicker(favoriteTasksForRound.map((task) => task.id));
+                              }}>
+                                <FavoriteIcon className="w-4 h-4" filled={allRoundTasksFavorited} />
+                              </AgentActionButton>
+                            )}
                             <AgentActionButton tooltip="下载所有图片" className={`p-1.5 rounded-md transition-colors ${hasRoundTasks ? 'text-gray-400 hover:text-green-500 hover:bg-green-50 dark:hover:bg-green-500/10' : 'text-gray-300 dark:text-gray-600 opacity-50 cursor-not-allowed'}`} disabled={!hasRoundTasks} onClick={async () => {
                                const imageIds = tasksForRound.flatMap(t => t.outputImages || []);
                                if (imageIds.length === 0) return;
                                try {
-                                 const roundIndex = round?.index ?? 0;
-                                 const fileNameBase = 'agent-round-' + roundIndex;
-                                 const settings = useStore.getState().settings;
-                                 const { successCount, failCount } = settings.zipDownloadRoutes.includes('agent-round-all')
-                                   ? await downloadImageEntriesAsZip(getImageZipEntries(imageIds, fileNameBase), fileNameBase)
-                                   : await downloadImageIds(imageIds, fileNameBase);
+                                  const roundIndex = round?.index ?? 0;
+                                  const fileNameBase = 'agent-round-' + roundIndex;
+                                  const settings = useStore.getState().settings;
+                                  const result = settings.zipDownloadRoutes.includes('agent-round-all')
+                                    ? await downloadImageEntriesAsZip(getImageZipEntries(imageIds, fileNameBase), fileNameBase)
+                                    : await downloadImageIds(imageIds, fileNameBase);
+                                 const { successCount, failCount, canceled } = result;
+                                 if (canceled) return;
                                  if (successCount === 0) {
-                                   useStore.getState().showToast('下载失败', 'error');
+                                   useStore.getState().showToast(getDownloadErrorMessage(result.error), 'error');
                                  } else if (failCount > 0) {
                                    useStore.getState().showToast('部分下载失败：成功 ' + successCount + '，失败 ' + failCount, 'error');
                                  } else {
-                                   useStore.getState().showToast(successCount > 1 ? '下载成功：' + successCount + ' 张图片' : '下载成功', 'success');
+                                   useStore.getState().showToast(withSaveLocation(successCount > 1 ? '下载成功：' + successCount + ' 张图片' : '下载成功', result.location), 'success');
                                  }
                                } catch (err) {
                                  console.error(err);
-                                 useStore.getState().showToast('下载失败', 'error');
+                                 useStore.getState().showToast(getDownloadErrorMessage(err), 'error');
                                }
                              }}>
                                <DownloadIcon className="w-4 h-4" />
@@ -1066,7 +1088,7 @@ export default function AgentWorkspace() {
 
         <button
           onClick={scrollToAgentBottom}
-          className={`fixed bottom-[calc(var(--input-bar-clearance,12rem)+1.5rem)] left-1/2 -translate-x-1/2 z-30 flex h-10 w-10 items-center justify-center rounded-full bg-white/90 backdrop-blur shadow-[0_2px_12px_rgba(0,0,0,0.1)] border border-gray-200/50 text-gray-500 transition-all duration-300 hover:bg-gray-50 hover:text-gray-800 dark:border-white/[0.08] dark:bg-gray-800/90 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-200 ${
+          className={`fixed bottom-[calc(var(--input-bar-clearance,12rem)+1.5rem)] left-[calc((100%-var(--page-scrollbar-width))/2)] -translate-x-1/2 z-30 flex h-10 w-10 items-center justify-center rounded-full bg-white/90 backdrop-blur shadow-[0_2px_12px_rgba(0,0,0,0.1)] border border-gray-200/50 text-gray-500 transition-all duration-300 hover:bg-gray-50 hover:text-gray-800 dark:border-white/[0.08] dark:bg-gray-800/90 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-200 ${
             !isScrolledToBottom && activeMessages.length > 0 ? 'translate-y-0 opacity-100' : 'translate-y-4 opacity-0 pointer-events-none'
           }`}
           aria-label="滚动到底部"

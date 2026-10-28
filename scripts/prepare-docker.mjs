@@ -3,13 +3,14 @@ import { existsSync, mkdirSync, copyFileSync, rmSync, mkdtempSync } from 'node:f
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { build } from 'esbuild'
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const apiCacheDir = path.join(rootDir, '.docker-npm-cache', 'server')
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
-    cwd: rootDir,
+    cwd: options.cwd ?? rootDir,
     stdio: 'inherit',
     env: { ...process.env, ...(options.env ?? {}) },
   })
@@ -22,8 +23,6 @@ function seedApiDependencyCache() {
 
   // 先更新服务端 lockfile，保证 API 镜像只安装真正需要的依赖。
   run('npm', [
-    '--prefix',
-    'server',
     'install',
     '--package-lock-only',
     '--cache',
@@ -31,7 +30,7 @@ function seedApiDependencyCache() {
     '--prefer-offline',
     '--no-audit',
     '--no-fund',
-  ])
+  ], { cwd: path.join(rootDir, 'server') })
 
   const tempDir = mkdtempSync(path.join(tmpdir(), 'gip-api-deps-'))
   try {
@@ -40,8 +39,6 @@ function seedApiDependencyCache() {
 
     // 在临时目录执行安装，只填充 Docker 构建缓存，不污染仓库目录。
     run('npm', [
-      '--prefix',
-      tempDir,
       'ci',
       '--cache',
       apiCacheDir,
@@ -49,29 +46,39 @@ function seedApiDependencyCache() {
       '--no-audit',
       '--no-fund',
       '--progress=false',
-    ])
+    ], { cwd: tempDir })
   } finally {
     rmSync(tempDir, { recursive: true, force: true })
   }
 }
 
-function buildServerBundle() {
+async function buildServerBundle() {
   const outputDir = path.join(rootDir, 'server-dist')
   rmSync(outputDir, { recursive: true, force: true })
   mkdirSync(outputDir, { recursive: true })
 
   // 服务端先在本机打包，容器运行纯 JS，避免生产镜像安装 tsx/esbuild。
-  run(path.join(rootDir, 'node_modules', '.bin', 'esbuild'), [
-    'server/index.ts',
-    '--bundle',
-    '--platform=node',
-    '--format=esm',
-    '--target=node22',
-    '--packages=external',
-    // Vite 会在前端构建时注入该对象；Node 服务端运行时没有 import.meta.env。
-    '--define:import.meta.env={}',
-    '--outfile=server-dist/index.js',
-  ])
+  await build({
+    absWorkingDir: rootDir,
+    entryPoints: ['server/index.ts'],
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: 'node22',
+    packages: 'external',
+    define: { 'import.meta.env': '{}' },
+    loader: { '.css': 'empty' },
+    outfile: 'server-dist/index.js',
+    plugins: [{
+      name: 'server-platform',
+      setup(build) {
+        build.onResolve({ filter: /(^|\/)platform$/ }, (args) => {
+          if (path.resolve(args.resolveDir, args.path) !== path.join(rootDir, 'src/lib/platform')) return
+          return { path: path.join(rootDir, 'server/platform.ts') }
+        })
+      },
+    }],
+  })
 }
 
 function buildDockerDist() {
@@ -85,6 +92,9 @@ function buildDockerDist() {
     VITE_SHOW_PRESET_CONFIG_ONLY: '__VITE_SHOW_PRESET_CONFIG_ONLY_PLACEHOLDER__',
     VITE_LOCK_PRESET_CONFIG_PARAMS: '__VITE_LOCK_PRESET_CONFIG_PARAMS_PLACEHOLDER__',
     VITE_PREVENT_PRESET_CONFIG_DELETION: '__VITE_PREVENT_PRESET_CONFIG_DELETION_PLACEHOLDER__',
+    VITE_DEFAULT_UI_FONT: '__VITE_DEFAULT_UI_FONT_PLACEHOLDER__',
+    VITE_DEFAULT_MONO_FONT: '__VITE_DEFAULT_MONO_FONT_PLACEHOLDER__',
+    VITE_BUILTIN_FONT_SOURCE: '__VITE_BUILTIN_FONT_SOURCE_PLACEHOLDER__',
   }
   run('npm', ['run', 'build'], { env: placeholderEnv })
 }
@@ -94,5 +104,5 @@ if (!existsSync(path.join(rootDir, 'server', 'package.json'))) {
 }
 
 seedApiDependencyCache()
-buildServerBundle()
+await buildServerBundle()
 buildDockerDist()

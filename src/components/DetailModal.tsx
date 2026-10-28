@@ -9,11 +9,12 @@ import { ActualValueBadge, DetailParamValue } from '../lib/paramDisplay'
 import { copyImageSourceToClipboard, copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
 import { dismissAllTooltips } from '../lib/tooltipDismiss'
-import { downloadImageEntriesAsZip, downloadImageIds, getImageZipEntries } from '../lib/downloadImages'
+import { downloadImageEntriesAsZip, downloadImageIds, getDownloadErrorMessage, getImageZipEntries, withSaveLocation } from '../lib/downloadImages'
 import { isAgentTaskPromptPending } from '../lib/taskPromptDisplay'
 import { getImageComments, getTaskPromptText, replaceImageMentionsForApi } from '../lib/promptImageMentions'
 import { applyPromptStylePreset } from '../lib/promptStyles'
 import { getApiProviderLabel } from '../lib/apiProfiles'
+import { isTauri } from '../lib/platform'
 import { CloseIcon, CodeIcon, CopyIcon, DownloadIcon, EditIcon, LinkIcon, TrashIcon } from './icons'
 
 import ViewportTooltip from './ViewportTooltip'
@@ -27,6 +28,7 @@ export default function DetailModal() {
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const showToast = useStore((s) => s.showToast)
   const openFavoritePicker = useStore((s) => s.openFavoritePicker)
+  const privacyMode = useStore((s) => Boolean(s.privacyMode))
   const settings = useStore((s) => s.settings)
   const dismissedCodexCliPrompts = useStore((s) => s.dismissedCodexCliPrompts)
   const streamPreviewSrc = useStore((s) => detailTaskId ? s.streamPreviews[detailTaskId] || '' : '')
@@ -364,14 +366,15 @@ export default function DetailModal() {
 
     try {
       const result = await downloadImageIds([currentOutputImageId], `task-${task.id}`)
+      if (result.canceled) return
       if (result.successCount === 0) {
-        showToast('下载失败', 'error')
+        showToast(getDownloadErrorMessage(result.error), 'error')
       } else {
-        showToast('下载成功', 'success')
+        showToast(withSaveLocation('下载成功', result.location), 'success')
       }
     } catch (err) {
       console.error(err)
-      showToast('下载失败', 'error')
+      showToast(getDownloadErrorMessage(err), 'error')
     }
   }
 
@@ -381,14 +384,15 @@ export default function DetailModal() {
 
     try {
       const result = await downloadImageIds([currentOriginalOutputImageId], `task-${task.id}-orig`)
+      if (result.canceled) return
       if (result.successCount === 0) {
-        showToast('下载失败', 'error')
+        showToast(getDownloadErrorMessage(result.error), 'error')
       } else {
-        showToast('原图下载成功', 'success')
+        showToast(withSaveLocation('原图下载成功', result.location), 'success')
       }
     } catch (err) {
       console.error(err)
-      showToast('下载失败', 'error')
+      showToast(getDownloadErrorMessage(err), 'error')
     }
   }
 
@@ -401,16 +405,17 @@ export default function DetailModal() {
       const result = settings.zipDownloadRoutes.includes('task-detail-all')
         ? await downloadImageEntriesAsZip(getImageZipEntries(task.outputImages, fileNameBase), fileNameBase)
         : await downloadImageIds(task.outputImages, fileNameBase)
+      if (result.canceled) return
       if (result.successCount === 0) {
-        showToast('下载失败', 'error')
+        showToast(getDownloadErrorMessage(result.error), 'error')
       } else if (result.failCount > 0) {
         showToast(`部分下载失败：成功 ${result.successCount}，失败 ${result.failCount}`, 'error')
       } else {
-        showToast(result.successCount > 1 ? `下载成功：${result.successCount} 张图片` : '下载成功', 'success')
+        showToast(withSaveLocation(result.successCount > 1 ? `下载成功：${result.successCount} 张图片` : '下载成功', result.location), 'success')
       }
     } catch (err) {
       console.error(err)
-      showToast('下载失败', 'error')
+      showToast(getDownloadErrorMessage(err), 'error')
     }
   }
 
@@ -422,16 +427,17 @@ export default function DetailModal() {
       const result = settings.zipDownloadRoutes.includes('task-detail-partial')
         ? await downloadImageEntriesAsZip(getImageZipEntries(streamPartialImageIds, fileNameBase), fileNameBase)
         : await downloadImageIds(streamPartialImageIds, fileNameBase)
+      if (result.canceled) return
       if (result.successCount === 0) {
-        showToast('下载失败', 'error')
+        showToast(getDownloadErrorMessage(result.error), 'error')
       } else if (result.failCount > 0) {
         showToast(`部分下载失败：成功 ${result.successCount}，失败 ${result.failCount}`, 'error')
       } else {
-        showToast(`下载成功：${result.successCount} 张中间步骤图`, 'success')
+        showToast(withSaveLocation(`下载成功：${result.successCount} 张中间步骤图`, result.location), 'success')
       }
     } catch (err) {
       console.error(err)
-      showToast('下载失败', 'error')
+      showToast(getDownloadErrorMessage(err), 'error')
     }
   }
 
@@ -1057,6 +1063,30 @@ export default function DetailModal() {
               )}
               {formatDuration() && <span> · 耗时 {formatDuration()}</span>}
             </div>
+
+            {/* 仅客户端：任务 ID 和图片 ID，可复制给使用命令行的 AI 工具，让它直接引用图片而不必重新上传 */}
+            {isTauri && (
+              <div className="mb-4 space-y-1 text-xs text-gray-400 dark:text-gray-500">
+                {[['任务 ID', task.id], ['图片 ID', currentOutputImageId]].filter(([, id]) => id).map(([label, id]) => (
+                  <div key={label} className="flex min-w-0 items-center gap-2">
+                    <span className="shrink-0">{label}</span>
+                    <span data-selectable-text className="min-w-0 truncate font-mono">{id}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        copyTextToClipboard(id).then(
+                          () => showToast(`${label}已复制`, 'success'),
+                          (err) => showToast(getClipboardFailureMessage(`复制${label}失败`, err), 'error'),
+                        )
+                      }}
+                      className="shrink-0 text-blue-500 hover:underline"
+                    >
+                      复制
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* 操作按钮 */}
@@ -1080,24 +1110,26 @@ export default function DetailModal() {
             </button>
             <button
               onClick={handleDelete}
-              className="col-span-3 sm:flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-500/20 transition text-sm font-medium whitespace-nowrap"
+              className={`${privacyMode ? 'col-span-4' : 'col-span-3'} sm:flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-500/20 transition text-sm font-medium whitespace-nowrap`}
             >
               <TrashIcon className="w-4 h-4 flex-shrink-0" />
               删除任务
             </button>
-            <button
-              onClick={handleToggleFavorite}
-              className={`col-span-1 sm:flex-none sm:w-11 w-full flex items-center justify-center rounded-xl transition ${
-                task.isFavorite
-                  ? 'bg-yellow-50 text-yellow-500 hover:bg-yellow-100 dark:bg-yellow-500/10 dark:hover:bg-yellow-500/20'
-                  : 'bg-gray-50 text-gray-400 hover:bg-yellow-50 hover:text-yellow-500 dark:bg-white/[0.04] dark:hover:bg-yellow-500/10'
-              }`}
-              title={task.isFavorite ? '编辑收藏夹' : '收藏任务'}
-            >
-              <svg className="w-5 h-5" fill={task.isFavorite ? 'currentColor' : 'none'} stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
-              </svg>
-            </button>
+            {!privacyMode && (
+              <button
+                onClick={handleToggleFavorite}
+                className={`col-span-1 sm:flex-none sm:w-11 w-full flex items-center justify-center rounded-xl transition ${
+                  task.isFavorite
+                    ? 'bg-yellow-50 text-yellow-500 hover:bg-yellow-100 dark:bg-yellow-500/10 dark:hover:bg-yellow-500/20'
+                    : 'bg-gray-50 text-gray-400 hover:bg-yellow-50 hover:text-yellow-500 dark:bg-white/[0.04] dark:hover:bg-yellow-500/10'
+                }`}
+                title={task.isFavorite ? '编辑收藏夹' : '收藏任务'}
+              >
+                <svg className="w-5 h-5" fill={task.isFavorite ? 'currentColor' : 'none'} stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
+                </svg>
+              </button>
+            )}
           </div>
         </div>
       </div>

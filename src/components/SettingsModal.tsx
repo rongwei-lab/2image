@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
 import { createPortal } from 'react-dom'
+import { readText } from '@tauri-apps/plugin-clipboard-manager'
 import { normalizeBaseUrl } from '../lib/api'
 import { customProviderSupportsNativeTransparentBackground } from '../lib/customProviderCapabilities'
-import { hasActiveDataOperations } from '../lib/dataOperations'
+import { hasActiveDataOperations, trackDataTransfer } from '../lib/dataOperations'
+import { useSettingsDataTransfer } from '../lib/dataProgress'
 import { isApiProxyAvailable, isApiProxyLocked, readClientDevProxyConfig } from '../lib/devProxy'
 import { changeCloudPassword } from '../lib/cloudApi'
+import { isTauri } from '../lib/platform'
 import { useStore, exportData, importData, clearData, type SettingsTab } from '../store'
 import {
   createDefaultOpenAIProfile,
@@ -23,13 +26,11 @@ import {
   isOpenAICompatibleProvider,
   mergeImportedSettings,
   normalizeAgentMaxToolRounds,
-  normalizeCustomProviderDefinition,
   normalizeSettings,
   normalizeStreamPartialImages,
   switchApiProfileProvider,
 } from '../lib/apiProfiles'
 import {
-  getDefaultPresetBaseUrl,
   getDefaultPresetProfileId,
   getPresetProfileDescription,
   getPresetProfileIds,
@@ -42,6 +43,7 @@ import {
 } from '../lib/presetConfig'
 import { copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
 import { createCustomProfileImportUrl } from '../lib/profileImportUrl'
+import { getProfileImportBaseUrl, handledImportLinks } from '../lib/importLink'
 import { requestBrowserNotificationPermission, type BrowserNotificationPermissionResult } from '../lib/browserNotification'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, REASONING_EFFORT_VALUES, type AgentApiConfigMode, type ApiProfile, type AppSettings, type CustomProviderDefinition, type ReasoningEffort, type ZipDownloadRoute } from '../types'
 import {
@@ -50,22 +52,36 @@ import {
 } from '../lib/settingsCustomProvider'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
+import { updateModalScrollRef, useReleaseUpdates } from '../hooks/useReleaseUpdates'
 import { DEFAULT_DROPDOWN_MAX_HEIGHT, getDropdownMaxHeight } from '../lib/dropdown'
+import {
+  buildCustomProvider,
+  getApiProfileDeleteBlock,
+  getCustomProviderDeleteBlock,
+  getDefaultModelForMode,
+  isAsyncCustomProvider,
+  isProfileApiProxyEligible,
+  newId,
+  prepareSettingsForCommit,
+  removeApiProfile,
+  removeCustomProvider,
+} from '../lib/settingsActions'
 import Select from './Select'
 import { Checkbox } from './Checkbox'
 import ViewportTooltip from './ViewportTooltip'
-import { ChevronDownIcon, CloseIcon, CopyIcon, PlusIcon, TrashIcon, GithubIcon, ExportIcon, ImportIcon, DragHandleIcon, LinkIcon } from './icons'
+import { ChevronDownIcon, CloseIcon, CopyIcon, PlusIcon, TrashIcon, ExportIcon, ImportIcon, DragHandleIcon, LinkIcon, SparklesIcon } from './icons'
 import { TooltipButton } from './TooltipButton'
 import GeneralSettingsTab from './settings/GeneralSettingsTab'
+import AppearanceSettingsTab from './settings/AppearanceSettingsTab'
 import AgentSettingsTab from './settings/AgentSettingsTab'
+import SkillSettingsSection from './settings/SkillSettingsSection'
+import FontLicensesModal from './settings/FontLicensesModal'
 import CustomProviderModal from './settings/CustomProviderModal'
 import ProfileImportUrlModal, { type CopyImportUrlOptions } from './settings/ProfileImportUrlModal'
 import ZipDownloadRouteModal, { ZIP_DOWNLOAD_ROUTE_OPTIONS } from './settings/ZipDownloadRouteModal'
+import StorageInfoSection from './settings/StorageInfoSection'
+import AboutSettingsTab from './settings/AboutSettingsTab'
 import MarkdownRenderer from './MarkdownRenderer'
-
-function newId(prefix: string) {
-  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
-}
 
 const ADD_CUSTOM_PROVIDER_VALUE = '__add_custom_provider__'
 const COPY_IMPORT_URL_OPTIONS_STORAGE_KEY = 'gpt-image-playground.copy-import-url-options'
@@ -156,15 +172,6 @@ function getImportedProfileFromMergedSettings(
   return nextSettings.profiles.find((profile) => !previousProfileIds.has(profile.id)) ?? nextSettings.profiles[0]
 }
 
-function isAsyncCustomProvider(provider: CustomProviderDefinition | null | undefined) {
-  return Boolean(provider?.poll || provider?.submit.taskIdPath || provider?.editSubmit?.taskIdPath)
-}
-
-function isProfileApiProxyEligible(settings: AppSettings, profile: ApiProfile) {
-  if (!isOpenAICompatibleProvider(settings, profile.provider)) return false
-  const customProvider = getCustomProviderDefinition(settings, profile.provider)
-  return !isAsyncCustomProvider(customProvider)
-}
 
 function getVisibleProviderOrder(settings: AppSettings) {
   const visibleProviderIds = ['openai', 'sb2api-async', ...settings.customProviders.map((provider) => provider.id)]
@@ -200,6 +207,10 @@ export default function SettingsModal() {
   const settingsScrollBoundaryRef = useRef<HTMLDivElement>(null)
   const customProviderScrollBoundaryRef = useRef<HTMLDivElement>(null)
   const zipDownloadRouteScrollBoundaryRef = useRef<HTMLDivElement>(null)
+  const fontLicensesScrollBoundaryRef = useRef<HTMLDivElement>(null)
+  const tabScrollRef = useRef<HTMLDivElement>(null)
+  // 各选项卡共用一个滚动容器，按选项卡记录滚动位置，切换时各自恢复
+  const tabScrollTopsRef = useRef<Partial<Record<SettingsTab, number>>>({})
   
   const [draft, setDraft] = useState<AppSettings>(normalizeSettings(settings))
   const [timeoutInput, setTimeoutInput] = useState(String(getActiveApiProfile(settings).timeout))
@@ -209,6 +220,7 @@ export default function SettingsModal() {
   const [profileMenuMaxHeight, setProfileMenuMaxHeight] = useState(DEFAULT_DROPDOWN_MAX_HEIGHT)
   const [showCustomProviderImport, setShowCustomProviderImport] = useState(false)
   const [showZipDownloadRouteManager, setShowZipDownloadRouteManager] = useState(false)
+  const [showFontLicenses, setShowFontLicenses] = useState(false)
   const [editingCustomProviderId, setEditingCustomProviderId] = useState<string | null>(null)
   const [customProviderJson, setCustomProviderJson] = useState(DEFAULT_CUSTOM_PROVIDER_JSON)
   const [customProviderImportError, setCustomProviderImportError] = useState<string | null>(null)
@@ -221,8 +233,9 @@ export default function SettingsModal() {
   const [importTasks, setImportTasks] = useState(true)
   const [clearConfig, setClearConfig] = useState(true)
   const [clearTasks, setClearTasks] = useState(true)
-  const [isExportingData, setIsExportingData] = useState(false)
-  const [isImportingData, setIsImportingData] = useState(false)
+  const dataTransferMode = useSettingsDataTransfer((s) => s.mode)
+  const isExportingData = dataTransferMode === 'export'
+  const isImportingData = dataTransferMode === 'import'
   const [isImportingJson, setIsImportingJson] = useState(false)
   const [draggedProfileId, setDraggedProfileId] = useState<string | null>(null)
   const [dragOverProfileId, setDragOverProfileId] = useState<string | null>(null)
@@ -302,9 +315,6 @@ export default function SettingsModal() {
     })
   ]
 
-  const getDefaultModelForMode = (apiMode: AppSettings['apiMode']) =>
-    apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL
-
   const enabledZipDownloadRouteCount = ZIP_DOWNLOAD_ROUTE_OPTIONS
     .filter((option) => draft.zipDownloadRoutes.includes(option.route))
     .length
@@ -334,16 +344,19 @@ export default function SettingsModal() {
     value: profile.id,
   }))
 
-  const wasSettingsOpenRef = useRef(false)
+  // 草稿所对应的已保存设置。设置页打开期间设置被别处修改（例如 AI 工具通过命令行）时按新设置重建草稿，
+  // 避免之后提交草稿时把别处的修改改回去
+  const draftSourceRef = useRef<AppSettings | null>(null)
 
   useEffect(() => {
     if (!showSettings) {
-      wasSettingsOpenRef.current = false
+      draftSourceRef.current = null
+      tabScrollTopsRef.current = {}
       return
     }
-    if (wasSettingsOpenRef.current) return
+    if (draftSourceRef.current === settings) return
 
-    wasSettingsOpenRef.current = true
+    draftSourceRef.current = settings
     const normalizedSettings = normalizeSettings(settings)
     const displaySettings = normalizedSettings.reuseTaskApiProfileTemporarily && reusedTaskApiProfileId && normalizedSettings.profiles.some((profile) => profile.id === reusedTaskApiProfileId)
       ? normalizeSettings({ ...normalizedSettings, activeProfileId: reusedTaskApiProfileId })
@@ -352,9 +365,10 @@ export default function SettingsModal() {
       ...displaySettings,
       profiles: displaySettings.profiles.map((profile) => ({
         ...profile,
+        // 客户端不使用代理，但保留已保存的设置，导回网页版时仍然有效
         apiProxy: isProfileApiProxyEligible(displaySettings, profile) && apiProxyAvailable
           ? (apiProxyLocked || profile.apiProxy)
-          : false,
+          : isTauri && profile.apiProxy,
       })),
     })
     setDraft(nextDraft)
@@ -366,9 +380,18 @@ export default function SettingsModal() {
     setTimeoutInput(String(activeProfile.timeout))
   }, [activeProfile.id, activeProfile.timeout])
 
+  // 设置打开期间首次保存（例如导出备份）时会询问并写入保存方式，同步到草稿，避免之后提交草稿时被改回
+  useEffect(() => {
+    setDraft((prev) => prev.saveLocationMode === settings.saveLocationMode ? prev : { ...prev, saveLocationMode: settings.saveLocationMode })
+  }, [settings.saveLocationMode])
+
   useEffect(() => {
     if (showSettings && settingsTabRequest) setActiveTab(settingsTabRequest)
   }, [settingsTabRequest, showSettings])
+
+  useLayoutEffect(() => {
+    if (tabScrollRef.current) tabScrollRef.current.scrollTop = tabScrollTopsRef.current[activeTab] ?? 0
+  }, [activeTab, showSettings])
 
   const updateProfileMenuMaxHeight = useCallback(() => {
     if (!profileMenuTriggerRef.current) return
@@ -435,40 +458,9 @@ export default function SettingsModal() {
   }
 
   const commitSettings = (nextDraft: AppSettings) => {
-    const normalizedProfiles = nextDraft.profiles.map((profile) => {
-      const nextApiProxy = isProfileApiProxyEligible(nextDraft, profile) && apiProxyAvailable ? (apiProxyLocked || profile.apiProxy) : false
-      const shouldKeepEmptyBaseUrl = profile.provider !== 'fal' && nextApiProxy && !profile.baseUrl.trim()
-      const emptyBaseUrlFallback = profile.id === defaultProfileId
-        ? getDefaultPresetBaseUrl()
-        : DEFAULT_SETTINGS.baseUrl
-      const normalizedBaseUrl = profile.provider === 'fal'
-        ? profile.baseUrl.trim().replace(/\/+$/, '') || (profile.id === defaultProfileId ? '' : DEFAULT_FAL_BASE_URL)
-        : shouldKeepEmptyBaseUrl ? '' : normalizeBaseUrl(profile.baseUrl.trim() || emptyBaseUrlFallback)
-      const defaultModel = profile.provider === 'fal' ? DEFAULT_FAL_MODEL : getDefaultModelForMode(profile.apiMode)
-      return {
-        ...profile,
-        name: profile.name.trim() || (profile.id === defaultProfileId ? '默认' : '新配置'),
-        baseUrl: normalizedBaseUrl,
-        apiKey: profile.apiKey.trim(),
-        hasStoredApiKey: profile.apiKey.trim() ? undefined : profile.hasStoredApiKey,
-        model: profile.model.trim() || defaultModel,
-        timeout: Number(profile.timeout) || DEFAULT_SETTINGS.timeout,
-        apiProxy: nextApiProxy,
-        codexCli: isOpenAICompatibleProvider(nextDraft, profile.provider) ? profile.codexCli : false,
-        streamImages: profile.provider === 'openai' ? profile.streamImages : false,
-        streamPartialImages: profile.provider === 'openai' ? normalizeStreamPartialImages(profile.streamPartialImages) : DEFAULT_STREAM_PARTIAL_IMAGES,
-      }
-    })
-    const fallbackProfile = createDefaultOpenAIProfile({ id: newId('openai') })
-    const normalizedDraft = normalizeSettings({
-      ...nextDraft,
-      profiles: normalizedProfiles.length ? normalizedProfiles : [fallbackProfile],
-      activeProfileId: normalizedProfiles.some((profile) => profile.id === nextDraft.activeProfileId)
-        ? nextDraft.activeProfileId
-        : (normalizedProfiles[0]?.id ?? fallbackProfile.id),
-    })
-    setSettings(normalizedDraft)
-    setDraft(useStore.getState().settings)
+    setSettings(prepareSettingsForCommit(nextDraft))
+    draftSourceRef.current = useStore.getState().settings
+    setDraft(draftSourceRef.current)
   }
 
   const setZipDownloadRouteEnabled = (route: ZipDownloadRoute, enabled: boolean) => {
@@ -489,7 +481,8 @@ export default function SettingsModal() {
   }
 
   const createProfileImportUrl = (profile: ApiProfile, options: ProfileImportUrlOptions) => {
-    const url = new URL(window.location.href)
+    const pageUrl = getProfileImportBaseUrl(isTauri, window.location.href)
+    const url = new URL(pageUrl)
     url.search = ''
     url.hash = ''
 
@@ -522,7 +515,7 @@ export default function SettingsModal() {
     }
 
     return createCustomProfileImportUrl(
-      window.location.href,
+      pageUrl,
       profile,
       draft.customProviders.find((item) => item.id === profile.provider),
       options,
@@ -531,8 +524,12 @@ export default function SettingsModal() {
 
   const copyProfileImportUrl = async (profile: ApiProfile, options: ProfileImportUrlOptions) => {
     try {
-      await copyTextToClipboard(createProfileImportUrl(profile, options))
-      showToast(options.includeApiKey ? '导入 URL 已复制（包含 API Key）' : '导入 URL 已复制', 'success')
+      const url = createProfileImportUrl(profile, options)
+      await copyTextToClipboard(url)
+      // 客户端切回窗口时会检查剪贴板，本机刚复制的链接不再提示导入
+      handledImportLinks.add(url)
+      const message = options.includeApiKey ? '导入 URL 已复制（包含 API Key）' : '导入 URL 已复制'
+      showToast(isTauri ? `${message}，在其他设备的客户端中复制此链接后切回客户端即可导入` : message, 'success')
       setCopyImportUrlProfile(null)
     } catch (err) {
       showToast(getClipboardFailureMessage('复制导入 URL 失败', err), 'error')
@@ -571,6 +568,10 @@ export default function SettingsModal() {
     }
     if (showZipDownloadRouteManager) {
       setShowZipDownloadRouteManager(false)
+      return
+    }
+    if (showFontLicenses) {
+      setShowFontLicenses(false)
       return
     }
     const nextTimeout = Number(timeoutInput)
@@ -614,11 +615,11 @@ export default function SettingsModal() {
 
   const showNotificationPermissionMessage = (result: Exclude<BrowserNotificationPermissionResult, { ok: true }>) => {
     if (result.reason === 'unsupported') {
-      showToast('当前浏览器不支持系统通知', 'error')
+      showToast(isTauri ? '当前环境不支持系统通知' : '当前浏览器不支持系统通知', 'error')
     } else if (result.reason === 'insecure') {
       showToast('系统通知需要 HTTPS 或 localhost 安全上下文', 'error')
     } else if (result.reason === 'denied') {
-      showToast('通知权限已被浏览器拒绝，请在地址栏左侧的网站设置中手动开启', 'error')
+      showToast(isTauri ? '通知权限已被拒绝，请在 Windows 设置的「通知」中允许本应用发送通知' : '通知权限已被浏览器拒绝，请在地址栏左侧的网站设置中手动开启', 'error')
     } else {
       showToast('没有开启系统通知', 'info')
     }
@@ -633,18 +634,17 @@ export default function SettingsModal() {
     const result = await requestBrowserNotificationPermission()
     if (result.ok) {
       commitSettings({ ...draft, taskCompletionNotification: true })
-      showToast('任务完成通知已开启', 'success')
+      showToast('任务通知已开启', 'success')
     } else {
       showNotificationPermissionMessage(result)
     }
   }
 
-  const dataTransferMode = isExportingData ? 'export' : isImportingData ? 'import' : null
   const showDataTransferBusyToast = () => {
     const now = Date.now()
     if (now - dataTransferToastAtRef.current < 1000) return
     dataTransferToastAtRef.current = now
-    showToast(dataTransferMode === 'export' ? '正在导出中，请稍候' : '正在导入中，请稍候', 'info')
+    showToast(dataTransferMode === 'export' ? '正在导出' : '正在导入', 'info')
   }
 
   useEffect(() => {
@@ -674,20 +674,22 @@ export default function SettingsModal() {
   }
 
   useCloseOnEscape(showSettings && !dataTransferMode, handleClose)
-  usePreventBackgroundScroll(showSettings, showZipDownloadRouteManager ? zipDownloadRouteScrollBoundaryRef : showCustomProviderImport ? customProviderScrollBoundaryRef : settingsScrollBoundaryRef)
+  // 从“关于”打开的更新弹窗叠在设置之上，需要放行它的滚动
+  const updateModalOpen = useReleaseUpdates((s) => s.modalOpen)
+  usePreventBackgroundScroll(showSettings, updateModalOpen ? updateModalScrollRef : showZipDownloadRouteManager ? zipDownloadRouteScrollBoundaryRef : showFontLicenses ? fontLicensesScrollBoundaryRef : showCustomProviderImport ? customProviderScrollBoundaryRef : settingsScrollBoundaryRef)
 
   if (!showSettings) return null
 
   const handleExport = async () => {
     if (exportTasks && hasRunningOperations) {
-      showToast('当前有任务正在进行，请完成或停止后再导出', 'error')
+      showToast('有任务正在进行，完成或停止后再导出', 'error')
       return
     }
-    setIsExportingData(true)
+    useSettingsDataTransfer.setState({ mode: 'export' })
     try {
-      await exportData({ exportConfig, exportTasks })
+      await trackDataTransfer(() => exportData({ exportConfig, exportTasks }))
     } finally {
-      setIsExportingData(false)
+      useSettingsDataTransfer.setState({ mode: null })
     }
   }
 
@@ -695,13 +697,13 @@ export default function SettingsModal() {
     const files = Array.from(e.target.files ?? [])
     if (files.length) {
       if (importTasks && hasRunningOperations) {
-        showToast('当前有任务正在进行，请完成或停止后再导入', 'error')
+        showToast('有任务正在进行，完成或停止后再导入', 'error')
         e.target.value = ''
         return
       }
-      setIsImportingData(true)
+      useSettingsDataTransfer.setState({ mode: 'import' })
       try {
-        const imported = await importData(files, { importConfig: presetConfigOnly ? false : importConfig, importTasks })
+        const imported = await trackDataTransfer(() => importData(files, { importConfig: presetConfigOnly ? false : importConfig, importTasks }))
         if (imported) {
           const nextDraft = normalizeSettings(useStore.getState().settings)
           setDraft(nextDraft)
@@ -709,14 +711,14 @@ export default function SettingsModal() {
           setShowProfileMenu(false)
         }
       } finally {
-        setIsImportingData(false)
+        useSettingsDataTransfer.setState({ mode: null })
       }
     }
     e.target.value = ''
   }
 
   const handleClearAllData = async () => {
-    await clearData({ clearConfig, clearTasks })
+    await trackDataTransfer(() => clearData({ clearConfig, clearTasks }))
     const nextDraft = normalizeSettings(useStore.getState().settings)
     setDraft(nextDraft)
     setTimeoutInput(String(getActiveApiProfile(nextDraft).timeout))
@@ -940,17 +942,10 @@ export default function SettingsModal() {
   }
 
   const deleteProfile = (id: string) => {
-    const preset = presetProfileIds.has(id)
-    if (presetConfigOnly || draft.profiles.length <= 1 || (preset && presetDeletionPrevented) || (!preset && id === defaultProfileId)) return
+    if (getApiProfileDeleteBlock(draft, id)) return
     if (id === reusedTaskApiProfileId) setReusedTaskApiProfile(null)
-    if (preset) dismissPresetProfile(id)
-    const nextProfiles = draft.profiles.filter((item) => item.id !== id)
-    const nextDraft = normalizeSettings({
-      ...draft,
-      profiles: nextProfiles,
-      activeProfileId: draft.activeProfileId === id ? nextProfiles[0].id : draft.activeProfileId,
-    })
-    commitSettings(nextDraft)
+    if (presetProfileIds.has(id)) dismissPresetProfile(id)
+    commitSettings(removeApiProfile(draft, id))
   }
 
   const handleProviderReorder = (sourceValue: string | number, targetValue: string | number, position: 'before' | 'after' | null) => {
@@ -992,25 +987,8 @@ export default function SettingsModal() {
     setEditingCustomProviderId(null)
   }
 
-  const buildCustomProviderFromJson = () => {
-    const input = JSON.parse(customProviderJson)
-    const usedIds = new Set(
-      draft.customProviders
-        .filter((item) => item.id !== editingCustomProviderId)
-        .map((item) => item.id),
-    )
-    const provider = normalizeCustomProviderDefinition(
-      editingCustomProviderId && input && typeof input === 'object'
-        ? {
-            ...input,
-            id: editingCustomProviderId,
-          }
-        : input,
-      usedIds,
-    )
-    if (!provider) throw new Error('自定义服务商配置无效')
-    return provider
-  }
+  const buildCustomProviderFromJson = () =>
+    buildCustomProvider(JSON.parse(customProviderJson), draft.customProviders, editingCustomProviderId)
 
   function openEditCustomProvider(provider: CustomProviderDefinition) {
     if (presetConfigOnly || isPresetProviderLocked(provider.id)) return
@@ -1070,17 +1048,9 @@ export default function SettingsModal() {
   }
 
   function deleteCustomProvider(provider: CustomProviderDefinition) {
-    if (presetConfigOnly || isPresetProviderDeletionPrevented(provider.id, draft.profiles)) return
-    const providerId = provider.id
-    if (isPresetProvider(providerId)) dismissPresetProvider(providerId)
-    const nextDraft = normalizeSettings({
-      ...draft,
-      customProviders: draft.customProviders.filter((provider) => provider.id !== providerId),
-      profiles: draft.profiles.map((profile) =>
-        profile.provider === providerId ? switchApiProfileProvider(profile, 'openai') : profile,
-      ),
-    })
-    commitSettings(nextDraft)
+    if (getCustomProviderDeleteBlock(draft, provider.id)) return
+    if (isPresetProvider(provider.id)) dismissPresetProvider(provider.id)
+    commitSettings(removeCustomProvider(draft, provider.id))
     showToast('服务商已删除', 'success')
   }
 
@@ -1096,7 +1066,8 @@ export default function SettingsModal() {
   const handleCustomProviderJsonPaste = async () => {
     setIsImportingJson(true)
     try {
-      const text = await navigator.clipboard.readText()
+      // 客户端中 navigator.clipboard.readText 会弹出 WebView2 的剪贴板权限框，改由插件读取；剪贴板为空或不是文本时插件抛英文错误，按空处理
+      const text = isTauri ? await readText().catch(() => '') : await navigator.clipboard.readText()
       if (!text.trim()) {
         throw new Error('剪贴板为空')
       }
@@ -1211,6 +1182,15 @@ export default function SettingsModal() {
                 习惯配置
               </button>
               <button
+                onClick={() => setActiveTab('appearance')}
+                className={`whitespace-nowrap flex-shrink-0 flex items-center gap-2.5 px-3 py-2.5 text-sm rounded-xl transition-colors ${activeTab === 'appearance' ? 'bg-white dark:bg-white/[0.08] shadow-sm text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100/80 dark:hover:bg-white/[0.04]'}`}
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01" />
+                </svg>
+                外观配置
+              </button>
+              <button
                 onClick={() => setActiveTab('agent')}
                 className={`whitespace-nowrap flex-shrink-0 flex items-center gap-2.5 px-3 py-2.5 text-sm rounded-xl transition-colors ${activeTab === 'agent' ? 'bg-white dark:bg-white/[0.08] shadow-sm text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100/80 dark:hover:bg-white/[0.04]'}`}
               >
@@ -1221,6 +1201,15 @@ export default function SettingsModal() {
                 </svg>
                 Agent 配置
               </button>
+              {isTauri && (
+                <button
+                  onClick={() => setActiveTab('skill')}
+                  className={`whitespace-nowrap flex-shrink-0 flex items-center gap-2.5 px-3 py-2.5 text-sm rounded-xl transition-colors ${activeTab === 'skill' ? 'bg-white dark:bg-white/[0.08] shadow-sm text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100/80 dark:hover:bg-white/[0.04]'}`}
+                >
+                  <SparklesIcon className="w-4 h-4" />
+                  Skill
+                </button>
+              )}
               <button
                 onClick={() => setActiveTab('data')}
                 className={`whitespace-nowrap flex-shrink-0 flex items-center gap-2.5 px-3 py-2.5 text-sm rounded-xl transition-colors ${activeTab === 'data' ? 'bg-white dark:bg-white/[0.08] shadow-sm text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100/80 dark:hover:bg-white/[0.04]'}`}
@@ -1235,7 +1224,11 @@ export default function SettingsModal() {
 
           {/* Content */}
           <div className="flex-1 flex flex-col min-w-0 min-h-0 bg-transparent relative overflow-hidden">
-            <div className="flex-1 overflow-y-auto overscroll-contain custom-scrollbar p-5 sm:p-6">
+            <div
+              ref={tabScrollRef}
+              onScroll={(e) => { tabScrollTopsRef.current[activeTab] = e.currentTarget.scrollTop }}
+              className="flex-1 overflow-y-auto overscroll-contain custom-scrollbar p-5 [scrollbar-gutter:stable_both-edges] sm:p-6"
+            >
             {activeTab === 'general' && (
               <GeneralSettingsTab
                 draft={draft}
@@ -1252,6 +1245,8 @@ export default function SettingsModal() {
                 toggleTaskCompletionNotification={toggleTaskCompletionNotification}
               />
             )}
+
+            {activeTab === 'appearance' && <AppearanceSettingsTab draft={draft} commitSettings={commitSettings} />}
 
             {activeTab === 'agent' && (
               <div className="space-y-4">
@@ -1653,7 +1648,7 @@ export default function SettingsModal() {
                     ) : activeProfile.provider === 'fal' ? (
                       <span>默认使用 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">{DEFAULT_FAL_BASE_URL}</code>；填写自定义地址时将作为 fal.ai 代理 URL。</span>
                     ) : (
-                      <span>末尾带 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">/</code> 时直接使用该地址拼接接口，不补 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">/v1</code> 前缀；支持通过查询参数覆盖：<code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">?apiUrl=</code>。</span>
+                      <span>末尾带 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">/</code> 时直接使用该地址拼接接口，不补 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">/v1</code> 前缀；支持通过链接参数导入（打开时会先确认）：<code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">?apiUrl=</code>。</span>
                     )}
                   </div>
                 </label>
@@ -1749,7 +1744,7 @@ export default function SettingsModal() {
                     className="w-full rounded-xl border border-transparent bg-black/[0.04] px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:bg-white/[0.06] dark:text-gray-200 dark:focus:border-blue-500/50"
                   />
                 <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
-                    支持通过查询参数覆盖：<code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">apiMode=images</code> 或 <code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">apiMode=responses</code>。
+                    支持通过链接参数导入：<code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">apiMode=images</code> 或 <code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">apiMode=responses</code>。
                   </div>
                 </div>
               )}
@@ -1784,7 +1779,7 @@ export default function SettingsModal() {
                   )}
                   多个模型以逗号分隔，可在首页的模型参数中切换。
                   {activeProfile.provider === 'openai' && (
-                    <>支持通过查询参数覆盖：<code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">?model=</code>。</>
+                    <>支持通过链接参数导入：<code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">?model=</code>。</>
                   )}
                 </div>
               </label>
@@ -1804,7 +1799,7 @@ export default function SettingsModal() {
                   <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
                     Responses API 的 <code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">image_generation</code> 工具需要使用 GPT Image 模型，例如 <code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">{DEFAULT_IMAGES_MODEL}</code>。
                     留空时不发送工具模型 ID，保持 API 默认值。
-                    支持通过查询参数覆盖：<code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">?imageGenerationModel=</code>。
+                    支持通过链接参数导入：<code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">?imageGenerationModel=</code>。
                   </div>
                 </label>
               )}
@@ -1827,7 +1822,7 @@ export default function SettingsModal() {
                     </div>
                   </div>
                   <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
-                    用于指导模型在执行任务时的思考深度，更高的档位会使模型花费更长时间进行思考，有助于提升 Agent 模式下模型完成复杂任务的能力。并非所有模型都支持全部推理强度。支持通过查询参数覆盖：<code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">?reasoningEffort=high</code>。
+                    用于指导模型在执行任务时的思考深度，更高的档位会使模型花费更长时间进行思考，有助于提升 Agent 模式下模型完成复杂任务的能力。并非所有模型都支持全部推理强度。支持通过链接参数导入：<code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">?reasoningEffort=high</code>。
                   </div>
                 </div>
               )}
@@ -1898,7 +1893,7 @@ export default function SettingsModal() {
                 </div>
                 <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
                   {activeCustomProviderSupportsNativeTransparentBackground
-                    ? 'API 原生会请求接口直接生成透明背景，需当前接口支持；本地后处理会生成纯色背景并在浏览器中去除。'
+                    ? `API 原生会请求接口直接生成透明背景，需当前接口支持；本地后处理会生成纯色背景并在${isTauri ? '本地' : '浏览器中'}去除。`
                     : <>当前自定义服务商 Manifest 未映射 <code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">$params.background</code>，无法使用 API 原生透明背景。</>}
                 </div>
               </div>
@@ -1944,7 +1939,7 @@ export default function SettingsModal() {
                     </button>
                   </div>
                   <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
-                    开启后应用 Codex CLI 实际支持的参数。支持查询参数覆盖：<code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">codexCli=true</code>。
+                    开启后应用 Codex CLI 实际支持的参数。支持通过链接参数导入：<code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">codexCli=true</code>。
                   </div>
                 </div>
               )}
@@ -1977,7 +1972,9 @@ export default function SettingsModal() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
                   </svg>
                   <div className="text-[13px] leading-relaxed text-gray-500 dark:text-gray-400">
-                    所有的配置、任务和生成的图片均仅保存在您的浏览器本地（除非您使用的服务商存储了它们）。如果您需要清理浏览器站点数据、重置浏览器或使用其他设备，请先导出备份。
+                    {isTauri
+                      ? '所有的配置、任务和生成的图片均仅保存在本机的数据目录中（除非您使用的服务商存储了它们）。如果您需要更换安装位置或使用其他设备，请先导出备份。'
+                      : '所有的配置、任务和生成的图片均仅保存在您的浏览器本地（除非您使用的服务商存储了它们）。如果您需要清理浏览器站点数据、重置浏览器或使用其他设备，请先导出备份。'}
                   </div>
                 </div>
 
@@ -2012,13 +2009,14 @@ export default function SettingsModal() {
                     </div>
                   </div>
                 )}
+                {isTauri && <StorageInfoSection />}
 
                 <div className="rounded-2xl border border-transparent bg-black/[0.04] p-4 dark:bg-white/[0.06] space-y-4">
                   <div className="flex items-center gap-2 mb-1">
                     <ExportIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
                     <h4 className="text-sm font-bold text-gray-800 dark:text-gray-100">导出数据</h4>
                   </div>
-                  <p className="text-xs text-gray-500 dark:text-gray-400">受浏览器文件大小限制，过大的备份将自动分片导出，请允许浏览器下载多个文件</p>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">{isTauri ? `受文件大小限制，过大的备份将自动分卷，${draft.saveLocationMode === 'default' ? '全部分卷保存到默认保存地址' : '导出时选择一个文件夹保存全部分卷'}` : '受浏览器文件大小限制，过大的备份将自动分卷导出，请允许浏览器下载多个文件'}</p>
                   <div className="flex flex-wrap gap-x-6 gap-y-3">
                     <Checkbox
                       checked={exportConfig}
@@ -2055,7 +2053,7 @@ export default function SettingsModal() {
                     <ImportIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
                     <h4 className="text-sm font-bold text-gray-800 dark:text-gray-100">导入数据</h4>
                   </div>
-                  <p className="text-xs text-gray-500 dark:text-gray-400">支持一次导入多个普通备份；分片备份请一次性选中同一批次的全部分片</p>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">支持一次导入多个普通备份；分卷备份请一次性选中同一批次的全部分卷</p>
                   <div className="flex flex-wrap gap-x-6 gap-y-3">
                     {!presetConfigOnly && <Checkbox
                       checked={importConfig}
@@ -2130,6 +2128,8 @@ export default function SettingsModal() {
                 </div>
               </div>
             )}
+
+            {activeTab === 'skill' && isTauri && <SkillSettingsSection />}
 
           </div>
         </div>
@@ -2208,6 +2208,13 @@ export default function SettingsModal() {
             </div>
           </div>,
           document.body,
+        )}
+
+        {showFontLicenses && (
+          <FontLicensesModal
+            scrollBoundaryRef={fontLicensesScrollBoundaryRef}
+            onClose={() => setShowFontLicenses(false)}
+          />
         )}
 
         {showCustomProviderImport && (

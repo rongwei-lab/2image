@@ -19,11 +19,15 @@ import { collectAgentRoundOutputImageSlots } from '../lib/agentImageReferences'
 import { ALL_FAVORITES_COLLECTION_ID, getTaskFavoriteCollectionIds } from '../lib/favoriteState'
 import { getContentEditableCursor, getContentEditablePlainText, getContentEditableSelection, getMentionTagHtml, setContentEditableCursor, setContentEditableSelection, syncMentionTagSelection } from '../lib/contentEditableMentions'
 import { useHintTooltip } from '../hooks/useHintTooltip'
-import { downloadImageEntriesAsZip, downloadImageIds, formatExportFileTime, getTaskOutputImageZipEntries } from '../lib/downloadImages'
+import { useVisibleTasks } from '../hooks/usePrivacyMode'
+import { downloadImageEntriesAsZip, downloadImageIds, formatExportFileTime, getDownloadErrorMessage, getTaskOutputImageZipEntries, withSaveLocation } from '../lib/downloadImages'
+import { pickSaveDir } from '../lib/saveFile'
+import { isTauri } from '../lib/platform'
 import SizePickerModal from './SizePickerModal'
 import Select from './Select'
-import { CloseIcon, CollapseIcon, ExpandIcon, SketchIcon } from './icons'
+import { CloseIcon, CollapseIcon, ExpandIcon, LinkIcon, SketchIcon } from './icons'
 import { CommentBadge } from './CommentMarks'
+import AddImageUrlsModal from './input/addImageUrlsModal'
 import ButtonTooltip from './input/buttonTooltip'
 import DragUploadOverlay from './input/dragUploadOverlay'
 import InputBatchBars from './input/inputBatchBars'
@@ -119,7 +123,7 @@ export default function InputBar() {
   const selectedFavoriteCollectionIds = useStore((s) => s.selectedFavoriteCollectionIds)
   const setSelectedFavoriteCollectionIds = useStore((s) => s.setSelectedFavoriteCollectionIds)
   const clearFavoriteCollectionSelection = useStore((s) => s.clearFavoriteCollectionSelection)
-  const tasks = useStore((s) => s.tasks)
+  const tasks = useVisibleTasks()
   const favoriteCollections = useStore((s) => s.favoriteCollections)
   const defaultFavoriteCollectionId = useStore((s) => s.defaultFavoriteCollectionId)
   const agentConversations = useStore((s) => s.agentConversations)
@@ -128,6 +132,7 @@ export default function InputBar() {
   const filterFavorite = useStore((s) => s.filterFavorite)
   const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
   const openFavoritePicker = useStore((s) => s.openFavoritePicker)
+  const privacyMode = useStore((s) => Boolean(s.privacyMode))
   const searchQuery = useStore((s) => s.searchQuery)
 
   const filteredTasks = useMemo(() => {
@@ -225,20 +230,21 @@ export default function InputBar() {
     try {
       const timeStr = formatExportFileTime(new Date())
       const fileNameBase = `batch-${timeStr}`
-      const { successCount, failCount } = settings.zipDownloadRoutes.includes('task-selection')
+      const result = settings.zipDownloadRoutes.includes('task-selection')
         ? await downloadImageEntriesAsZip(getTaskOutputImageZipEntries(selectedTasks), fileNameBase)
         : await downloadImageIds(imageIds, fileNameBase)
+      if (result.canceled) return
 
-      if (successCount === 0) {
-        showToast('下载失败', 'error')
-      } else if (failCount > 0) {
-        showToast(`部分下载失败：成功 ${successCount}，失败 ${failCount}`, 'error')
+      if (result.successCount === 0) {
+        showToast(getDownloadErrorMessage(result.error), 'error')
+      } else if (result.failCount > 0) {
+        showToast(`部分下载失败：成功 ${result.successCount}，失败 ${result.failCount}`, 'error')
       } else {
-        showToast(successCount > 1 ? `下载成功：${successCount} 张图片` : '下载成功', 'success')
+        showToast(withSaveLocation(result.successCount > 1 ? `下载成功：${result.successCount} 张图片` : '下载成功', result.location), 'success')
       }
     } catch (err) {
       console.error(err)
-      showToast('下载失败', 'error')
+      showToast(getDownloadErrorMessage(err), 'error')
     }
     clearSelection()
   }, [tasks, selectedTaskIds, settings.zipDownloadRoutes, showToast, clearSelection])
@@ -251,10 +257,15 @@ export default function InputBar() {
     let successCount = 0
     let failCount = 0
     let downloadedCollectionCount = 0
+    let location: string | undefined
+    let error: string | undefined
     const useZipDownload = settings.zipDownloadRoutes.includes('favorite-collection-selection')
     const timeStr = formatExportFileTime(new Date())
 
     try {
+      // 客户端选中多个收藏夹时只选择一次目录，避免每个收藏夹各弹一次对话框
+      const dir = isTauri && selectedCollections.length > 1 ? await pickSaveDir() : null
+      if (isTauri && selectedCollections.length > 1 && !dir) return
       for (const collection of selectedCollections) {
         const entries = getTaskOutputImageZipEntries(collection.tasks)
         if (entries.length === 0) continue
@@ -262,24 +273,29 @@ export default function InputBar() {
           ? `favorites-all-${timeStr}`
           : `favorites-${collection.name}-${timeStr}`
         const result = useZipDownload
-          ? await downloadImageEntriesAsZip(entries, zipName)
-          : await downloadImageIds(entries.map((entry) => entry.imageId), zipName)
+          ? await downloadImageEntriesAsZip(entries, zipName, dir)
+          : await downloadImageIds(entries.map((entry) => entry.imageId), zipName, dir)
+        if (result.canceled) return
         successCount += result.successCount
         failCount += result.failCount
+        location = dir?.path ?? result.location ?? location
+        error = result.error ?? error
         if (result.successCount > 0) downloadedCollectionCount++
-        if (selectedCollections.length > 1) await delay(100)
+        if (selectedCollections.length > 1 && !dir) await delay(100)
       }
 
-      if (successCount === 0) {
+      if (successCount === 0 && failCount > 0) {
+        showToast(getDownloadErrorMessage(error), 'error')
+      } else if (successCount === 0) {
         showToast('选中的收藏夹没有图片', 'info')
       } else if (failCount > 0) {
         showToast(`部分下载失败：成功 ${successCount}，失败 ${failCount}`, 'error')
       } else {
-        showToast(useZipDownload && downloadedCollectionCount > 1 ? `下载成功：${downloadedCollectionCount} 个压缩包，${successCount} 张图片` : `下载成功：${successCount} 张图片`, 'success')
+        showToast(withSaveLocation(useZipDownload && downloadedCollectionCount > 1 ? `下载成功：${downloadedCollectionCount} 个压缩包，${successCount} 张图片` : `下载成功：${successCount} 张图片`, location), 'success')
       }
     } catch (err) {
       console.error(err)
-      showToast('下载失败', 'error')
+      showToast(getDownloadErrorMessage(err), 'error')
     }
     clearFavoriteCollectionSelection()
   }, [clearFavoriteCollectionSelection, favoriteCollectionCards, selectedFavoriteCollectionIds, settings.zipDownloadRoutes, showToast])
@@ -343,6 +359,7 @@ export default function InputBar() {
   const [mobileCollapsed, setMobileCollapsed] = useState(false)
   const [showSizePicker, setShowSizePicker] = useState(false)
   const [showUploadMenu, setShowUploadMenu] = useState(false)
+  const [showAddImageUrls, setShowAddImageUrls] = useState(false)
   const [maskPreviewUrl, setMaskPreviewUrl] = useState('')
   const [imageDragIndex, setImageDragIndex] = useState<number | null>(null)
   const [imageDragOverIndex, setImageDragOverIndex] = useState<number | null>(null)
@@ -1169,7 +1186,7 @@ export default function InputBar() {
     const html = prompt
       ? parts.map((part) =>
           part.type === 'mention'
-              ? `<span contenteditable="false" class="mention-tag" data-mention-text="${part.mentionText ?? getSelectedImageMentionLabel(part.imageIndex ?? 0)}">${part.text}</span>`
+            ? getMentionTagHtml(part.text, part.mentionText)
             : part.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
         ).join('')
       : ''
@@ -1682,6 +1699,16 @@ export default function InputBar() {
             className="w-full px-4 py-3 text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 flex items-center gap-2 transition-colors"
             onClick={() => {
               setShowUploadMenu(false)
+              setShowAddImageUrls(true)
+            }}
+          >
+            <LinkIcon className="w-4 h-4" />
+            添加链接
+          </button>
+          <button
+            className="w-full px-4 py-3 text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 flex items-center gap-2 transition-colors"
+            onClick={() => {
+              setShowUploadMenu(false)
               setSketchBoard({ baseImageSrc: null })
             }}
           >
@@ -1811,6 +1838,8 @@ export default function InputBar() {
     <>
       <DragUploadOverlay visible={isDragging} atImageLimit={atImageLimit} maxImages={MAX_INPUT_IMAGES} />
 
+      {showAddImageUrls && <AddImageUrlsModal onClose={() => setShowAddImageUrls(false)} />}
+
       {showSizePicker && (
         <SizePickerModal
           currentSize={isFalTextToImage && params.size === 'auto' ? DEFAULT_FAL_IMAGE_SIZE : params.size}
@@ -1823,7 +1852,7 @@ export default function InputBar() {
 
       <div
         data-input-bar
-        className={`fixed bottom-4 sm:bottom-6 left-1/2 -translate-x-1/2 z-30 w-full max-w-4xl sm:w-max sm:min-w-[min(56rem,100%)] sm:max-w-[min(80rem,100%)] px-3 sm:px-4 transition-all duration-300${promptExpanded ? ' flex flex-col' : ''}`}
+        className={`fixed bottom-4 sm:bottom-6 left-[calc((100%-var(--page-scrollbar-width))/2)] -translate-x-1/2 z-30 w-[calc(100%-var(--page-scrollbar-width))] max-w-4xl sm:w-max sm:min-w-[min(56rem,calc(100%-var(--page-scrollbar-width)))] sm:max-w-[min(80rem,calc(100%-var(--page-scrollbar-width)))] px-3 sm:px-4 transition-all duration-300${promptExpanded ? ' flex flex-col' : ''}`}
         style={promptExpanded ? { top: `${promptExpandedTop}px`, transitionProperty: 'none' } : undefined}
       >
         {/* 桌面端输入栏宽度只由参数栏内容决定（最宽与任务卡片区域对齐），其余区域用 contain 排除在宽度计算之外 */}
@@ -1841,7 +1870,7 @@ export default function InputBar() {
             clearSelection={clearSelection}
             onSelectAllVisibleTasks={handleSelectAllVisibleTasks}
             onInvertVisibleTasks={handleInvertVisibleTasks}
-            onToggleFavorite={handleToggleFavorite}
+            onToggleFavorite={privacyMode ? undefined : handleToggleFavorite}
             onDownloadSelected={handleDownloadSelected}
             onDeleteSelected={handleDeleteSelected}
           />

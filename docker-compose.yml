@@ -9,6 +9,9 @@ services:
       HOST: 0.0.0.0
       PORT: 80
       ENABLE_API_PROXY: "false"
+      DEFAULT_UI_FONT: ${DEFAULT_UI_FONT:-}
+      DEFAULT_MONO_FONT: ${DEFAULT_MONO_FONT:-}
+      BUILTIN_FONT_SOURCE: ${BUILTIN_FONT_SOURCE:-}
     ports:
       - "${WEB_PORT:-18080}:80"
 

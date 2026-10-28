@@ -4,20 +4,23 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
+    tags: ['v*']
     paths:
       - package.json
+  workflow_run:
+    workflows: ['Build Desktop Client']
+    types: [completed]
   workflow_dispatch:
 
 jobs:
   deploy:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     env:
       VERCEL_DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Check release version
@@ -25,9 +28,23 @@ jobs:
         env:
           BEFORE_SHA: ${{ github.event.before }}
           GH_TOKEN: ${{ github.token }}
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch || "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 配置了签名私钥时，推送 tag 先构建客户端，构建成功后由 workflow_run 部署；未配置时推送 tag 直接部署
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            [[ -n "$SIGNING_KEY" ]] && deploy=true || deploy=false
+            echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            [[ -z "$SIGNING_KEY" ]] && deploy=true || deploy=false
+            [[ "$deploy" == false ]] && echo "Signing key is set. Vercel deployment will run after the desktop client build."
+            echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 

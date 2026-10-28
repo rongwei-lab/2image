@@ -141,6 +141,7 @@ export interface CloudSettingsSnapshot {
   settings: AppSettings
   params: TaskParams
   promptStylePresetId?: string
+  imageSourceUrls?: Record<string, string>
   activeAgentConversationId: string | null
   appMode: AppMode
   agentSidebarCollapsed: boolean
@@ -630,6 +631,7 @@ export async function callCloudBatchImageSingle(opts: {
   batchItemId: string
   prompt: string
   referenceImageDataUrls: string[]
+  referenceImageSourceUrls?: (string | null)[]
   referenceIds?: string[]
   signal?: AbortSignal
   onImageToolStarted?: () => void | Promise<void>
@@ -641,6 +643,7 @@ export async function callCloudBatchImageSingle(opts: {
     batchItemId: opts.batchItemId,
     prompt: opts.prompt,
     referenceImageDataUrls: opts.referenceImageDataUrls,
+    referenceImageSourceUrls: opts.referenceImageSourceUrls,
     referenceIds: opts.referenceIds,
   }, async (event) => {
     if (event.type === 'batch_image_started') await opts.onImageToolStarted?.()

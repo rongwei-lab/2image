@@ -20,6 +20,10 @@ interface ImportMetaEnv {
   readonly VITE_APP_RELEASES_URL?: string
   readonly VITE_APP_RELEASE_API_URL?: string
   readonly VITE_APP_RELEASE_API_ACCEPT?: string
+  readonly VITE_DEFAULT_UI_FONT?: string
+  readonly VITE_DEFAULT_MONO_FONT?: string
+  readonly VITE_BUILTIN_FONT_SOURCE?: string
+  readonly VITE_WEB_APP_URL?: string
 }
 
 interface ImportMeta {

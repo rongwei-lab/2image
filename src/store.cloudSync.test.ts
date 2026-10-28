@@ -44,6 +44,8 @@ describe('cloud settings sync', () => {
       settings: { ...DEFAULT_SETTINGS },
       params: { ...DEFAULT_PARAMS },
       promptStylePresetId: '',
+      privacyMode: null,
+      imageSourceUrls: {},
       appMode: 'gallery',
       prompt: '',
       inputImages: [],
@@ -64,7 +66,7 @@ describe('cloud settings sync', () => {
 
   afterEach(() => {
     vi.useRealTimers()
-    useStore.setState({ cloudUser: null, cloudSyncing: false })
+    useStore.setState({ cloudUser: null, cloudSyncing: false, privacyMode: null })
   })
 
   it('does not start another save only because cloudSyncing changes', async () => {
@@ -90,5 +92,28 @@ describe('cloud settings sync', () => {
 
     await vi.advanceTimersByTimeAsync(3_000)
     expect(cloudApiMocks.saveCloudSettings).toHaveBeenCalledTimes(1)
+  })
+
+  it('隐私模式下继续同步原始草稿和参考图链接，退出后恢复输入', async () => {
+    const image = { id: 'cloud-image', dataUrl: 'data:image/png;base64,YQ==', remoteSynced: true }
+    useStore.setState({ prompt: '原始草稿', inputImages: [image], imageSourceUrls: { 'cloud-image': 'https://images.example.com/ref.png' } })
+    await vi.advanceTimersByTimeAsync(900)
+    cloudApiMocks.saveCloudSettings.mockClear()
+
+    useStore.getState().togglePrivacyMode()
+    expect(useStore.getState().prompt).toBe('')
+    expect(useStore.getState().inputImages).toEqual([])
+    useStore.getState().setPrompt('隐私模式临时输入')
+    useStore.getState().setParams({ quality: 'low' })
+    await vi.advanceTimersByTimeAsync(900)
+
+    expect(cloudApiMocks.saveCloudSettings).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: '原始草稿',
+      inputImages: [expect.objectContaining({ id: image.id, dataUrl: '' })],
+      imageSourceUrls: { 'cloud-image': 'https://images.example.com/ref.png' },
+    }))
+    useStore.getState().togglePrivacyMode()
+    expect(useStore.getState().prompt).toBe('原始草稿')
+    expect(useStore.getState().inputImages[0].id).toBe(image.id)
   })
 })

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { clearCloudData, deleteCloudImage, getCurrentUser } from './cloudApi'
+import { callCloudBatchImageSingle, clearCloudData, deleteCloudImage, getCurrentUser } from './cloudApi'
+import { DEFAULT_PARAMS } from '../types'
 
 describe('cloudApi request headers', () => {
   afterEach(() => {
@@ -40,5 +41,25 @@ describe('cloudApi request headers', () => {
 
     const [, init] = fetchMock.mock.calls[0]
     expect((init as RequestInit).cache).toBe('no-store')
+  })
+
+  it('云端 Hybrid 生图同时传递参考图数据和原始链接', async () => {
+    const result = { batchItemId: 'item-1', image: null, error: null }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(`data: ${JSON.stringify({ type: 'done', result })}\n\n`, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    }))
+
+    await callCloudBatchImageSingle({
+      params: DEFAULT_PARAMS,
+      batchItemId: 'item-1',
+      prompt: '生成图片',
+      referenceImageDataUrls: ['data:image/png;base64,YQ=='],
+      referenceImageSourceUrls: ['https://images.example.com/input.png'],
+    })
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1]!.body as string)).toMatchObject({
+      referenceImageDataUrls: ['data:image/png;base64,YQ=='],
+      referenceImageSourceUrls: ['https://images.example.com/input.png'],
+    })
   })
 })

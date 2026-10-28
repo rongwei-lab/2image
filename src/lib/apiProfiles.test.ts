@@ -92,6 +92,13 @@ describe('normalizeSettings', () => {
     expect(normalizeSettings({ retryMode: 'overwriteAll', alwaysShowRetryButton: true }).retryMode).toBe('overwriteAll')
   })
 
+  it('defaults the save location mode to asking and drops invalid values', () => {
+    expect(DEFAULT_SETTINGS.saveLocationMode).toBe('ask')
+    expect(normalizeSettings({}).saveLocationMode).toBe('ask')
+    expect(normalizeSettings({ saveLocationMode: 'bogus' }).saveLocationMode).toBe('ask')
+    expect(normalizeSettings({ saveLocationMode: 'default' }).saveLocationMode).toBe('default')
+  })
+
   it('preserves a non-empty profile description and removes an empty one', () => {
     const settings = normalizeSettings({
       profiles: [
@@ -102,6 +109,32 @@ describe('normalizeSettings', () => {
 
     expect(settings.profiles[0].description).toBe('支持 **Markdown**')
     expect(settings.profiles[1].description).toBeUndefined()
+  })
+
+  it('keeps valid color modes and falls back to following the system', () => {
+    expect(normalizeSettings({ enterSubmit: true }).colorMode).toBe('system')
+    expect(normalizeSettings({ colorMode: 'light' }).colorMode).toBe('light')
+    expect(normalizeSettings({ colorMode: 'dark' }).colorMode).toBe('dark')
+    expect(normalizeSettings({ colorMode: 'bogus' }).colorMode).toBe('system')
+  })
+
+  it('defaults font settings to following the deployment for old data', () => {
+    const settings = normalizeSettings({ enterSubmit: true })
+
+    expect(settings.uiFont).toBe('default')
+    expect(settings.uiFontName).toBe('')
+    expect(settings.monoFont).toBe('default')
+    expect(settings.monoFontName).toBe('')
+  })
+
+  it('keeps valid font settings and drops invalid ones', () => {
+    const settings = normalizeSettings({ uiFont: 'custom', uiFontName: '  Source Han Sans SC ', monoFont: 'bogus', monoFontName: 42 })
+
+    expect(settings.uiFont).toBe('custom')
+    expect(settings.uiFontName).toBe('Source Han Sans SC')
+    expect(settings.monoFont).toBe('default')
+    expect(settings.monoFontName).toBe('')
+    expect(normalizeSettings({ monoFont: 'builtin' }).monoFont).toBe('builtin')
   })
 })
 

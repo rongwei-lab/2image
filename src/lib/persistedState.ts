@@ -5,6 +5,7 @@ import { ensureDefaultFavoriteCollection, normalizeFavoriteCollections, resolveD
 import { cleanStaleAgentInputDrafts, getPersistableAgentInputDrafts, isEmptyAgentInputDraft, normalizeAgentInputDraft, normalizeAgentInputDrafts, normalizeAgentInputDraftsByKey, saveGalleryInputDraft } from './inputDraftState'
 import { getPersistableAgentConversations, stripPersistedAgentConversations } from './agentResponseState'
 import { normalizePromptStylePresetId, type PromptStylePresetId } from './promptStyles'
+import { isHttpUrl } from './imageApiShared'
 
 export interface PersistedAppState {
   settings: AppSettings
@@ -29,6 +30,7 @@ export interface PersistedAppState {
   supportPromptDismissed: boolean
   supportPromptOpen: boolean
   supportPromptSkippedForImportedData: boolean
+  imageSourceUrls: Record<string, string>
 }
 
 type PersistedStateSource = Omit<PersistedAppState, 'prompt' | 'inputImages' | 'agentConversations'> & {
@@ -126,6 +128,7 @@ export function createPersistedState(state: PersistedStateSource, includeLegacyA
     supportPromptDismissed: state.supportPromptDismissed,
     supportPromptOpen: state.supportPromptOpen,
     supportPromptSkippedForImportedData: state.supportPromptSkippedForImportedData,
+    imageSourceUrls: state.imageSourceUrls,
   }
 }
 
@@ -223,6 +226,9 @@ export function normalizePersistedState(
       supportPromptDismissed: Boolean(persistedState.supportPromptDismissed),
       supportPromptOpen: Boolean(persistedState.supportPromptOpen),
       supportPromptSkippedForImportedData: Boolean(persistedState.supportPromptSkippedForImportedData),
+      imageSourceUrls: isRecord(persistedState.imageSourceUrls)
+        ? Object.fromEntries(Object.entries(persistedState.imageSourceUrls).filter((entry): entry is [string, string] => isHttpUrl(entry[1])))
+        : {},
       prompt: restoredAgentDraft ? restoredAgentDraft.prompt : galleryInputDraft?.prompt ?? '',
       inputImages: restoredAgentDraft ? restoredAgentDraft.inputImages : galleryInputDraft?.inputImages ?? [],
       maskDraft: restoredAgentDraft ? restoredAgentDraft.maskDraft : galleryInputDraft?.maskDraft ?? null,

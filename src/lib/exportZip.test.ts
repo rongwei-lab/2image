@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest'
 
 import type { AppSettings, StoredImage, StoredImageThumbnail, TaskParams, TaskRecord } from '../types'
 import { DEFAULT_SETTINGS } from './apiProfiles'
-import { buildExportZip, getExportImageEstimatedBytes, getExportZipPlan, readExportZip, readExportZipFileAsDataUrl } from './exportZip'
+import { buildExportZip, getExportFileEstimatedBytes, getExportZipPlan, readExportZip, readExportZipFileAsDataUrl } from './exportZip'
+import { getDataUrlDecodedByteSize } from './imageApiShared'
+
+// 按 dataUrl 解码后的字节数估算，作为只取文件大小估算的对照
+const estimateFromDataUrl = (image: StoredImage, thumbnail?: StoredImageThumbnail) => getExportFileEstimatedBytes(
+  getDataUrlDecodedByteSize(image.dataUrl),
+  thumbnail?.thumbnailDataUrl ? getDataUrlDecodedByteSize(thumbnail.thumbnailDataUrl) : undefined,
+)
 
 describe('exportZip', () => {
   it('omits empty customProviders in backup settings and retains non-empty providers', async () => {
@@ -22,6 +29,28 @@ describe('exportZip', () => {
     const provider = { id: 'custom', name: 'Custom', submit: { path: 'generate' } }
     const filled = await buildExportZip({ ...opts, settings: { ...DEFAULT_SETTINGS, customProviders: [provider] } })
     expect((await readExportZip(filled.bytes)).manifest.settings?.customProviders).toEqual([provider])
+  })
+
+  it('records source URLs of reference images added by link', async () => {
+    const { bytes } = await buildExportZip({
+      options: { exportTasks: true },
+      exportedAt: 1700000001000,
+      settings: DEFAULT_SETTINGS,
+      tasks: [],
+      images: [
+        { id: 'linked', dataUrl: 'data:image/png;base64,AAECAw==', source: 'upload' },
+        { id: 'local', dataUrl: 'data:image/png;base64,BAUGBw==', source: 'upload' },
+      ],
+      imageSourceUrls: { linked: 'https://example.com/a.png' },
+      thumbnailsByImageId: new Map(),
+      favoriteCollections: [],
+      defaultFavoriteCollectionId: null,
+      agentConversations: [],
+    })
+    const manifest = (await readExportZip(bytes)).manifest
+
+    expect(manifest.imageFiles?.linked?.sourceUrl).toBe('https://example.com/a.png')
+    expect(manifest.imageFiles?.local).not.toHaveProperty('sourceUrl')
   })
 
   it('builds and reads backup zip entries without changing manifest shape', async () => {
@@ -126,7 +155,7 @@ describe('exportZip', () => {
     }
     const plan = getExportZipPlan(
       params,
-      images.map((image) => ({ id: image.id, bytes: getExportImageEstimatedBytes(image) })),
+      images.map((image) => ({ id: image.id, bytes: estimateFromDataUrl(image) })),
       { maxBytes: 1_800_000, partBytes: 1_400_000 },
     )
 

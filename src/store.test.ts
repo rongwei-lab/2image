@@ -4,11 +4,13 @@ import { DEFAULT_PARAMS } from './types'
 import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings } from './lib/apiProfiles'
 import type { AgentConversation, ExportData, StoredImage, StoredImageThumbnail, TaskRecord } from './types'
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
-import { hasActiveDataOperations } from './lib/dataOperations'
+import { hasActiveDataOperations, hasInterruptibleOperations, trackDataTransfer } from './lib/dataOperations'
+import { cancelDataProgress, useDataProgress } from './lib/dataProgress'
 import { deleteAgentRoundFromConversation, getActiveAgentRounds, getAgentConversationTaskIds, getAgentRoundTaskIds, remapAgentRoundMentionsForPathChange } from './lib/agentConversationState'
 import { cleanStaleAgentInputDrafts } from './lib/inputDraftState'
 import { normalizePersistedState } from './lib/persistedState'
 import { setPresetConfig } from './lib/presetConfig'
+import { FetchConnectError } from './lib/platform'
 vi.mock('./lib/db', () => {
   const tasks = new Map<string, TaskRecord>()
   const images = new Map<string, StoredImage>()
@@ -51,8 +53,12 @@ vi.mock('./lib/db', () => {
     },
     getImage: async (id: string) => images.get(id),
     getStoredImageThumbnail: async (id: string) => thumbnails.get(id),
+    getStoredFreshImageThumbnail: async (id: string) => {
+      const thumbnail = thumbnails.get(id)
+      return thumbnail?.thumbnailVersion === 2 ? thumbnail : undefined
+    },
     getImageThumbnail: async (id: string) => thumbnails.get(id),
-    getStoredFreshImageThumbnail: async (id: string) => thumbnails.get(id),
+    getImageMeta: async (id: string) => images.get(id),
     getAllImageIds: async () => [...images.keys()],
     getAllImages: async () => [...images.values()],
     putImage: async (image: StoredImage) => {
@@ -160,7 +166,12 @@ vi.mock('./lib/cloudApi', () => ({
   })),
   uploadCloudImageThumbnail: vi.fn(),
 }))
-import { clearAgentConversations, clearImages, clearTasks, commitTaskDeletion, deleteImage as deleteDbImage, deleteTask as deleteDbTask, getAllAgentConversations, getAllImageIds, getAllTasks, getImage, getStoredFreshImageThumbnail, putAgentConversation, putImage, putImageThumbnail, putTask as putDbTask } from './lib/db'
+vi.mock('./lib/browserNotification', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./lib/browserNotification')>(),
+  showBrowserNotification: vi.fn(() => true),
+}))
+import { showBrowserNotification } from './lib/browserNotification'
+import { clearAgentConversations, clearImages, clearTasks, commitTaskDeletion, deleteImage as deleteDbImage, deleteTask as deleteDbTask, getAllAgentConversations, getAllImageIds, getAllTasks, getImage, getStoredImageThumbnail, getStoredFreshImageThumbnail, putAgentConversation, putImage, putImageThumbnail, putTask as putDbTask } from './lib/db'
 import { callImageApi } from './lib/api'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { callCloudAgentResponsesApi, callCloudBatchImageSingle, createCloudTask, deleteCloudImage, subscribeCloudTask } from './lib/cloudApi'
@@ -261,6 +272,41 @@ describe('data operation locking', () => {
       }],
     })])).toBe(true)
     expect(hasActiveDataOperations([task()], [])).toBe(false)
+  })
+
+  it('closing the client only warns about work that cannot resume after restart', async () => {
+    expect(hasInterruptibleOperations([task({ status: 'running' })], [], null)).toBe(true)
+    expect(hasInterruptibleOperations([task({ status: 'running', apiProvider: 'fal', falRequestId: 'req', falEndpoint: 'fal-ai/x' })], [], null)).toBe(false)
+    expect(hasInterruptibleOperations([task({ status: 'running', apiProvider: 'fal', falRequestId: 'req' })], [], null)).toBe(true)
+    expect(hasInterruptibleOperations([task({ status: 'running', customTaskId: 'job' })], [], null)).toBe(false)
+    expect(hasInterruptibleOperations([task({ falRecoverable: true, apiProvider: 'fal', falRequestId: 'req', falEndpoint: 'fal-ai/x' })], [], null)).toBe(false)
+    expect(hasInterruptibleOperations([task()], [agentConversation({
+      rounds: [{
+        id: 'round-a',
+        index: 1,
+        userMessageId: 'message-a',
+        prompt: 'prompt',
+        inputImageIds: [],
+        outputTaskIds: [],
+        status: 'running',
+        error: null,
+        createdAt: 1,
+        finishedAt: null,
+      }],
+    })], null)).toBe(true)
+
+    let release = () => {}
+    const transfer = trackDataTransfer(() => new Promise<void>((resolve) => { release = resolve }))
+    expect(hasInterruptibleOperations([], [], null)).toBe(true)
+    release()
+    await transfer
+    expect(hasInterruptibleOperations([], [], null)).toBe(false)
+
+    // 批量中尚未开始的提示词只在内存中，即使已开始的任务都可恢复也要提示
+    const recoverable = [task({ status: 'running', customTaskId: 'job' })]
+    expect(hasInterruptibleOperations(recoverable, [], { total: 3, started: 1, finished: 0 })).toBe(true)
+    expect(hasInterruptibleOperations(recoverable, [], { total: 3, started: 3, finished: 2 })).toBe(false)
+    expect(hasInterruptibleOperations(recoverable, [], null)).toBe(false)
   })
 })
 
@@ -552,6 +598,7 @@ describe('云端批量与覆盖重试', () => {
     useStore.setState({
       settings: normalizeSettings({ ...DEFAULT_SETTINGS, apiKey: '', alwaysShowRetryButton: true, retryMode: 'overwriteAll' }),
       cloudUser: { id: 'cloud-user', email: 'user@example.com' },
+      privacyMode: null,
       appMode: 'gallery',
       prompt: 'first\n\n\nsecond',
       promptStylePresetId: 'cinematic',
@@ -570,7 +617,24 @@ describe('云端批量与覆盖重试', () => {
 
   afterEach(() => {
     stopBatchPrompts()
-    useStore.setState({ cloudUser: null, tasks: [], promptStylePresetId: '' })
+    useStore.setState({ cloudUser: null, tasks: [], promptStylePresetId: '', privacyMode: null })
+  })
+
+  it.each(['done', 'error'] as const)('隐私模式不会因已有云端任务变为 %s 而弹出提示或详情', async (status) => {
+    await submitTask()
+    await vi.waitFor(() => expect(subscribeCloudTask).toHaveBeenCalledOnce())
+    const original = useStore.getState().tasks[0]
+    useStore.getState().togglePrivacyMode()
+    vi.mocked(useStore.getState().showToast).mockClear()
+
+    vi.mocked(subscribeCloudTask).mock.calls[0][1]({
+      type: status,
+      task: { ...original, status, error: status === 'error' ? '请求失败' : null },
+    })
+
+    expect(useStore.getState().tasks[0].status).toBe(status)
+    expect(useStore.getState().detailTaskId).toBeNull()
+    expect(useStore.getState().showToast).not.toHaveBeenCalled()
   })
 
   it.each([false, true])('云端排队生成等待上一条结束，并只汇总提示（首条失败：%s）', async (failed) => {
@@ -2767,6 +2831,22 @@ describe('data import', () => {
     })
   })
 
+  it('cancels import during parsing without writing any data', async () => {
+    await clearTasks()
+    const importing = importData(importFile({
+      version: 3,
+      exportedAt: new Date(0).toISOString(),
+      tasks: [task({ id: 'imported-canceled-task' })],
+      imageFiles: {},
+    }), { importConfig: false, importTasks: true })
+    cancelDataProgress()
+
+    expect(await importing).toBe(false)
+    expect(await getAllTasks()).toEqual([])
+    expect(useStore.getState().showToast).toHaveBeenCalledWith('已取消导入', 'info')
+    expect(useDataProgress.getState().progress).toBeNull()
+  })
+
   it('drops invalid retry start times when importing tasks', async () => {
     const valid = task({ id: 'imported-valid-start', createdAt: 1, startedAt: 5 })
     const invalid = { ...task({ id: 'imported-invalid-start' }), startedAt: 'bad' } as unknown as TaskRecord
@@ -4204,7 +4284,7 @@ describe('task deletion', () => {
     await removeTask(deleted)
 
     await expect(getImage('referenced-late')).resolves.toMatchObject({ dataUrl: 'data:image/png;base64,second' })
-    await expect(getStoredFreshImageThumbnail('referenced-late')).resolves.toMatchObject({ thumbnailDataUrl: 'data:image/webp;base64,thumb' })
+    await expect(getStoredImageThumbnail('referenced-late')).resolves.toMatchObject({ thumbnailDataUrl: 'data:image/webp;base64,thumb', thumbnailVersion: 2 })
     expect(deleteDbImage).toHaveBeenCalledTimes(1)
   })
 
@@ -5930,5 +6010,388 @@ describe('reused task API profile', () => {
       cancelText: '放弃提交',
     }))
     expect(state.showSettings).toBe(false)
+  })
+})
+
+describe('task failure notification', () => {
+  const responsesProfile = createDefaultOpenAIProfile({
+    id: 'responses-profile',
+    apiKey: 'test-key',
+    apiMode: 'responses',
+    model: DEFAULT_RESPONSES_MODEL,
+  })
+
+  beforeEach(async () => {
+    await clearTasks()
+    await clearImages()
+    await clearAgentConversations()
+    vi.mocked(callImageApi).mockReset()
+    vi.mocked(callAgentResponsesApi).mockReset()
+    vi.mocked(showBrowserNotification).mockClear()
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        profiles: [responsesProfile],
+        activeProfileId: responsesProfile.id,
+        taskCompletionNotification: true,
+      }),
+      appMode: 'gallery',
+      prompt: 'prompt',
+      inputImages: [],
+      maskDraft: null,
+      params: { ...DEFAULT_PARAMS },
+      tasks: [],
+      agentConversations: [agentConversation({ id: 'conversation-a' })],
+      activeAgentConversationId: 'conversation-a',
+      agentEditingRoundId: null,
+      detailTaskId: null,
+      showToast: vi.fn(),
+    })
+  })
+
+  it('notifies a gallery failure once without the error detail', async () => {
+    vi.mocked(callImageApi).mockRejectedValueOnce(new Error('接口报错'))
+
+    await submitTask()
+    await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).toBe('error'))
+
+    expect(showBrowserNotification).toHaveBeenCalledOnce()
+    expect(showBrowserNotification).toHaveBeenCalledWith('图像生成失败', { body: '请回到应用查看详情。', tag: 'task-failure' })
+  })
+
+  it('does not notify a failure when the setting is off', async () => {
+    useStore.setState({ settings: { ...useStore.getState().settings, taskCompletionNotification: false } })
+    vi.mocked(callImageApi).mockRejectedValueOnce(new Error('接口报错'))
+
+    await submitTask()
+    await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).toBe('error'))
+
+    expect(showBrowserNotification).not.toHaveBeenCalled()
+  })
+
+  it('reports batch failures once in the batch summary', async () => {
+    vi.mocked(callImageApi)
+      .mockRejectedValueOnce(new Error('第一条失败'))
+      .mockResolvedValueOnce({ images: [], actualParams: {}, actualParamsList: [], revisedPrompts: [] })
+    useStore.setState({
+      settings: { ...useStore.getState().settings, showBatchPrompt: true, batchPromptEnabled: true, batchPromptMode: 'queue' },
+      prompt: 'first\n\n\nsecond',
+    })
+
+    await submitTask()
+    await vi.waitFor(() => expect(useStore.getState().batchProgress).toBeNull())
+
+    expect(showBrowserNotification).toHaveBeenCalledOnce()
+    expect(showBrowserNotification).toHaveBeenCalledWith('批量生成完成', { body: '批量生成完成：成功 1 条，失败 1 条。', tag: 'task-completion' })
+  })
+
+  it('notifies an Agent reply failure', async () => {
+    useStore.setState({ appMode: 'agent' })
+    vi.mocked(callAgentResponsesApi).mockRejectedValueOnce(new Error('模型不可用'))
+
+    await submitAgentMessage()
+    await vi.waitFor(() => expect(useStore.getState().agentConversations[0].rounds[0]).toMatchObject({ status: 'error' }))
+
+    expect(showBrowserNotification).toHaveBeenCalledOnce()
+    expect(showBrowserNotification).toHaveBeenCalledWith('Agent 回复失败', { body: '请回到应用查看详情。', tag: 'task-failure' })
+  })
+
+  it('notifies when a recovered fal task finally fails', async () => {
+    const falProfile = createDefaultFalProfile({ id: 'fal-profile', apiKey: 'fal-key' })
+    useStore.setState({ settings: normalizeSettings({ ...useStore.getState().settings, profiles: [falProfile], activeProfileId: falProfile.id }) })
+    await putDbTask(task({
+      id: 'fal-task',
+      apiProvider: 'fal',
+      apiProfileId: 'fal-profile',
+      status: 'error',
+      error: '与 fal.ai 的连接已断开，之后会继续查询任务结果。',
+      falRequestId: 'fal-request-id',
+      falEndpoint: 'fal-endpoint',
+      falRecoverable: true,
+      finishedAt: null,
+      elapsed: null,
+    }))
+    vi.mocked(getFalQueuedImageResult).mockRejectedValueOnce(new Error('quota exceeded'))
+
+    await initStore()
+    await vi.waitFor(() => expect(useStore.getState().tasks[0]).toMatchObject({ status: 'error', error: 'quota exceeded', falRecoverable: false }))
+
+    expect(showBrowserNotification).toHaveBeenCalledOnce()
+    expect(showBrowserNotification).toHaveBeenCalledWith('图像生成失败', { body: '请回到应用查看详情。', tag: 'task-failure' })
+  })
+
+  it('notifies a watchdog timeout once and ignores the late request failure', async () => {
+    vi.useFakeTimers()
+    try {
+      const timeoutProfile = createDefaultOpenAIProfile({ id: 'timeout-profile', apiKey: 'test-key', timeout: 1 })
+      useStore.setState({ settings: normalizeSettings({ ...useStore.getState().settings, profiles: [timeoutProfile], activeProfileId: timeoutProfile.id }) })
+      const request = deferred<Awaited<ReturnType<typeof callImageApi>>>()
+      vi.mocked(callImageApi).mockImplementationOnce(() => request.promise)
+
+      await submitTask()
+      await vi.waitFor(() => expect(callImageApi).toHaveBeenCalledOnce())
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(useStore.getState().tasks[0]).toMatchObject({ status: 'error' })
+      request.reject(new Error('late failure'))
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(showBrowserNotification).toHaveBeenCalledOnce()
+      expect(showBrowserNotification).toHaveBeenCalledWith('图像生成失败', expect.objectContaining({ tag: 'task-failure' }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('only reports the Agent round when its image task fails', async () => {
+    const textProfile = createDefaultOpenAIProfile({ id: 'agent-text-profile', apiKey: 'text-key', apiMode: 'responses' })
+    const imageProfile = createDefaultFalProfile({ id: 'fal-profile', apiKey: 'fal-key' })
+    useStore.setState({
+      settings: normalizeSettings({
+        ...useStore.getState().settings,
+        profiles: [textProfile, imageProfile],
+        activeProfileId: textProfile.id,
+        agentApiConfigMode: 'hybrid',
+        agentTextProfileId: textProfile.id,
+        agentImageProfileId: imageProfile.id,
+      }),
+      agentConversations: [],
+    })
+    await putDbTask(task({
+      id: 'agent-fal-task',
+      apiProvider: 'fal',
+      apiProfileId: imageProfile.id,
+      status: 'error',
+      error: '与 fal.ai 的连接已断开，之后会继续查询任务结果。',
+      falRequestId: 'fal-request-id',
+      falEndpoint: 'fal-endpoint',
+      falRecoverable: true,
+      sourceMode: 'agent',
+      agentConversationId: 'conversation-a',
+      agentRoundId: 'round-a',
+      agentMessageId: 'assistant-a',
+      agentToolCallId: 'tool-a',
+    }))
+    await putAgentConversation(agentConversation({
+      id: 'conversation-a',
+      activeRoundId: 'round-a',
+      rounds: [{
+        id: 'round-a',
+        index: 1,
+        parentRoundId: null,
+        userMessageId: 'user-a',
+        assistantMessageId: 'assistant-a',
+        prompt: '画一只猫',
+        inputImageIds: [],
+        outputTaskIds: ['agent-fal-task'],
+        responseOutput: [{ type: 'function_call', name: 'generate_image', call_id: 'tool-a', arguments: JSON.stringify({ id: 'cat', prompt: '画一只猫' }) }],
+        status: 'running',
+        error: null,
+        createdAt: 1,
+        finishedAt: null,
+      }],
+      messages: [
+        { id: 'user-a', role: 'user', content: '画一只猫', roundId: 'round-a', createdAt: 1 },
+        { id: 'assistant-a', role: 'assistant', content: '', roundId: 'round-a', outputTaskIds: ['agent-fal-task'], createdAt: 2 },
+      ],
+    }))
+    vi.mocked(getFalQueuedImageResult).mockRejectedValueOnce(new Error('quota exceeded'))
+
+    await initStore()
+    await vi.waitFor(() => expect(useStore.getState().agentConversations[0]?.rounds[0]).toMatchObject({ status: 'error', error: 'quota exceeded' }))
+
+    expect(showBrowserNotification).toHaveBeenCalledOnce()
+    expect(showBrowserNotification).toHaveBeenCalledWith('Agent 回复失败', expect.objectContaining({ tag: 'task-failure' }))
+    expect(showBrowserNotification).not.toHaveBeenCalledWith('图像生成失败', expect.anything())
+  })
+
+  it('does not notify when the user stops an Agent reply', async () => {
+    useStore.setState({ appMode: 'agent' })
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce((opts) => new Promise((_, reject) => {
+      opts.signal?.addEventListener('abort', () => reject(new DOMException('Agent 请求已停止', 'AbortError')), { once: true })
+    }))
+
+    await submitAgentMessage()
+    await vi.waitFor(() => expect(callAgentResponsesApi).toHaveBeenCalledOnce())
+    stopAgentResponse('conversation-a')
+    await vi.waitFor(() => expect(useStore.getState().agentConversations[0].rounds[0]).toMatchObject({ status: 'error', error: '已停止生成。' }))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(showBrowserNotification).not.toHaveBeenCalled()
+  })
+})
+
+describe('client connection errors', () => {
+  beforeEach(async () => {
+    await clearTasks()
+    vi.mocked(callImageApi).mockReset()
+    const profile = createDefaultOpenAIProfile({ id: 'client-profile', apiKey: 'test-key', apiMode: 'images' })
+    useStore.setState({
+      settings: normalizeSettings({ ...DEFAULT_SETTINGS, profiles: [profile], activeProfileId: profile.id }),
+      appMode: 'gallery',
+      prompt: 'prompt',
+      inputImages: [],
+      maskDraft: null,
+      params: { ...DEFAULT_PARAMS },
+      tasks: [],
+      showToast: vi.fn(),
+    })
+  })
+
+  it('shows an identified reason without the immediate failure hint', async () => {
+    vi.mocked(callImageApi).mockRejectedValueOnce(new FetchConnectError('无法解析域名，请检查 API 地址是否正确。（错误码 11001）'))
+
+    await submitTask()
+    await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).toBe('error'))
+
+    expect(useStore.getState().tasks[0].error).toBe('无法解析域名，请检查 API 地址是否正确。（错误码 11001）')
+  })
+
+  it('keeps the immediate failure hint for the fallback reason', async () => {
+    vi.mocked(callImageApi).mockRejectedValueOnce(new FetchConnectError('无法连接到服务器。（unexpected eof）'))
+
+    await submitTask()
+    await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).toBe('error'))
+
+    const error = useStore.getState().tasks[0].error!
+    expect(error.startsWith('无法连接到服务器。（unexpected eof）\n提示：请求立即失败，可能原因：')).toBe(true)
+    expect(error).not.toContain('Failed to fetch')
+  })
+
+  it('treats a connection error as recoverable for queued fal requests', async () => {
+    const falProfile = createDefaultFalProfile({ id: 'fal-profile', apiKey: 'fal-key' })
+    useStore.setState({ settings: normalizeSettings({ ...DEFAULT_SETTINGS, profiles: [falProfile], activeProfileId: falProfile.id }) })
+    vi.mocked(callImageApi).mockImplementationOnce(async (opts) => {
+      opts.onFalRequestEnqueued?.({ requestId: 'fal-request', endpoint: 'fal-endpoint' })
+      // 消息不含“连接”“断开”等字样，只能靠错误类型判断为可恢复
+      throw new FetchConnectError('无法解析域名，请检查 API 地址是否正确。（错误码 11001）')
+    })
+
+    await submitTask()
+    await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).toBe('error'))
+
+    expect(useStore.getState().tasks[0]).toMatchObject({ falRecoverable: true, error: '与 fal.ai 的连接已断开，之后会继续查询任务结果。' })
+    await removeTask(useStore.getState().tasks[0])
+  })
+
+  it.each([
+    ['连接被服务器重置。（错误码 10054）', true],
+    ['无法解析域名，请检查 API 地址是否正确。（错误码 11001）', false],
+  ])('adds the gateway timeout hint after about 60 seconds only when the connection was dropped: %s', async (reason, hinted) => {
+    const now = Date.now()
+    const dateNow = vi.spyOn(Date, 'now')
+    vi.mocked(callImageApi).mockImplementationOnce(async () => {
+      dateNow.mockReturnValue(now + 60_000)
+      throw new FetchConnectError(reason)
+    })
+
+    try {
+      await submitTask()
+      await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).toBe('error'))
+    } finally {
+      dateNow.mockRestore()
+    }
+
+    const error = useStore.getState().tasks[0].error!
+    if (hinted) expect(error.startsWith(`${reason}\n提示：请求等待约 60 秒后被断开`)).toBe(true)
+    else expect(error).toBe(reason)
+  })
+})
+
+describe('privacy mode', () => {
+  const responsesProfile = createDefaultOpenAIProfile({
+    id: 'responses-profile',
+    apiKey: 'test-key',
+    apiMode: 'responses',
+    model: DEFAULT_RESPONSES_MODEL,
+  })
+
+  beforeEach(async () => {
+    await clearTasks()
+    await clearImages()
+    await clearAgentConversations()
+    vi.mocked(callImageApi).mockReset()
+    vi.mocked(showBrowserNotification).mockClear()
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        profiles: [responsesProfile],
+        activeProfileId: responsesProfile.id,
+        taskCompletionNotification: true,
+      }),
+      privacyMode: null,
+      appMode: 'gallery',
+      prompt: 'secret prompt',
+      inputImages: [imageA],
+      maskDraft: null,
+      maskEditorImageId: null,
+      galleryInputDraft: null,
+      agentInputDrafts: { 'conversation-a': { prompt: 'agent draft', inputImages: [], maskDraft: null, maskEditorImageId: null, updatedAt: 1 } },
+      params: { ...DEFAULT_PARAMS },
+      tasks: [task({ id: 'old-task', createdAt: 1 })],
+      agentConversations: [agentConversation({ id: 'conversation-a', messages: [{ id: 'm', role: 'user', content: 'hi', roundId: 'r', createdAt: 1 }] })],
+      activeAgentConversationId: 'conversation-a',
+      searchQuery: 'secret',
+      filterFavorite: true,
+      showSettings: true,
+      detailTaskId: 'old-task',
+      confirmDialog: { title: '确认', message: '内容' },
+      showToast: vi.fn(),
+    })
+  })
+
+  afterEach(() => {
+    useStore.setState({ privacyMode: null })
+  })
+
+  it('clears views and input on entry, keeps the previous input persisted, and restores it on exit', () => {
+    const epoch = useStore.getState().privacyModeEpoch
+    useStore.getState().togglePrivacyMode()
+
+    const state = useStore.getState()
+    expect(state.privacyMode).not.toBeNull()
+    expect(state.privacyModeEpoch).toBe(epoch + 1)
+    expect(state).toMatchObject({
+      prompt: '',
+      inputImages: [],
+      agentInputDrafts: {},
+      activeAgentConversationId: null,
+      searchQuery: '',
+      filterFavorite: false,
+      showSettings: false,
+      detailTaskId: null,
+      confirmDialog: null,
+    })
+    const persisted = getPersistedState(state)
+    expect(persisted.prompt).toBe('secret prompt')
+    expect(persisted.agentInputDrafts['conversation-a']?.prompt).toBe('agent draft')
+
+    useStore.getState().setPrompt('typed in privacy mode')
+    useStore.getState().togglePrivacyMode()
+
+    expect(useStore.getState().privacyMode).toBeNull()
+    expect(useStore.getState().prompt).toBe('secret prompt')
+    expect(useStore.getState().inputImages).toEqual([imageA])
+    expect(useStore.getState().agentInputDrafts['conversation-a']?.prompt).toBe('agent draft')
+  })
+
+  it('drops notifications of tasks started before entry and keeps those of new tasks', async () => {
+    const pending = deferred<never>()
+    vi.mocked(callImageApi).mockReturnValueOnce(pending.promise)
+    useStore.setState({ tasks: [], inputImages: [] })
+    await submitTask()
+    const oldTaskId = useStore.getState().tasks[0].id
+
+    useStore.getState().togglePrivacyMode()
+    pending.reject(new Error('接口报错'))
+    await vi.waitFor(() => expect(useStore.getState().tasks.find((item) => item.id === oldTaskId)?.status).toBe('error'))
+    expect(showBrowserNotification).not.toHaveBeenCalled()
+    expect(useStore.getState().detailTaskId).toBeNull()
+
+    vi.mocked(callImageApi).mockRejectedValueOnce(new Error('接口报错'))
+    useStore.getState().setPrompt('new prompt')
+    await submitTask()
+    await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).toBe('error'))
+    expect(showBrowserNotification).toHaveBeenCalledOnce()
+    expect(useStore.getState().detailTaskId).toBe(useStore.getState().tasks[0].id)
   })
 })

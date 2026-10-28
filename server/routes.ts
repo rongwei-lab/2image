@@ -1019,6 +1019,7 @@ async function upsertSettings(
     settings: AppSettings
     params: TaskParams
     promptStylePresetId?: string
+    imageSourceUrls?: unknown
     activeAgentConversationId?: string | null
     appMode?: string
     agentSidebarCollapsed?: boolean
@@ -1041,6 +1042,9 @@ async function upsertSettings(
     agentAssetTab: body.agentAssetTab === 'references' ? 'references' : 'outputs',
     agentAssetPanelCollapsed: Boolean(body.agentAssetPanelCollapsed),
     promptStylePresetId: normalizePromptStylePresetId(body.promptStylePresetId),
+    imageSourceUrls: body.imageSourceUrls && typeof body.imageSourceUrls === 'object' && !Array.isArray(body.imageSourceUrls)
+      ? Object.fromEntries(Object.entries(body.imageSourceUrls).filter((entry) => typeof entry[1] === 'string' && /^https?:\/\//i.test(entry[1])))
+      : {},
     prompt: typeof body.prompt === 'string' ? body.prompt : '',
     inputImages: Array.isArray(body.inputImages) ? body.inputImages : [],
 	    maskDraft: body.maskDraft ?? null,
@@ -2318,6 +2322,10 @@ async function runTask(
       params: task.params,
       nativeTransparentBackground: task.params.transparent_output && !task.transparentOutput,
       inputImageDataUrls,
+      inputImageUrls: task.inputImageIds.map((_, index) => {
+        const url = task.inputImageUrls?.[index]
+        return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : null
+      }),
       maskDataUrl,
       onPartialImage: (partial) => {
         publishTaskEvent(user.id, taskId, {
@@ -3151,6 +3159,7 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
       batchItemId?: string
       prompt?: string
       referenceImageDataUrls?: string[]
+      referenceImageSourceUrls?: (string | null)[]
       referenceIds?: string[]
     }
     openSse(reply)
@@ -3178,6 +3187,10 @@ export function registerCloudRoutes(app: FastifyInstance, db: Db, s3: S3Client, 
           prompt: replaceImageMentionsForApi(prompt, referenceImageDataUrls.length),
           params,
           inputImageDataUrls: referenceImageDataUrls,
+          inputImageUrls: referenceImageDataUrls.map((_, index) => {
+            const url = body.referenceImageSourceUrls?.[index]
+            return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : null
+          }),
           onPartialImage: (partial) => writeSse(reply, {
             type: 'batch_partial_image',
             event: { image: partial.image, partialImageIndex: partial.partialImageIndex ?? partial.requestIndex },
